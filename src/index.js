@@ -247,14 +247,14 @@ app.get('/api/ghl/test', async (c) => {
   if (!settings.ghl_location_id) return c.json({ ok: false, error: 'No Location ID saved yet — add it in Settings.' });
   const ghl = ghlFor(c.env, settings);
   try {
-    const [loc, forms] = await Promise.all([
+    const [loc, sources] = await Promise.all([
       ghl.getLocation().catch((e) => ({ error: e.message })),
-      ghl.listForms(),
+      ghl.listIntakeSources(),
     ]);
     return c.json({
       ok: true,
       location: loc?.location?.name || loc?.name || settings.ghl_location_id,
-      forms: forms.map((f) => ({ id: f.id, name: f.name })),
+      forms: sources,
     });
   } catch (e) {
     return c.json({ ok: false, error: e.message });
@@ -300,7 +300,7 @@ async function pollForms(env, settings) {
   ]) {
     const formId = settings[formKey];
     if (!formId) continue;
-    const subs = await ghl.formSubmissions({ formId, startAt, endAt });
+    const subs = await ghl.intakeSubmissions(formId, { startAt, endAt });
     for (const sub of subs) {
       const email = (sub.email || sub.others?.email || '').trim();
       if (!email) continue;

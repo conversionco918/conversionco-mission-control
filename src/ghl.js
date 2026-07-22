@@ -53,6 +53,41 @@ export class GHL {
     return data.submissions || [];
   }
 
+  // ---- Surveys (multi-step intakes live here, not under /forms) ----
+  async listSurveys() {
+    const data = await this.req('GET', '/surveys/', {
+      query: { locationId: this.locationId, limit: 50 },
+    });
+    return data.surveys || [];
+  }
+
+  async surveySubmissions({ surveyId, startAt, endAt, page = 1, limit = 100 } = {}) {
+    const data = await this.req('GET', '/surveys/submissions', {
+      query: { locationId: this.locationId, surveyId, startAt, endAt, page, limit },
+    });
+    return data.submissions || [];
+  }
+
+  // Unified: id may be "form:xxx" or "survey:xxx" (bare id = form)
+  async listIntakeSources() {
+    const [forms, surveys] = await Promise.all([
+      this.listForms().catch(() => []),
+      this.listSurveys().catch(() => []),
+    ]);
+    return [
+      ...forms.map((f) => ({ id: `form:${f.id}`, name: `Form: ${f.name}` })),
+      ...surveys.map((s) => ({ id: `survey:${s.id}`, name: `Survey: ${s.name}` })),
+    ];
+  }
+
+  async intakeSubmissions(sourceId, opts = {}) {
+    if (String(sourceId).startsWith('survey:')) {
+      return this.surveySubmissions({ ...opts, surveyId: sourceId.slice(7) });
+    }
+    const formId = String(sourceId).startsWith('form:') ? sourceId.slice(5) : sourceId;
+    return this.formSubmissions({ ...opts, formId });
+  }
+
   // ---- Contacts ----
   async upsertContact({ email, name, phone }) {
     const body = { locationId: this.locationId, email };
