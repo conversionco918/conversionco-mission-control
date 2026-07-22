@@ -31,7 +31,7 @@ export const DEFAULT_TEMPLATES = {
 };
 
 export const DEFAULT_SETTINGS = {
-  ghl_location_id: '',
+  ghl_location_id: 'Rl6440Fbo39WBs8mJaIV', // ConversionCo GHL sub-account
   form1_id: '',
   form2_id: '',
   form1_link: 'https://conversionco918.com/intake-form-for-clients',
