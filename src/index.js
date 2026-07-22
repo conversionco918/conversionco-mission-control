@@ -269,6 +269,74 @@ app.get('/debug/:key', async (c) => {
   });
 });
 
+// ---- AI image generation (OpenAI) → commits PNG into the client-sites repo ----
+// Keyed endpoint so the builder can trigger it without a browser session.
+app.post('/api/genimage/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  if (!c.env.OPENAI_API_KEY) return c.json({ ok: false, error: 'OPENAI_API_KEY secret not set yet' });
+  if (!c.env.GITHUB_TOKEN) return c.json({ ok: false, error: 'GITHUB_TOKEN secret not set' });
+  const { prompt, slug, name, size = '1024x1536' } = await c.req.json();
+  if (!prompt || !slug || !name) return c.json({ ok: false, error: 'prompt, slug, name required' }, 400);
+  const settings = await getSettings(c.env.DB);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  try {
+    // try gpt-image-1 first, fall back to dall-e-3
+    let b64 = null;
+    let modelUsed = 'gpt-image-1';
+    let res = await fetch('https://api.openai.com/v1/images/generations', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${c.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-image-1', prompt, size, quality: 'high' }),
+    });
+    let data = await res.json();
+    if (data?.data?.[0]?.b64_json) {
+      b64 = data.data[0].b64_json;
+    } else {
+      modelUsed = 'dall-e-3';
+      res = await fetch('https://api.openai.com/v1/images/generations', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${c.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'dall-e-3', prompt, size: '1024x1792', quality: 'hd', response_format: 'b64_json' }),
+      });
+      data = await res.json();
+      if (data?.data?.[0]?.b64_json) b64 = data.data[0].b64_json;
+      else return c.json({ ok: false, error: JSON.stringify(data?.error || data).slice(0, 400) });
+    }
+    // commit PNG to GitHub repo
+    const path = `sites/${slug}/img/${name}.png`;
+    const getRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+      headers: { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' },
+    });
+    const existing = getRes.ok ? await getRes.json() : null;
+    const putRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: `Generate ${name}.png (${modelUsed})`, content: b64, ...(existing?.sha ? { sha: existing.sha } : {}) }),
+    });
+    if (!putRes.ok) return c.json({ ok: false, error: `GitHub commit failed: ${putRes.status}` });
+    // also store directly into D1 so the preview serves it immediately
+    await c.env.DB.prepare(
+      `INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
+       VALUES (?, ?, ?, 'image/png', 1, datetime('now'))
+       ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, is_base64=1, updated_at=datetime('now')`
+    ).bind(slug, `img/${name}.png`, b64).run();
+    return c.json({ ok: true, model: modelUsed, path, preview: `${BASE_URL}/preview/${slug}/img/${name}.png` });
+  } catch (e) {
+    return c.json({ ok: false, error: e.message }, 502);
+  }
+});
+
+app.get('/api/genimage/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const q = c.req.query();
+  const res = await app.request('/api/genimage/gen-4b8e1d7f3a', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt: q.prompt, slug: q.slug, name: q.name, size: q.size }),
+  }, c.env, c.executionCtx);
+  return res;
+});
+
 // Everything below requires a session
 app.use('*', async (c, next) => {
   if (await checkSession(c.env, c.req.header('Cookie'))) return next();
