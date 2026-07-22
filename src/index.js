@@ -378,6 +378,21 @@ app.post('/api/fetchimg/:key', async (c) => {
 });
 app.options('/api/fetchimg/:key', (c) => { corsHeaders(c); return c.body(null, 204); });
 
+// GET variant: grab an image URL via top-level navigation (bypasses page CSP)
+app.get('/api/grabimg/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const q = c.req.query();
+  const res = await app.request('/api/fetchimg/gen-4b8e1d7f3a', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url: q.u, slug: q.slug, name: q.name }),
+  }, c.env, c.executionCtx);
+  const data = await res.json().catch(() => ({}));
+  return c.html(`<html><body style="font-family:sans-serif;background:#111;color:#eee;padding:40px">
+    <h2>${data.ok ? '✅ SAVED' : '❌ FAILED'}</h2><p>${q.name}: ${data.ok ? data.bytes + ' bytes' : (data.error || 'unknown')}</p>
+  </body></html>`);
+});
+
 // Everything below requires a session
 app.use('*', async (c, next) => {
   if (await checkSession(c.env, c.req.header('Cookie'))) return next();
