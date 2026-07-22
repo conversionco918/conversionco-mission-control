@@ -449,83 +449,120 @@ app.post('/api/gh/raw', async (c) => {
   return c.json({ status: res.status, data });
 });
 
-// Import a generated site from the client-sites GitHub repo into D1 + flip stage + notify
-app.post('/api/sites/import', async (c) => {
-  const db = c.env.DB;
-  const { slug, client_id } = await c.req.json();
-  if (!slug) return c.json({ error: 'slug required' }, 400);
-  if (!c.env.GITHUB_TOKEN) return c.json({ error: 'GITHUB_TOKEN secret not set' }, 400);
-  const settings = await getSettings(db);
-  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+// ---- site import machinery (shared by API endpoint + cron auto-publish) ----
+const BASE_URL = 'https://conversionco-mission-control.conversionco918.workers.dev';
 
-  async function gh(path) {
+function ghFetcher(env) {
+  return async function gh(path) {
     const res = await fetch(`https://api.github.com${path}`, {
       headers: {
-        Authorization: `Bearer ${c.env.GITHUB_TOKEN}`,
+        Authorization: `Bearer ${env.GITHUB_TOKEN}`,
         'User-Agent': 'conversionco-mission-control',
         Accept: 'application/vnd.github+json',
       },
     });
     if (!res.ok) throw new Error(`GitHub ${path} -> ${res.status}`);
     return res.json();
-  }
+  };
+}
 
-  try {
-    // recursive tree of the repo, filter to sites/<slug>/
+async function importSite(env, settings, slug, clientId, treeFiles) {
+  const db = env.DB;
+  const gh = ghFetcher(env);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  let files = treeFiles;
+  if (!files) {
     const ref = await gh(`/repos/${repo}/git/ref/heads/main`);
     const commit = await gh(`/repos/${repo}/git/commits/${ref.object.sha}`);
     const tree = await gh(`/repos/${repo}/git/trees/${commit.tree.sha}?recursive=1`);
     const prefix = `sites/${slug}/`;
-    const files = (tree.tree || []).filter((t) => t.type === 'blob' && t.path.startsWith(prefix));
-    if (!files.length) return c.json({ error: `No files found under ${prefix} in ${repo}` }, 404);
-
-    let count = 0;
-    for (const f of files) {
-      const blob = await gh(`/repos/${repo}/git/blobs/${f.sha}`);
-      const rel = f.path.slice(prefix.length);
-      const ext = (rel.split('.').pop() || '').toLowerCase();
-      const ctype = MIME[ext] || 'application/octet-stream';
-      const isText = /^(text\/|application\/(javascript|json|xml))/.test(ctype) || ext === 'svg';
-      const content = isText
-        ? new TextDecoder().decode(Uint8Array.from(atob(blob.content.replace(/\n/g, '')), (ch) => ch.charCodeAt(0)))
-        : blob.content.replace(/\n/g, '');
-      await db.prepare(
-        `INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
-         VALUES (?, ?, ?, ?, ?, datetime('now'))
-         ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, content_type=excluded.content_type,
-         is_base64=excluded.is_base64, updated_at=datetime('now')`
-      ).bind(slug, rel, content, ctype, isText ? 0 : 1).run();
-      count++;
-    }
-
-    const previewUrl = `${new URL(c.req.url).origin}/preview/${slug}/`;
-    if (client_id) {
-      await touchClient(db, Number(client_id), { stage: 'preview_ready', preview_url: previewUrl });
-      await logEvent(db, Number(client_id), 'preview_ready', previewUrl);
-      // notify Tiffany by email (best effort)
-      if (settings.notify_email && settings.ghl_location_id) {
-        const notify = (async () => {
-          try {
-            const ghl = ghlFor(c.env, settings);
-            const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(Number(client_id)).first();
-            const contact = await ghl.upsertContact({ email: settings.notify_email, name: 'ConversionCo Notifications' });
-            await ghl.sendEmail({
-              contactId: contact.id || contact.contactId,
-              subject: `🎉 Website ready: ${client?.business_name || client?.name || slug}`,
-              html: `<p>The site for <b>${client?.name || slug}</b> (${client?.email || ''}) is built and ready for your review.</p>
-                     <p><a href="${previewUrl}">View the preview</a> &middot; <a href="${new URL(c.req.url).origin}">Open Mission Control</a></p>
-                     <p>When you approve it, we connect the domain and go live.</p>`,
-              emailFrom: settings.email_from || undefined,
-            });
-            await logEvent(db, Number(client_id), 'notified', `Notification sent to ${settings.notify_email}`);
-          } catch (e) {
-            await logEvent(db, Number(client_id), 'error', `Notify failed: ${e.message}`);
-          }
-        })();
-        c.executionCtx.waitUntil(notify);
+    files = (tree.tree || []).filter((t) => t.type === 'blob' && t.path.startsWith(prefix));
+  }
+  if (!files.length) throw new Error(`No files for ${slug}`);
+  const prefix = `sites/${slug}/`;
+  let count = 0;
+  for (const f of files) {
+    const blob = await gh(`/repos/${repo}/git/blobs/${f.sha}`);
+    const rel = f.path.slice(prefix.length);
+    const ext = (rel.split('.').pop() || '').toLowerCase();
+    const ctype = MIME[ext] || 'application/octet-stream';
+    const isText = /^(text\/|application\/(javascript|json|xml))/.test(ctype) || ext === 'svg';
+    const content = isText
+      ? new TextDecoder().decode(Uint8Array.from(atob(blob.content.replace(/\n/g, '')), (ch) => ch.charCodeAt(0)))
+      : blob.content.replace(/\n/g, '');
+    await db.prepare(
+      `INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
+       VALUES (?, ?, ?, ?, ?, datetime('now'))
+       ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, content_type=excluded.content_type,
+       is_base64=excluded.is_base64, updated_at=datetime('now')`
+    ).bind(slug, rel, content, ctype, isText ? 0 : 1).run();
+    count++;
+  }
+  const previewUrl = `${BASE_URL}/preview/${slug}/`;
+  if (clientId) {
+    await touchClient(db, Number(clientId), { stage: 'preview_ready', preview_url: previewUrl });
+    await logEvent(db, Number(clientId), 'preview_ready', previewUrl);
+    if (settings.notify_email && settings.ghl_location_id) {
+      try {
+        const ghl = new GHL(env.GHL_TOKEN, settings.ghl_location_id);
+        const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(Number(clientId)).first();
+        const contact = await ghl.upsertContact({ email: settings.notify_email, name: 'ConversionCo Notifications' });
+        await ghl.sendEmail({
+          contactId: contact.id || contact.contactId,
+          subject: `🎉 Website ready: ${client?.business_name || client?.name || slug}`,
+          html: `<p>The site for <b>${client?.name || slug}</b> (${client?.email || ''}) is built and ready for your review.</p>
+                 <p><a href="${previewUrl}">View the preview</a> &middot; <a href="${BASE_URL}">Open Mission Control</a></p>
+                 <p>When you approve it, we connect the domain and go live.</p>`,
+          emailFrom: settings.email_from || undefined,
+        });
+        await logEvent(db, Number(clientId), 'notified', `Notification sent to ${settings.notify_email}`);
+      } catch (e) {
+        await logEvent(db, Number(clientId), 'error', `Notify failed: ${e.message}`);
       }
     }
-    return c.json({ ok: true, files: count, preview_url: previewUrl });
+  }
+  return { files: count, preview_url: previewUrl };
+}
+
+// Cron: auto-publish any new/updated site pushed to the client-sites repo
+async function autoPublish(env, settings) {
+  if (!env.GITHUB_TOKEN) return;
+  const db = env.DB;
+  const gh = ghFetcher(env);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  const ref = await gh(`/repos/${repo}/git/ref/heads/main`);
+  const commit = await gh(`/repos/${repo}/git/commits/${ref.object.sha}`);
+  const tree = await gh(`/repos/${repo}/git/trees/${commit.tree.sha}?recursive=1`);
+  const blobs = (tree.tree || []).filter((t) => t.type === 'blob');
+  const metas = blobs.filter((t) => /^sites\/[^/]+\/site-meta\.json$/.test(t.path));
+  for (const m of metas) {
+    const slug = m.path.split('/')[1];
+    const seenKey = `site_sha_${slug}`;
+    const seen = settings[seenKey];
+    if (seen === m.sha) continue; // unchanged
+    try {
+      const metaBlob = await gh(`/repos/${repo}/git/blobs/${m.sha}`);
+      const meta = JSON.parse(new TextDecoder().decode(
+        Uint8Array.from(atob(metaBlob.content.replace(/\n/g, '')), (ch) => ch.charCodeAt(0))));
+      const files = blobs.filter((t) => t.path.startsWith(`sites/${slug}/`));
+      await importSite(env, settings, slug, meta.client_id, files);
+      await setSetting(db, seenKey, m.sha);
+      await logEvent(db, meta.client_id || null, 'auto_published', `${slug} auto-published from GitHub`);
+    } catch (e) {
+      await logEvent(db, null, 'error', `Auto-publish ${slug} failed: ${e.message}`);
+    }
+  }
+}
+
+// Manual import endpoint (session-protected)
+app.post('/api/sites/import', async (c) => {
+  const { slug, client_id } = await c.req.json();
+  if (!slug) return c.json({ error: 'slug required' }, 400);
+  if (!c.env.GITHUB_TOKEN) return c.json({ error: 'GITHUB_TOKEN secret not set' }, 400);
+  const settings = await getSettings(c.env.DB);
+  try {
+    const r = await importSite(c.env, settings, slug, client_id);
+    return c.json({ ok: true, ...r });
   } catch (e) {
     return c.json({ ok: false, error: e.message }, 502);
   }
@@ -623,6 +660,9 @@ export default {
     const settings = await getSettings(env.DB);
     ctx.waitUntil(pollForms(env, settings).catch((e) =>
       logEvent(env.DB, null, 'error', `Poll failed: ${e.message}`)
+    ));
+    ctx.waitUntil(autoPublish(env, settings).catch((e) =>
+      logEvent(env.DB, null, 'error', `Auto-publish failed: ${e.message}`)
     ));
   },
 };
