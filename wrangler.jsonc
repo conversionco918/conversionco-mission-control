@@ -18,6 +18,9 @@
   },
   "observability": {
     "enabled": true
+  },
+  "vars": {
+    "CF_ACCOUNT_ID": "71e4892c78ac885973b94c7547987acf"
   }
   // Secrets (set with `wrangler secret put NAME` or in the Cloudflare dashboard):
   //   GHL_TOKEN        - GoHighLevel private integration token

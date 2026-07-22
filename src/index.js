@@ -343,6 +343,22 @@ app.get('/api/ghl/test', async (c) => {
   }
 });
 
+// Test Cloudflare API token (used by the site-builder to publish client sites)
+app.get('/api/cf/test', async (c) => {
+  if (!c.env.CLOUDFLARE_API_TOKEN) return c.json({ ok: false, error: 'CLOUDFLARE_API_TOKEN secret is not set yet.' });
+  try {
+    const res = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${c.env.CF_ACCOUNT_ID}/pages/projects`,
+      { headers: { Authorization: `Bearer ${c.env.CLOUDFLARE_API_TOKEN}` } }
+    );
+    const data = await res.json();
+    if (!data.success) return c.json({ ok: false, error: JSON.stringify(data.errors).slice(0, 300) });
+    return c.json({ ok: true, projects: (data.result || []).map((p) => p.name) });
+  } catch (e) {
+    return c.json({ ok: false, error: e.message });
+  }
+});
+
 app.post('/api/poll-now', async (c) => {
   const settings = await getSettings(c.env.DB);
   try {
