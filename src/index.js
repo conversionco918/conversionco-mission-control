@@ -390,6 +390,42 @@ app.post('/api/fetchimg/:key', async (c) => {
 });
 app.options('/api/fetchimg/:key', (c) => { corsHeaders(c); return c.body(null, 204); });
 
+// Push raw base64 image data (e.g. read out of a page that blocks downloads) → GitHub + D1
+app.post('/api/pushimg/:key', async (c) => {
+  corsHeaders(c);
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  if (!c.env.GITHUB_TOKEN) return c.json({ ok: false, error: 'GITHUB_TOKEN secret not set' });
+  const { b64, slug, name, ext = 'png' } = await c.req.json();
+  if (!b64 || !slug || !name) return c.json({ ok: false, error: 'b64, slug, name required' }, 400);
+  if (b64.length > 11_000_000) return c.json({ ok: false, error: 'image too large' });
+  const clean = b64.replace(/^data:[^,]+,/, '');
+  const safeExt = ext === 'webp' ? 'webp' : ext === 'jpg' ? 'jpg' : 'png';
+  const mime = safeExt === 'webp' ? 'image/webp' : safeExt === 'jpg' ? 'image/jpeg' : 'image/png';
+  const settings = await getSettings(c.env.DB);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  try {
+    const path = `sites/${slug}/img/${name}.${safeExt}`;
+    const ghHeaders = { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+    const getRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, { headers: ghHeaders });
+    const existing = getRes.ok ? await getRes.json() : null;
+    const putRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+      method: 'PUT',
+      headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: `Add ${name}.${safeExt}`, content: clean, ...(existing?.sha ? { sha: existing.sha } : {}) }),
+    });
+    if (!putRes.ok) return c.json({ ok: false, error: `GitHub ${putRes.status}: ${(await putRes.text()).slice(0, 200)}` });
+    await c.env.DB.prepare(
+      `INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
+       VALUES (?, ?, ?, ?, 1, datetime('now'))
+       ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, content_type=excluded.content_type, is_base64=1, updated_at=datetime('now')`
+    ).bind(slug, `img/${name}.${safeExt}`, clean, mime).run();
+    return c.json({ ok: true, bytes: Math.floor(clean.length * 0.75), path, preview: `${BASE_URL}/preview/${slug}/img/${name}.${safeExt}` });
+  } catch (e) {
+    return c.json({ ok: false, error: e.message }, 502);
+  }
+});
+app.options('/api/pushimg/:key', (c) => { corsHeaders(c); return c.body(null, 204); });
+
 // GET variant: grab an image URL via top-level navigation (bypasses page CSP)
 app.get('/api/grabimg/:key', async (c) => {
   if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
