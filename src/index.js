@@ -337,6 +337,47 @@ app.get('/api/genimage/:key', async (c) => {
   return res;
 });
 
+// Fetch an image from a URL (e.g. a generated render) and store it into a site + GitHub
+app.post('/api/fetchimg/:key', async (c) => {
+  corsHeaders(c);
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  if (!c.env.GITHUB_TOKEN) return c.json({ ok: false, error: 'GITHUB_TOKEN secret not set' });
+  const { url, slug, name } = await c.req.json();
+  if (!url || !slug || !name) return c.json({ ok: false, error: 'url, slug, name required' }, 400);
+  const settings = await getSettings(c.env.DB);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  try {
+    const imgRes = await fetch(url);
+    if (!imgRes.ok) return c.json({ ok: false, error: `fetch ${imgRes.status}` });
+    const buf = new Uint8Array(await imgRes.arrayBuffer());
+    if (buf.length > 8_000_000) return c.json({ ok: false, error: 'image too large' });
+    let bin = '';
+    const chunk = 0x8000;
+    for (let i = 0; i < buf.length; i += chunk) bin += String.fromCharCode.apply(null, buf.subarray(i, i + chunk));
+    const b64 = btoa(bin);
+    const path = `sites/${slug}/img/${name}.png`;
+    const getRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+      headers: { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' },
+    });
+    const existing = getRes.ok ? await getRes.json() : null;
+    const putRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: `Add ${name}.png`, content: b64, ...(existing?.sha ? { sha: existing.sha } : {}) }),
+    });
+    if (!putRes.ok) return c.json({ ok: false, error: `GitHub ${putRes.status}` });
+    await c.env.DB.prepare(
+      `INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
+       VALUES (?, ?, ?, 'image/png', 1, datetime('now'))
+       ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, is_base64=1, updated_at=datetime('now')`
+    ).bind(slug, `img/${name}.png`, b64).run();
+    return c.json({ ok: true, bytes: buf.length, path });
+  } catch (e) {
+    return c.json({ ok: false, error: e.message }, 502);
+  }
+});
+app.options('/api/fetchimg/:key', (c) => { corsHeaders(c); return c.body(null, 204); });
+
 // Everything below requires a session
 app.use('*', async (c, next) => {
   if (await checkSession(c.env, c.req.header('Cookie'))) return next();
