@@ -10,7 +10,7 @@
     {
       "binding": "DB",
       "database_name": "conversionco-db",
-      "database_id": "REPLACE_AFTER_CREATE"
+      "database_id": "fc4094bf-d199-4715-99d4-6d939cdff701"
     }
   ],
   "triggers": {
