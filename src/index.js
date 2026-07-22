@@ -23,6 +23,11 @@ const SCHEMA_SQL = [
     client_id INTEGER, type TEXT NOT NULL, detail TEXT DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now')))`,
   `CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '')`,
+  `CREATE TABLE IF NOT EXISTS site_files (
+    slug TEXT NOT NULL, path TEXT NOT NULL, content TEXT NOT NULL DEFAULT '',
+    content_type TEXT NOT NULL DEFAULT 'text/html', is_base64 INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (slug, path))`,
   `CREATE INDEX IF NOT EXISTS idx_events_client ON events(client_id)`,
   `CREATE INDEX IF NOT EXISTS idx_clients_stage ON clients(stage)`,
 ];
@@ -204,6 +209,24 @@ app.post('/intake/:n', async (c) => {
   return c.json({ success: true, message: 'Submission received' });
 });
 
+// ---------------- public preview serving (client site previews) ----------------
+const MIME = { html: 'text/html;charset=utf-8', css: 'text/css', js: 'application/javascript', json: 'application/json', svg: 'image/svg+xml', xml: 'application/xml', txt: 'text/plain', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', ico: 'image/x-icon', woff2: 'font/woff2' };
+
+app.get('/preview/:slug', (c) => c.redirect(`/preview/${c.req.param('slug')}/`));
+app.get('/preview/:slug/*', async (c) => {
+  const slug = c.req.param('slug');
+  let path = c.req.path.replace(`/preview/${slug}/`, '') || 'index.html';
+  if (path === '' || path.endsWith('/')) path += 'index.html';
+  let row = await c.env.DB.prepare('SELECT * FROM site_files WHERE slug = ? AND path = ?').bind(slug, path).first();
+  if (!row && !path.includes('.')) {
+    row = await c.env.DB.prepare('SELECT * FROM site_files WHERE slug = ? AND path = ?').bind(slug, path + '/index.html').first()
+      || await c.env.DB.prepare('SELECT * FROM site_files WHERE slug = ? AND path = ?').bind(slug, path + '.html').first();
+  }
+  if (!row) return c.text('Not found', 404);
+  const body = row.is_base64 ? Uint8Array.from(atob(row.content), (ch) => ch.charCodeAt(0)) : row.content;
+  return new Response(body, { headers: { 'Content-Type': row.content_type, 'Cache-Control': 'no-cache' } });
+});
+
 // ---------------- auth ----------------
 app.post('/login', async (c) => {
   const { password } = await c.req.parseBody();
@@ -350,6 +373,7 @@ app.post('/api/settings', async (c) => {
     'ghl_location_id', 'form1_id', 'form2_id', 'form1_link', 'form2_link', 'email_from',
     'intake1_subject', 'intake1_body', 'intake2_subject', 'intake2_body',
     'booking_link', 'booking_subject', 'booking_body',
+    'notify_email', 'sites_repo',
   ];
   for (const k of allowed) if (k in body) await setSetting(c.env.DB, k, body[k]);
   return c.json({ ok: true });
@@ -387,6 +411,123 @@ app.post('/api/ghl/raw', async (c) => {
     return c.json({ ok: true, data });
   } catch (e) {
     return c.json({ ok: false, error: e.message, status: e.status, detail: e.data }, 200);
+  }
+});
+
+// Cloudflare API passthrough (session-protected) — for infra automation
+app.post('/api/cf/raw', async (c) => {
+  const { method = 'GET', path, body } = await c.req.json();
+  if (!path || !path.startsWith('/')) return c.json({ error: 'path required' }, 400);
+  const res = await fetch(`https://api.cloudflare.com/client/v4${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${c.env.CLOUDFLARE_API_TOKEN}`,
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  return c.json({ status: res.status, data });
+});
+
+// GitHub API passthrough (session-protected) — for repo automation
+app.post('/api/gh/raw', async (c) => {
+  if (!c.env.GITHUB_TOKEN) return c.json({ error: 'GITHUB_TOKEN secret not set' }, 400);
+  const { method = 'GET', path, body } = await c.req.json();
+  if (!path || !path.startsWith('/')) return c.json({ error: 'path required' }, 400);
+  const res = await fetch(`https://api.github.com${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${c.env.GITHUB_TOKEN}`,
+      'User-Agent': 'conversionco-mission-control',
+      Accept: 'application/vnd.github+json',
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  return c.json({ status: res.status, data });
+});
+
+// Import a generated site from the client-sites GitHub repo into D1 + flip stage + notify
+app.post('/api/sites/import', async (c) => {
+  const db = c.env.DB;
+  const { slug, client_id } = await c.req.json();
+  if (!slug) return c.json({ error: 'slug required' }, 400);
+  if (!c.env.GITHUB_TOKEN) return c.json({ error: 'GITHUB_TOKEN secret not set' }, 400);
+  const settings = await getSettings(db);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+
+  async function gh(path) {
+    const res = await fetch(`https://api.github.com${path}`, {
+      headers: {
+        Authorization: `Bearer ${c.env.GITHUB_TOKEN}`,
+        'User-Agent': 'conversionco-mission-control',
+        Accept: 'application/vnd.github+json',
+      },
+    });
+    if (!res.ok) throw new Error(`GitHub ${path} -> ${res.status}`);
+    return res.json();
+  }
+
+  try {
+    // recursive tree of the repo, filter to sites/<slug>/
+    const ref = await gh(`/repos/${repo}/git/ref/heads/main`);
+    const commit = await gh(`/repos/${repo}/git/commits/${ref.object.sha}`);
+    const tree = await gh(`/repos/${repo}/git/trees/${commit.tree.sha}?recursive=1`);
+    const prefix = `sites/${slug}/`;
+    const files = (tree.tree || []).filter((t) => t.type === 'blob' && t.path.startsWith(prefix));
+    if (!files.length) return c.json({ error: `No files found under ${prefix} in ${repo}` }, 404);
+
+    let count = 0;
+    for (const f of files) {
+      const blob = await gh(`/repos/${repo}/git/blobs/${f.sha}`);
+      const rel = f.path.slice(prefix.length);
+      const ext = (rel.split('.').pop() || '').toLowerCase();
+      const ctype = MIME[ext] || 'application/octet-stream';
+      const isText = /^(text\/|application\/(javascript|json|xml))/.test(ctype) || ext === 'svg';
+      const content = isText
+        ? new TextDecoder().decode(Uint8Array.from(atob(blob.content.replace(/\n/g, '')), (ch) => ch.charCodeAt(0)))
+        : blob.content.replace(/\n/g, '');
+      await db.prepare(
+        `INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
+         VALUES (?, ?, ?, ?, ?, datetime('now'))
+         ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, content_type=excluded.content_type,
+         is_base64=excluded.is_base64, updated_at=datetime('now')`
+      ).bind(slug, rel, content, ctype, isText ? 0 : 1).run();
+      count++;
+    }
+
+    const previewUrl = `${new URL(c.req.url).origin}/preview/${slug}/`;
+    if (client_id) {
+      await touchClient(db, Number(client_id), { stage: 'preview_ready', preview_url: previewUrl });
+      await logEvent(db, Number(client_id), 'preview_ready', previewUrl);
+      // notify Tiffany by email (best effort)
+      if (settings.notify_email && settings.ghl_location_id) {
+        const notify = (async () => {
+          try {
+            const ghl = ghlFor(c.env, settings);
+            const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(Number(client_id)).first();
+            const contact = await ghl.upsertContact({ email: settings.notify_email, name: 'ConversionCo Notifications' });
+            await ghl.sendEmail({
+              contactId: contact.id || contact.contactId,
+              subject: `🎉 Website ready: ${client?.business_name || client?.name || slug}`,
+              html: `<p>The site for <b>${client?.name || slug}</b> (${client?.email || ''}) is built and ready for your review.</p>
+                     <p><a href="${previewUrl}">View the preview</a> &middot; <a href="${new URL(c.req.url).origin}">Open Mission Control</a></p>
+                     <p>When you approve it, we connect the domain and go live.</p>`,
+              emailFrom: settings.email_from || undefined,
+            });
+            await logEvent(db, Number(client_id), 'notified', `Notification sent to ${settings.notify_email}`);
+          } catch (e) {
+            await logEvent(db, Number(client_id), 'error', `Notify failed: ${e.message}`);
+          }
+        })();
+        c.executionCtx.waitUntil(notify);
+      }
+    }
+    return c.json({ ok: true, files: count, preview_url: previewUrl });
+  } catch (e) {
+    return c.json({ ok: false, error: e.message }, 502);
   }
 });
 

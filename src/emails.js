@@ -46,6 +46,8 @@ export const BOOKING_TEMPLATES = {
 
 export const DEFAULT_SETTINGS = {
   booking_link: '',
+  notify_email: 'tiffany.anywhereinfusions@gmail.com',
+  sites_repo: 'conversionco918/conversionco-client-sites',
   ghl_location_id: 'Rl6440Fbo39WBs8mJaIV', // ConversionCo GHL sub-account
   form1_id: '',
   form2_id: '',
