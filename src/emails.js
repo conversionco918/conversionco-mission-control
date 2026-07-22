@@ -30,7 +30,22 @@ export const DEFAULT_TEMPLATES = {
 `,
 };
 
+export const BOOKING_TEMPLATES = {
+  booking_subject: "Got your blueprint! Let's pick a time to talk 📅",
+  booking_body: `
+<p>Hi {{name}},</p>
+<p>Your Business Growth Blueprint just landed in my inbox — I'm already excited about what we can build for you!</p>
+<p>Next step: a quick call to walk through your goals and map out your website plan. Grab whatever time works best for you:</p>
+<p style="margin:24px 0;">
+  <a href="{{booking_link}}" style="background:#071B33;color:#ffffff;padding:12px 24px;border-radius:6px;text-decoration:none;font-weight:bold;">Pick Your Call Time &rarr;</a>
+</p>
+<p>As soon as you book, you'll get a confirmation with a Zoom link — that's where we'll meet.</p>
+<p>Talk soon,<br>Tiffany<br>ConversionCo</p>
+`,
+};
+
 export const DEFAULT_SETTINGS = {
+  booking_link: '',
   ghl_location_id: 'Rl6440Fbo39WBs8mJaIV', // ConversionCo GHL sub-account
   form1_id: '',
   form2_id: '',

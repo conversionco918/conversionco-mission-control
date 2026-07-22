@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { GHL } from './ghl.js';
-import { DEFAULT_TEMPLATES, DEFAULT_SETTINGS, renderTemplate } from './emails.js';
+import { DEFAULT_TEMPLATES, BOOKING_TEMPLATES, DEFAULT_SETTINGS, renderTemplate } from './emails.js';
 import dashboardHtml from './ui.html';
 import loginHtml from './login.html';
 
@@ -66,7 +66,7 @@ async function checkSession(env, cookie) {
 
 async function getSettings(db) {
   const rows = (await db.prepare('SELECT key, value FROM settings').all()).results || [];
-  const s = { ...DEFAULT_SETTINGS, ...DEFAULT_TEMPLATES };
+  const s = { ...DEFAULT_SETTINGS, ...DEFAULT_TEMPLATES, ...BOOKING_TEMPLATES };
   for (const r of rows) s[r.key] = r.value;
   return s;
 }
@@ -140,14 +140,20 @@ app.post('/intake/:n', async (c) => {
     ? ['new', 'intake1_sent', 'intake1_done', 'intake2_sent']
     : ['new', 'intake1_sent'];
 
+  let clientId = null;
+  let firstTime = false;
   if (email) {
     const client = await db.prepare('SELECT * FROM clients WHERE email = ?').bind(email).first();
     if (!client) {
       const r = await db.prepare(
         `INSERT INTO clients (email, name, phone, stage, ${dataCol}) VALUES (?, ?, ?, ?, ?)`
       ).bind(email, name, phone, doneStage, JSON.stringify(stored)).run();
-      await logEvent(db, r.meta.last_row_id, doneStage, `Intake ${n} submitted (new contact)`);
+      clientId = r.meta.last_row_id;
+      firstTime = true;
+      await logEvent(db, clientId, doneStage, `Intake ${n} submitted (new contact)`);
     } else {
+      clientId = client.id;
+      firstTime = !(client[dataCol] && client[dataCol].length > 2);
       const updates = { [dataCol]: JSON.stringify(stored) };
       if (name && !client.name) updates.name = name;
       if (phone && !client.phone) updates.phone = phone;
@@ -157,6 +163,32 @@ app.post('/intake/:n', async (c) => {
     }
   } else {
     await logEvent(db, null, 'error', `Intake ${n} submission had no email: ${JSON.stringify(stored).slice(0, 500)}`);
+  }
+
+  // After a first-time Intake 1: automatically email the booking link (best effort)
+  if (n === 1 && email && firstTime) {
+    const settings = await getSettings(db);
+    if (settings.booking_link && c.env.GHL_TOKEN && settings.ghl_location_id) {
+      const sendBooking = (async () => {
+        try {
+          const ghl = ghlFor(c.env, settings);
+          const contact = await ghl.upsertContact({ email, name, phone });
+          const contactId = contact.id || contact.contactId;
+          if (clientId && contactId) await touchClient(db, clientId, { ghl_contact_id: contactId });
+          const firstName = (name || '').split(' ')[0] || 'there';
+          await ghl.sendEmail({
+            contactId,
+            subject: renderTemplate(settings.booking_subject, { name: firstName }),
+            html: renderTemplate(settings.booking_body, { name: firstName, booking_link: settings.booking_link }),
+            emailFrom: settings.email_from || undefined,
+          });
+          await logEvent(db, clientId, 'booking_email_sent', `Booking link sent to ${email}`);
+        } catch (e) {
+          await logEvent(db, clientId, 'error', `Booking email failed: ${e.message}`);
+        }
+      })();
+      c.executionCtx.waitUntil(sendBooking);
+    }
   }
 
   // forward to Web3Forms so email notifications keep working (best effort)
@@ -317,6 +349,7 @@ app.post('/api/settings', async (c) => {
   const allowed = [
     'ghl_location_id', 'form1_id', 'form2_id', 'form1_link', 'form2_link', 'email_from',
     'intake1_subject', 'intake1_body', 'intake2_subject', 'intake2_body',
+    'booking_link', 'booking_subject', 'booking_body',
   ];
   for (const k of allowed) if (k in body) await setSetting(c.env.DB, k, body[k]);
   return c.json({ ok: true });

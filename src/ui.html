@@ -141,6 +141,13 @@
     <label>Send emails from (optional, must be verified in GHL)</label>
     <input id="s_from" placeholder="tiffany@conversionco918.com">
 
+    <label>Booking calendar link <span style="font-weight:400;color:var(--muted)">(your GHL calendar — auto-emailed after Intake 1 is submitted)</span></label>
+    <input id="s_booklink" placeholder="https://api.leadconnectorhq.com/widget/booking/...">
+    <label>Booking email — subject</label>
+    <input id="s_bsub">
+    <label>Booking email — body ({{name}} and {{booking_link}} get filled in)</label>
+    <textarea id="s_bbody" rows="6"></textarea>
+
     <label>Intake 1 email — subject</label>
     <input id="s_sub1">
     <label>Intake 1 email — body (HTML, {{name}} and {{form_link}} get filled in)</label>
@@ -208,7 +215,7 @@ function renderFeed() {
   if (!STATE.events.length) { f.innerHTML = '<div class="empty">Activity will appear here.</div>'; return; }
   f.innerHTML = STATE.events.map(e => `<div class="item"><b>${esc(e.client_name || e.client_email || 'System')}</b> — ${esc(pretty(e.type))}${e.detail && e.type==='error' ? `<br><span style="color:var(--red);font-size:12px">${esc(e.detail)}</span>`:''}<time>${ago(e.created_at)}</time></div>`).join('');
 }
-function pretty(t){ return ({client_created:'added to pipeline', intake1_sent:'Intake 1 email sent', intake1_done:'submitted Intake 1 🎉', intake2_sent:'Intake 2 email sent', intake2_done:'submitted Intake 2 🎉', stage_changed:'stage updated', error:'⚠ error', client_deleted:'removed', webhook_received:'webhook ping'})[t] || t; }
+function pretty(t){ return ({client_created:'added to pipeline', booking_email_sent:'booking link emailed 📅', intake1_sent:'Intake 1 email sent', intake1_done:'submitted Intake 1 🎉', intake2_sent:'Intake 2 email sent', intake2_done:'submitted Intake 2 🎉', stage_changed:'stage updated', error:'⚠ error', client_deleted:'removed', webhook_received:'webhook ping'})[t] || t; }
 
 async function addClient() {
   const email = document.getElementById('newEmail').value.trim();
@@ -282,6 +289,7 @@ function openSettings() {
   s_loc.value = s.ghl_location_id || ''; s_link1.value = s.form1_link || ''; s_link2.value = s.form2_link || '';
   s_from.value = s.email_from || ''; s_sub1.value = s.intake1_subject || ''; s_body1.value = s.intake1_body || '';
   s_sub2.value = s.intake2_subject || ''; s_body2.value = s.intake2_body || '';
+  s_booklink.value = s.booking_link || ''; s_bsub.value = s.booking_subject || ''; s_bbody.value = s.booking_body || '';
   setFormOptions([{id: s.form1_id, name: s.form1_id ? '(saved form)' : ''}, {id: s.form2_id, name: s.form2_id ? '(saved form)' : ''}].filter(f=>f.id));
   s_form1.value = s.form1_id || ''; s_form2.value = s.form2_id || '';
   document.getElementById('settingsModal').classList.add('open');
@@ -309,6 +317,7 @@ async function saveSettings(btn) {
     ghl_location_id: s_loc.value.trim(), form1_id: s_form1.value, form2_id: s_form2.value,
     form1_link: s_link1.value.trim(), form2_link: s_link2.value.trim(), email_from: s_from.value.trim(),
     intake1_subject: s_sub1.value, intake1_body: s_body1.value, intake2_subject: s_sub2.value, intake2_body: s_body2.value,
+    booking_link: s_booklink.value.trim(), booking_subject: s_bsub.value, booking_body: s_bbody.value,
   })});
   btn.disabled = false; closeSettings(); toast('Settings saved ✓'); refresh();
 }
