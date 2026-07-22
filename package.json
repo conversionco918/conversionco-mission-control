@@ -1,0 +1,17 @@
+{
+  "name": "conversionco-mission-control",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ConversionCo website pipeline automation dashboard",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:init": "wrangler d1 execute conversionco-db --remote --file=./schema.sql"
+  },
+  "dependencies": {
+    "hono": "^4.6.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

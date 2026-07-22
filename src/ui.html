@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ConversionCo — Mission Control</title>
+<style>
+  :root {
+    --navy: #071B33; --navy2: #0d2b4d; --bg: #f1f5f9; --card: #ffffff;
+    --line: #e2e8f0; --text: #0f172a; --muted: #64748b;
+    --green: #059669; --amber: #d97706; --blue: #2563eb; --purple: #7c3aed; --red: #dc2626;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body { font-family: -apple-system, 'Segoe UI', Inter, Roboto, sans-serif; background: var(--bg); color: var(--text); }
+  header { background: var(--navy); color: #fff; padding: 14px 24px; display: flex; align-items: center; gap: 16px; position: sticky; top: 0; z-index: 20; }
+  header h1 { font-size: 17px; font-weight: 700; letter-spacing: .3px; }
+  header .tag { font-size: 11px; background: rgba(255,255,255,.14); padding: 3px 10px; border-radius: 99px; }
+  header .spacer { flex: 1; }
+  header button { background: rgba(255,255,255,.12); color: #fff; border: 0; padding: 8px 14px; border-radius: 8px; cursor: pointer; font-size: 13px; }
+  header button:hover { background: rgba(255,255,255,.22); }
+  main { max-width: 1200px; margin: 0 auto; padding: 24px; }
+
+  .addbar { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 22px; box-shadow: 0 1px 3px rgba(0,0,0,.05); }
+  .addbar b { font-size: 14px; margin-right: 4px; }
+  .addbar input { padding: 10px 12px; border: 1.5px solid var(--line); border-radius: 8px; font-size: 14px; }
+  .addbar input:focus { outline: none; border-color: var(--navy); }
+  #newEmail { min-width: 260px; }
+  .btn { padding: 10px 16px; border: 0; border-radius: 8px; font-size: 13.5px; font-weight: 600; cursor: pointer; }
+  .btn-primary { background: var(--navy); color: #fff; }
+  .btn-primary:hover { background: var(--navy2); }
+  .btn-ghost { background: #eef2f7; color: var(--navy); }
+  .btn-green { background: var(--green); color: #fff; }
+  .btn-red { background: #fee2e2; color: var(--red); }
+  .btn:disabled { opacity: .5; cursor: wait; }
+
+  .cols { display: grid; grid-template-columns: 1fr 340px; gap: 22px; align-items: start; }
+  @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
+
+  table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,.05); }
+  th { text-align: left; font-size: 11.5px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); padding: 12px 14px; border-bottom: 1px solid var(--line); background: #f8fafc; }
+  td { padding: 13px 14px; border-bottom: 1px solid var(--line); font-size: 14px; vertical-align: middle; }
+  tr:last-child td { border-bottom: 0; }
+  tr.rowclick { cursor: pointer; }
+  tr.rowclick:hover { background: #f8fafc; }
+  .chip { display: inline-block; padding: 4px 11px; border-radius: 99px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+
+  .panel { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px; box-shadow: 0 1px 3px rgba(0,0,0,.05); }
+  .panel h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin-bottom: 12px; }
+  .feed { display: flex; flex-direction: column; gap: 10px; max-height: 480px; overflow-y: auto; }
+  .feed .item { font-size: 13px; line-height: 1.45; padding-bottom: 10px; border-bottom: 1px dashed var(--line); }
+  .feed .item:last-child { border-bottom: 0; }
+  .feed time { color: var(--muted); font-size: 11.5px; display: block; }
+
+  /* drawer */
+  #overlay { position: fixed; inset: 0; background: rgba(7,27,51,.45); display: none; z-index: 30; }
+  #drawer { position: fixed; top: 0; right: -560px; width: min(560px, 100vw); height: 100vh; background: #fff; z-index: 31; transition: right .25s ease; overflow-y: auto; box-shadow: -12px 0 40px rgba(0,0,0,.2); }
+  #drawer.open { right: 0; } #overlay.open { display: block; }
+  #drawer .dhead { background: var(--navy); color: #fff; padding: 20px 24px; }
+  #drawer .dhead h2 { font-size: 19px; } #drawer .dhead p { opacity: .75; font-size: 13px; margin-top: 3px; }
+  #drawer .dbody { padding: 20px 24px; display: flex; flex-direction: column; gap: 18px; }
+  .kv { font-size: 13.5px; } .kv b { display: block; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 2px; }
+  .intake { background: #f8fafc; border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  .intake h4 { font-size: 13px; margin-bottom: 8px; color: var(--navy); }
+  .intake dl { font-size: 13px; } .intake dt { font-weight: 600; margin-top: 8px; color: #334155; } .intake dd { margin-left: 0; color: #475569; white-space: pre-wrap; }
+  textarea, select, .modal input { width: 100%; padding: 10px 12px; border: 1.5px solid var(--line); border-radius: 8px; font-size: 13.5px; font-family: inherit; }
+  textarea:focus, select:focus, .modal input:focus { outline: none; border-color: var(--navy); }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+  /* modal */
+  .modal { position: fixed; inset: 0; background: rgba(7,27,51,.45); display: none; place-items: center; z-index: 40; }
+  .modal.open { display: grid; }
+  .modal .box { background: #fff; border-radius: 16px; width: min(640px, 94vw); max-height: 90vh; overflow-y: auto; padding: 26px; }
+  .modal h2 { font-size: 18px; margin-bottom: 4px; color: var(--navy); }
+  .modal p.hint { font-size: 12.5px; color: var(--muted); margin-bottom: 14px; }
+  .modal label { display: block; font-size: 12.5px; font-weight: 600; margin: 14px 0 5px; color: #334155; }
+  .modal .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .modal .foot { display: flex; gap: 10px; margin-top: 20px; justify-content: flex-end; }
+  .okmsg { font-size: 13px; padding: 10px 12px; border-radius: 8px; margin-top: 12px; display: none; }
+  .okmsg.ok { background: #ecfdf5; color: var(--green); display: block; }
+  .okmsg.bad { background: #fef2f2; color: var(--red); display: block; }
+
+  #toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: var(--navy); color: #fff; padding: 12px 22px; border-radius: 10px; font-size: 14px; display: none; z-index: 50; box-shadow: 0 10px 30px rgba(0,0,0,.3); }
+  .empty { text-align: center; color: var(--muted); padding: 40px; font-size: 14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ConversionCo</h1><span class="tag">Mission Control</span>
+  <span class="spacer"></span>
+  <button onclick="pollNow(this)">↻ Check for submissions</button>
+  <button onclick="openSettings()">⚙ Settings</button>
+</header>
+
+<main>
+  <div class="addbar">
+    <b>New client:</b>
+    <input id="newEmail" type="email" placeholder="client email address">
+    <input id="newName" type="text" placeholder="name (optional)">
+    <button class="btn btn-primary" id="addBtn" onclick="addClient()">Send Intake 1 →</button>
+  </div>
+
+  <div class="cols">
+    <div>
+      <table>
+        <thead><tr><th>Client</th><th>Stage</th><th>Last activity</th><th></th></tr></thead>
+        <tbody id="clientRows"></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h3>Activity</h3>
+      <div class="feed" id="feed"></div>
+    </div>
+  </div>
+</main>
+
+<!-- client drawer -->
+<div id="overlay" onclick="closeDrawer()"></div>
+<div id="drawer"></div>
+
+<!-- settings modal -->
+<div class="modal" id="settingsModal">
+  <div class="box">
+    <h2>Settings</h2>
+    <p class="hint">Connects the dashboard to your GoHighLevel account and controls the emails clients receive.</p>
+
+    <label>GHL Location ID <span style="font-weight:400;color:var(--muted)">(GHL → Settings → Business Profile)</span></label>
+    <input id="s_loc" placeholder="e.g. ve9EPM428h8vShlRW1KT">
+    <div style="display:flex;gap:8px;margin-top:10px;">
+      <button class="btn btn-ghost" onclick="testGHL()">Test connection & load forms</button>
+    </div>
+    <div class="okmsg" id="ghlmsg"></div>
+
+    <div class="row2">
+      <div><label>Intake Form 1</label><select id="s_form1"><option value="">— pick after testing —</option></select></div>
+      <div><label>Intake Form 2 (Website Vision)</label><select id="s_form2"><option value="">— pick after testing —</option></select></div>
+    </div>
+    <div class="row2">
+      <div><label>Intake 1 page link</label><input id="s_link1"></div>
+      <div><label>Intake 2 page link</label><input id="s_link2"></div>
+    </div>
+    <label>Send emails from (optional, must be verified in GHL)</label>
+    <input id="s_from" placeholder="tiffany@conversionco918.com">
+
+    <label>Intake 1 email — subject</label>
+    <input id="s_sub1">
+    <label>Intake 1 email — body (HTML, {{name}} and {{form_link}} get filled in)</label>
+    <textarea id="s_body1" rows="7"></textarea>
+    <label>Intake 2 email — subject</label>
+    <input id="s_sub2">
+    <label>Intake 2 email — body</label>
+    <textarea id="s_body2" rows="7"></textarea>
+
+    <div class="foot">
+      <button class="btn btn-ghost" onclick="closeSettings()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveSettings(this)">Save settings</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const STAGES = {
+  new:            { label: 'New',                 bg:'#e2e8f0', fg:'#334155' },
+  intake1_sent:   { label: 'Intake 1 sent',       bg:'#dbeafe', fg:'#1d4ed8' },
+  intake1_done:   { label: '✓ Intake 1 done — call them!', bg:'#fef3c7', fg:'#b45309' },
+  intake2_sent:   { label: 'Intake 2 sent',       bg:'#ede9fe', fg:'#6d28d9' },
+  intake2_done:   { label: '✓ Intake 2 done',     bg:'#ccfbf1', fg:'#0f766e' },
+  generating:     { label: '⚙ Building site…',    bg:'#fce7f3', fg:'#be185d' },
+  preview_ready:  { label: '★ Preview ready',     bg:'#dcfce7', fg:'#15803d' },
+  live:           { label: '● Live',              bg:'#071B33', fg:'#ffffff' },
+  archived:       { label: 'Archived',            bg:'#f1f5f9', fg:'#94a3b8' },
+};
+let STATE = { clients: [], events: [], settings: {} };
+
+function esc(s){ return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function toast(msg){ const t = document.getElementById('toast'); t.textContent = msg; t.style.display='block'; setTimeout(()=>t.style.display='none', 3500); }
+function ago(iso){ if(!iso) return ''; const d = new Date(iso + (iso.includes('Z')||iso.includes('+') ? '' : 'Z')); const m = (Date.now()-d)/60000;
+  if (m < 1) return 'just now'; if (m < 60) return Math.floor(m)+'m ago'; if (m < 1440) return Math.floor(m/60)+'h ago'; return Math.floor(m/1440)+'d ago'; }
+
+async function api(path, opts={}) {
+  const r = await fetch(path, { headers: {'Content-Type':'application/json'}, ...opts });
+  if (r.status === 401) { location.reload(); return {}; }
+  return r.json();
+}
+
+async function refresh() {
+  STATE = await api('/api/state');
+  renderClients(); renderFeed();
+}
+
+function renderClients() {
+  const tb = document.getElementById('clientRows');
+  if (!STATE.clients.length) { tb.innerHTML = '<tr><td colspan="4"><div class="empty">No clients yet — add one above to send your first automated Intake 1 email.</div></td></tr>'; return; }
+  tb.innerHTML = STATE.clients.map(c => {
+    const st = STAGES[c.stage] || STAGES.new;
+    return `<tr class="rowclick" onclick="openDrawer(${c.id})">
+      <td><b>${esc(c.name || c.email)}</b>${c.name ? `<br><span style="color:var(--muted);font-size:12px">${esc(c.email)}</span>` : ''}</td>
+      <td><span class="chip" style="background:${st.bg};color:${st.fg}">${st.label}</span></td>
+      <td style="color:var(--muted);font-size:13px">${ago(c.updated_at)}</td>
+      <td>${c.stage === 'intake1_done' ? `<button class="btn btn-green" onclick="event.stopPropagation();sendIntake2(${c.id}, this)">Approve → Intake 2</button>` : ''}</td>
+    </tr>`;
+  }).join('');
+}
+
+function renderFeed() {
+  const f = document.getElementById('feed');
+  if (!STATE.events.length) { f.innerHTML = '<div class="empty">Activity will appear here.</div>'; return; }
+  f.innerHTML = STATE.events.map(e => `<div class="item"><b>${esc(e.client_name || e.client_email || 'System')}</b> — ${esc(pretty(e.type))}${e.detail && e.type==='error' ? `<br><span style="color:var(--red);font-size:12px">${esc(e.detail)}</span>`:''}<time>${ago(e.created_at)}</time></div>`).join('');
+}
+function pretty(t){ return ({client_created:'added to pipeline', intake1_sent:'Intake 1 email sent', intake1_done:'submitted Intake 1 🎉', intake2_sent:'Intake 2 email sent', intake2_done:'submitted Intake 2 🎉', stage_changed:'stage updated', error:'⚠ error', client_deleted:'removed', webhook_received:'webhook ping'})[t] || t; }
+
+async function addClient() {
+  const email = document.getElementById('newEmail').value.trim();
+  const name = document.getElementById('newName').value.trim();
+  if (!email) return toast('Enter an email first');
+  const btn = document.getElementById('addBtn'); btn.disabled = true;
+  const r = await api('/api/clients', { method:'POST', body: JSON.stringify({ email, name }) });
+  btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error);
+  document.getElementById('newEmail').value = ''; document.getElementById('newName').value = '';
+  toast('Intake 1 sent to ' + email + ' ✓');
+  refresh();
+}
+
+async function sendIntake2(id, btn) {
+  if (btn) btn.disabled = true;
+  const r = await api(`/api/clients/${id}/send-intake2`, { method:'POST' });
+  if (btn) btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error);
+  toast('Intake 2 sent ✓'); closeDrawer(); refresh();
+}
+
+function intakeBlock(title, json) {
+  if (!json) return '';
+  let data; try { data = JSON.parse(json); } catch { return ''; }
+  const rows = Object.entries(data).map(([k,v]) => `<dt>${esc(k.replace(/_/g,' '))}</dt><dd>${esc(v)}</dd>`).join('');
+  return `<div class="intake"><h4>${title}</h4><dl>${rows}</dl></div>`;
+}
+
+function openDrawer(id) {
+  const c = STATE.clients.find(x => x.id === id); if (!c) return;
+  const st = STAGES[c.stage] || STAGES.new;
+  document.getElementById('drawer').innerHTML = `
+    <div class="dhead"><h2>${esc(c.name || c.email)}</h2><p>${esc(c.email)}${c.phone ? ' · ' + esc(c.phone) : ''}</p></div>
+    <div class="dbody">
+      <div><span class="chip" style="background:${st.bg};color:${st.fg}">${st.label}</span></div>
+      <div class="actions">
+        ${c.stage === 'intake1_done' || c.stage === 'intake2_sent' ? `<button class="btn btn-green" onclick="sendIntake2(${c.id}, this)">${c.stage==='intake2_sent'?'Resend Intake 2':'Approve → Send Intake 2'}</button>` : ''}
+        ${c.stage === 'new' || c.stage === 'intake1_sent' ? `<button class="btn btn-primary" onclick="resendIntake1('${esc(c.email)}', this)">${c.stage==='intake1_sent'?'Resend Intake 1':'Send Intake 1'}</button>` : ''}
+        <button class="btn btn-red" onclick="delClient(${c.id})">Remove</button>
+      </div>
+      ${c.preview_url ? `<div class="kv"><b>Preview site</b><a href="${esc(c.preview_url)}" target="_blank">${esc(c.preview_url)}</a></div>` : ''}
+      ${c.live_url ? `<div class="kv"><b>Live site</b><a href="${esc(c.live_url)}" target="_blank">${esc(c.live_url)}</a></div>` : ''}
+      ${intakeBlock('Intake 1 — Client details', c.intake1_data)}
+      ${intakeBlock('Intake 2 — Website vision', c.intake2_data)}
+      <div>
+        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:5px;">Stage (manual override)</label>
+        <select onchange="patchClient(${c.id}, {stage: this.value})">
+          ${Object.entries(STAGES).map(([k,v]) => `<option value="${k}" ${k===c.stage?'selected':''}>${v.label}</option>`).join('')}
+        </select>
+      </div>
+      <div>
+        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:5px;">Notes</label>
+        <textarea rows="4" onblur="patchClient(${c.id}, {notes: this.value}, true)">${esc(c.notes)}</textarea>
+      </div>
+    </div>`;
+  document.getElementById('drawer').classList.add('open');
+  document.getElementById('overlay').classList.add('open');
+}
+function closeDrawer(){ document.getElementById('drawer').classList.remove('open'); document.getElementById('overlay').classList.remove('open'); }
+async function patchClient(id, body, quiet) { await api(`/api/clients/${id}`, { method:'PATCH', body: JSON.stringify(body) }); if (!quiet) { toast('Updated ✓'); refresh(); } }
+async function resendIntake1(email, btn) { btn.disabled = true; const r = await api('/api/clients', { method:'POST', body: JSON.stringify({ email }) }); btn.disabled = false; if (r.error) return toast('⚠ ' + r.error); toast('Intake 1 sent ✓'); closeDrawer(); refresh(); }
+async function delClient(id) { if (!confirm('Remove this client from the pipeline?')) return; await api(`/api/clients/${id}`, { method:'DELETE' }); closeDrawer(); refresh(); }
+
+async function pollNow(btn) { btn.disabled = true; const r = await api('/api/poll-now', { method:'POST' }); btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error); toast(r.processed ? `Found ${r.processed} new submission(s) 🎉` : 'No new submissions yet'); refresh(); }
+
+// ---- settings ----
+function openSettings() {
+  const s = STATE.settings;
+  s_loc.value = s.ghl_location_id || ''; s_link1.value = s.form1_link || ''; s_link2.value = s.form2_link || '';
+  s_from.value = s.email_from || ''; s_sub1.value = s.intake1_subject || ''; s_body1.value = s.intake1_body || '';
+  s_sub2.value = s.intake2_subject || ''; s_body2.value = s.intake2_body || '';
+  setFormOptions([{id: s.form1_id, name: s.form1_id ? '(saved form)' : ''}, {id: s.form2_id, name: s.form2_id ? '(saved form)' : ''}].filter(f=>f.id));
+  s_form1.value = s.form1_id || ''; s_form2.value = s.form2_id || '';
+  document.getElementById('settingsModal').classList.add('open');
+}
+function closeSettings(){ document.getElementById('settingsModal').classList.remove('open'); }
+function setFormOptions(forms) {
+  for (const sel of [s_form1, s_form2]) {
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">— none —</option>' + forms.map(f => `<option value="${esc(f.id)}">${esc(f.name || f.id)}</option>`).join('');
+    if (forms.some(f => f.id === cur)) sel.value = cur;
+  }
+}
+async function testGHL() {
+  const msg = document.getElementById('ghlmsg');
+  msg.className = 'okmsg'; msg.textContent = 'Testing…'; msg.style.display = 'block';
+  await api('/api/settings', { method:'POST', body: JSON.stringify({ ghl_location_id: s_loc.value.trim() }) });
+  const r = await api('/api/ghl/test');
+  if (!r.ok) { msg.className = 'okmsg bad'; msg.textContent = '✗ ' + (r.error || 'Connection failed'); return; }
+  msg.className = 'okmsg ok'; msg.textContent = `✓ Connected to "${r.location}" — found ${r.forms.length} forms. Pick which is which below.`;
+  setFormOptions(r.forms);
+}
+async function saveSettings(btn) {
+  btn.disabled = true;
+  await api('/api/settings', { method:'POST', body: JSON.stringify({
+    ghl_location_id: s_loc.value.trim(), form1_id: s_form1.value, form2_id: s_form2.value,
+    form1_link: s_link1.value.trim(), form2_link: s_link2.value.trim(), email_from: s_from.value.trim(),
+    intake1_subject: s_sub1.value, intake1_body: s_body1.value, intake2_subject: s_sub2.value, intake2_body: s_body2.value,
+  })});
+  btn.disabled = false; closeSettings(); toast('Settings saved ✓'); refresh();
+}
+
+refresh();
+setInterval(refresh, 60000);
+</script>
+</body>
+</html>
