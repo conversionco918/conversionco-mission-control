@@ -376,6 +376,20 @@ app.get('/api/ghl/test', async (c) => {
   }
 });
 
+// Admin passthrough to the GHL API (session-protected) — used for setup/config tasks
+app.post('/api/ghl/raw', async (c) => {
+  const { method = 'GET', path, query, body } = await c.req.json();
+  if (!path || !path.startsWith('/')) return c.json({ error: 'path required' }, 400);
+  const settings = await getSettings(c.env.DB);
+  const ghl = ghlFor(c.env, settings);
+  try {
+    const data = await ghl.req(method, path, { query, body });
+    return c.json({ ok: true, data });
+  } catch (e) {
+    return c.json({ ok: false, error: e.message, status: e.status, detail: e.data }, 200);
+  }
+});
+
 // Test Cloudflare API token (used by the site-builder to publish client sites)
 app.get('/api/cf/test', async (c) => {
   if (!c.env.CLOUDFLARE_API_TOKEN) return c.json({ ok: false, error: 'CLOUDFLARE_API_TOKEN secret is not set yet.' });
