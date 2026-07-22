@@ -212,7 +212,8 @@ app.post('/intake/:n', async (c) => {
 // ---------------- public preview serving (client site previews) ----------------
 const MIME = { html: 'text/html;charset=utf-8', css: 'text/css', js: 'application/javascript', json: 'application/json', svg: 'image/svg+xml', xml: 'application/xml', txt: 'text/plain', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', ico: 'image/x-icon', woff2: 'font/woff2' };
 
-app.get('/preview/:slug', (c) => c.redirect(`/preview/${c.req.param('slug')}/`));
+app.get('/preview/:slug', (c) => c.redirect(`/preview/${c.req.param('slug')}/index.html`));
+app.get('/preview/:slug/', (c) => c.redirect(`/preview/${c.req.param('slug')}/index.html`));
 app.get('/preview/:slug/*', async (c) => {
   const slug = c.req.param('slug');
   let path = c.req.path.replace(`/preview/${slug}/`, '') || 'index.html';
