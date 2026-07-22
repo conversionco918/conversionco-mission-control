@@ -250,6 +250,24 @@ app.post('/webhooks/ghl/:secret', async (c) => {
   return c.json({ ok: true });
 });
 
+// Diagnostic endpoint (keyed, GET so it can be fetched externally)
+app.get('/debug/:key', async (c) => {
+  if (c.req.param('key') !== 'dbg-7c1f4a9e2b') return c.text('nope', 403);
+  const db = c.env.DB;
+  const settings = await getSettings(db);
+  let publishResult = 'ran';
+  try { await autoPublish(c.env, settings); } catch (e) { publishResult = 'ERROR: ' + e.message; }
+  const events = (await db.prepare('SELECT type, detail, created_at FROM events ORDER BY id DESC LIMIT 12').all()).results || [];
+  const fileCount = await db.prepare('SELECT COUNT(*) AS n FROM site_files').first();
+  return c.json({
+    publishResult,
+    site_files: fileCount?.n,
+    has_github_token: Boolean(c.env.GITHUB_TOKEN),
+    sites_repo: settings.sites_repo,
+    events: events.map((e) => ({ t: e.type, d: (e.detail || '').slice(0, 160), at: e.created_at })),
+  });
+});
+
 // Everything below requires a session
 app.use('*', async (c, next) => {
   if (await checkSession(c.env, c.req.header('Cookie'))) return next();
