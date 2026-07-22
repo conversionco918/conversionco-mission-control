@@ -93,6 +93,85 @@ function ghlFor(env, settings) {
   return new GHL(env.GHL_TOKEN, settings.ghl_location_id);
 }
 
+// ---------------- direct intake receiver (public, called by the form pages) ----------------
+function corsHeaders(c) {
+  c.header('Access-Control-Allow-Origin', c.req.header('Origin') || '*');
+  c.header('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  c.header('Access-Control-Allow-Headers', 'Content-Type');
+}
+
+app.options('/intake/:n', (c) => { corsHeaders(c); return c.body(null, 204); });
+
+app.post('/intake/:n', async (c) => {
+  corsHeaders(c);
+  const n = c.req.param('n') === '2' ? 2 : 1;
+  const db = c.env.DB;
+  const ct = c.req.header('Content-Type') || '';
+  let fields = {};
+  let rawBody = null;
+  try {
+    if (ct.includes('json')) {
+      fields = await c.req.json();
+      rawBody = JSON.stringify(fields);
+    } else {
+      const parsed = await c.req.parseBody();
+      for (const [k, v] of Object.entries(parsed)) fields[k] = typeof v === 'string' ? v : '(file)';
+    }
+  } catch { /* keep going with empty fields */ }
+
+  // normalize: find email/name/phone regardless of exact field naming
+  const lower = {};
+  for (const [k, v] of Object.entries(fields)) lower[k.toLowerCase().trim()] = typeof v === 'string' ? v : JSON.stringify(v);
+  const email = (lower.email || lower['email address'] || lower.e_mail ||
+    Object.values(lower).find((v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v).trim())) || '').trim();
+  const name = lower.name || lower['full name'] || [lower.first_name || lower.firstname, lower.last_name || lower.lastname].filter(Boolean).join(' ') || '';
+  const phone = lower.phone || lower['phone number'] || lower.tel || '';
+
+  // never store the web3forms key or bot fields
+  const stored = {};
+  for (const [k, v] of Object.entries(fields)) {
+    if (['access_key', 'botcheck', 'h-captcha-response'].includes(k.toLowerCase())) continue;
+    stored[k] = typeof v === 'string' ? v : JSON.stringify(v);
+  }
+
+  const dataCol = n === 2 ? 'intake2_data' : 'intake1_data';
+  const doneStage = n === 2 ? 'intake2_done' : 'intake1_done';
+  const advanceFrom = n === 2
+    ? ['new', 'intake1_sent', 'intake1_done', 'intake2_sent']
+    : ['new', 'intake1_sent'];
+
+  if (email) {
+    const client = await db.prepare('SELECT * FROM clients WHERE email = ?').bind(email).first();
+    if (!client) {
+      const r = await db.prepare(
+        `INSERT INTO clients (email, name, phone, stage, ${dataCol}) VALUES (?, ?, ?, ?, ?)`
+      ).bind(email, name, phone, doneStage, JSON.stringify(stored)).run();
+      await logEvent(db, r.meta.last_row_id, doneStage, `Intake ${n} submitted (new contact)`);
+    } else {
+      const updates = { [dataCol]: JSON.stringify(stored) };
+      if (name && !client.name) updates.name = name;
+      if (phone && !client.phone) updates.phone = phone;
+      if (advanceFrom.includes(client.stage)) updates.stage = doneStage;
+      await touchClient(db, client.id, updates);
+      await logEvent(db, client.id, doneStage, `Intake ${n} submission received`);
+    }
+  } else {
+    await logEvent(db, null, 'error', `Intake ${n} submission had no email: ${JSON.stringify(stored).slice(0, 500)}`);
+  }
+
+  // forward to Web3Forms so email notifications keep working (best effort)
+  if (fields.access_key) {
+    const fwd = fetch('https://api.web3forms.com/submit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: rawBody || JSON.stringify(fields),
+    }).catch(() => {});
+    c.executionCtx.waitUntil(fwd);
+  }
+
+  return c.json({ success: true, message: 'Submission received' });
+});
+
 // ---------------- auth ----------------
 app.post('/login', async (c) => {
   const { password } = await c.req.parseBody();
