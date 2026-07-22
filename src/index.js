@@ -272,10 +272,13 @@ app.post('/api/clients/:id/send-intake2', async (c) => {
       contactId = contact.id || contact.contactId;
     }
     const firstName = (client.name || '').split(' ')[0] || 'there';
+    // carry the client's email in the form link so their submission auto-matches
+    const link2 = settings.form2_link + (settings.form2_link.includes('?') ? '&' : '?') +
+      'e=' + encodeURIComponent(client.email);
     await ghl.sendEmail({
       contactId,
       subject: renderTemplate(settings.intake2_subject, { name: firstName }),
-      html: renderTemplate(settings.intake2_body, { name: firstName, form_link: settings.form2_link }),
+      html: renderTemplate(settings.intake2_body, { name: firstName, form_link: link2 }),
       emailFrom: settings.email_from || undefined,
     });
     await touchClient(db, id, { stage: 'intake2_sent', ghl_contact_id: contactId });
