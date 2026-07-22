@@ -259,12 +259,24 @@ app.get('/debug/:key', async (c) => {
   let publishResult = 'ran';
   try { await autoPublish(c.env, settings); } catch (e) { publishResult = 'ERROR: ' + e.message; }
   const events = (await db.prepare('SELECT type, detail, created_at FROM events ORDER BY id DESC LIMIT 12').all()).results || [];
+  // repo state diagnostics
+  let repoDiag = {};
+  try {
+    const gh = ghFetcher(c.env);
+    const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+    const ref = await gh(`/repos/${repo}/git/ref/heads/main`);
+    const commit = await gh(`/repos/${repo}/git/commits/${ref.object.sha}`);
+    const tree = await gh(`/repos/${repo}/git/trees/${commit.tree.sha}?recursive=1`);
+    const metas = (tree.tree || []).filter((t) => /^sites\/[^/]+\/site-meta\.json$/.test(t.path));
+    repoDiag = { head: ref.object.sha.slice(0,10), metas: metas.map(m => ({ path: m.path, sha: m.sha.slice(0,10), stored: (settings['site_sha_' + m.path.split('/')[1]] || 'none').slice(0,10) })) };
+  } catch (e) { repoDiag = { error: e.message }; }
   const fileCount = await db.prepare('SELECT COUNT(*) AS n FROM site_files').first();
   return c.json({
     publishResult,
     site_files: fileCount?.n,
     has_github_token: Boolean(c.env.GITHUB_TOKEN),
     sites_repo: settings.sites_repo,
+    repoDiag,
     events: events.map((e) => ({ t: e.type, d: (e.detail || '').slice(0, 160), at: e.created_at })),
   });
 });
