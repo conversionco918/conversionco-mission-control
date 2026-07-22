@@ -6,6 +6,38 @@ import loginHtml from './login.html';
 
 const app = new Hono();
 
+// ---------------- schema bootstrap (runs once per isolate) ----------------
+const SCHEMA_SQL = [
+  `CREATE TABLE IF NOT EXISTS clients (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    name TEXT DEFAULT '', phone TEXT DEFAULT '', business_name TEXT DEFAULT '',
+    stage TEXT NOT NULL DEFAULT 'new',
+    ghl_contact_id TEXT DEFAULT '',
+    intake1_data TEXT DEFAULT '', intake2_data TEXT DEFAULT '',
+    preview_url TEXT DEFAULT '', live_url TEXT DEFAULT '', notes TEXT DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')))`,
+  `CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_id INTEGER, type TEXT NOT NULL, detail TEXT DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')))`,
+  `CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '')`,
+  `CREATE INDEX IF NOT EXISTS idx_events_client ON events(client_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_clients_stage ON clients(stage)`,
+];
+let schemaReady = false;
+async function ensureSchema(db) {
+  if (schemaReady) return;
+  await db.batch(SCHEMA_SQL.map((s) => db.prepare(s)));
+  schemaReady = true;
+}
+
+app.use('*', async (c, next) => {
+  await ensureSchema(c.env.DB);
+  return next();
+});
+
 // ---------------- helpers ----------------
 async function hmac(secret, msg) {
   const key = await crypto.subtle.importKey(
@@ -301,6 +333,7 @@ async function pollForms(env, settings) {
 export default {
   fetch: app.fetch,
   async scheduled(event, env, ctx) {
+    await ensureSchema(env.DB);
     const settings = await getSettings(env.DB);
     ctx.waitUntil(pollForms(env, settings).catch((e) =>
       logEvent(env.DB, null, 'error', `Poll failed: ${e.message}`)
