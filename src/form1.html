@@ -1,0 +1,484 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>Business Growth Blueprint — ConversionCo</title>
+<style>html,body{margin:0;padding:0;background:#0C1A30;-webkit-text-size-adjust:100%}</style>
+</head>
+<body>
+<!-- ── Paste this entire block into a GHL Custom Code element ── -->
+<div id="cco-form-root"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+  #cco-form-root { min-height: 100vh; }
+  #cco-form-root * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+  #cco-form-root button { cursor: pointer; }
+</style>
+<script type="text/babel" data-presets="react">
+  const { useState } = React;
+  const WEB3_KEY = "7ccbe7de-3ad2-4ab6-b983-d4d581ab4311";
+  const NAVY    = "#0C1A30";
+  const NAVY2   = "#0F2847";
+  const TEAL    = "#0D9488";
+  const TEAL_H  = "#0B7A6F";
+  const TEAL_BG = "#F0FDFA";
+  const TEAL_BR = "#5EEAD4";
+  const WHITE   = "#FFFFFF";
+  const BDR     = "#E2E8F0";
+  const TXT     = "#0F172A";
+  const MUTED   = "#64748B";
+  const ML      = "#CBD5E1";
+  const ERR     = "#EF4444";
+  const ERRBG   = "#FEF2F2";
+  const ERRBR   = "#FECACA";
+  const FEATURES = [
+    { id: "booking",      label: "Online booking & scheduling" },
+    { id: "contact",      label: "Contact / inquiry form" },
+    { id: "services",     label: "Service menu & pricing" },
+    { id: "blog",         label: "Blog" },
+    { id: "gallery",      label: "Photo gallery" },
+    { id: "testimonials", label: "Testimonials & reviews" },
+  ];
+  const LIKE_OPTS = ["Layout", "Colors", "Photography", "Typography", "Simplicity", "Overall vibe"];
+  const TIMELINES = [
+    { value: "1–2 weeks",  emoji: "⚡", label: "ASAP",     sub: "1–2 weeks" },
+    { value: "2–4 weeks",  emoji: "📅", label: "Soon",     sub: "2–4 weeks" },
+    { value: "1–2 months", emoji: "🗓️", label: "No rush",  sub: "1–2 months" },
+    { value: "3+ months",  emoji: "🌱", label: "Flexible", sub: "3+ months" },
+  ];
+  const INIT = {
+    businessName: "", firstName: "", lastName: "", email: "", phone: "",
+    location: "",
+    serviceGoal: "", hasDomain: null, domain: "", timeline: "",
+    chartingSystem: "", features: [], featuresOther: "",
+    blogType: "",
+    inspiration: [
+      { url: "", likes: [], notes: "" },
+      { url: "", likes: [], notes: "" },
+      { url: "", likes: [], notes: "" },
+    ],
+    googleAds: null, googleAdsManaged: "", googleAdsNotes: "",
+  };
+  function FieldLabel({ children, required }) {
+    return (
+      <div style={{ fontSize: 12, fontWeight: 700, color: MUTED, textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 7 }}>
+        {children}{required && <span style={{ color: TEAL, marginLeft: 3 }}>*</span>}
+      </div>
+    );
+  }
+  function TInput({ label, required, err, ...props }) {
+    const [focus, setFocus] = useState(false);
+    return (
+      <div style={{ marginBottom: 14 }}>
+        {label && <FieldLabel required={required}>{label}</FieldLabel>}
+        <input
+          style={{
+            width: "100%", padding: "13px 15px",
+            border: `1.5px solid ${err ? ERR : focus ? TEAL : BDR}`,
+            borderRadius: 10, fontSize: 15, color: TXT, fontFamily: "inherit",
+            outline: "none", background: focus ? "#FAFFFE" : "#FAFBFC",
+            transition: "all 0.2s", boxSizing: "border-box", display: "block",
+          }}
+          onFocus={() => setFocus(true)}
+          onBlur={() => setFocus(false)}
+          {...props}
+        />
+        {err && <div style={{ color: ERR, fontSize: 12, marginTop: 4 }}>{err}</div>}
+      </div>
+    );
+  }
+  function YN({ value, onChange }) {
+    return (
+      <div style={{ display: "flex", gap: 12 }}>
+        {[{ v: true, label: "Yes" }, { v: false, label: "No" }].map(({ v, label }) => (
+          <button key={String(v)} onClick={() => onChange(v)} style={{
+            flex: 1, padding: 16,
+            border: `2px solid ${value === v ? TEAL : BDR}`,
+            borderRadius: 12, background: value === v ? TEAL_BG : WHITE,
+            color: value === v ? TEAL : MUTED,
+            fontWeight: 700, fontSize: 17,
+            transition: "all 0.15s", fontFamily: "inherit",
+          }}>
+            {value === v ? `✓ ${label}` : label}
+          </button>
+        ))}
+      </div>
+    );
+  }
+  function Chip({ selected, onClick, children }) {
+    return (
+      <button onClick={onClick} style={{
+        padding: "9px 15px", marginRight: 8, marginBottom: 8,
+        border: `1.5px solid ${selected ? TEAL : BDR}`,
+        borderRadius: 100, background: selected ? TEAL_BG : WHITE,
+        color: selected ? TEAL : MUTED,
+        fontSize: 14, fontWeight: selected ? 600 : 500,
+        transition: "all 0.15s", fontFamily: "inherit",
+        display: "inline-block",
+      }}>
+        {children}
+      </button>
+    );
+  }
+  function CardOpt({ selected, onClick, emoji, title, desc }) {
+    return (
+      <button onClick={onClick} style={{
+        display: "block", width: "100%", padding: "17px 18px", marginBottom: 10,
+        border: `2px solid ${selected ? TEAL : BDR}`,
+        borderRadius: 14, background: selected ? TEAL_BG : WHITE,
+        textAlign: "left", transition: "all 0.15s", fontFamily: "inherit",
+      }}>
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
+          <div style={{ fontSize: 24, lineHeight: 1, flexShrink: 0, marginTop: 2 }}>{emoji}</div>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 700, fontSize: 14, color: selected ? TEAL : TXT, marginBottom: 3 }}>{title}</div>
+            <div style={{ fontSize: 13, color: MUTED, lineHeight: 1.5 }}>{desc}</div>
+          </div>
+          <div style={{
+            width: 18, height: 18, borderRadius: "50%",
+            border: `2px solid ${selected ? TEAL : BDR}`,
+            background: selected ? TEAL : WHITE,
+            display: "flex", alignItems: "center", justifyContent: "center",
+            flexShrink: 0, marginTop: 4,
+          }}>
+            {selected && <div style={{ width: 7, height: 7, background: WHITE, borderRadius: "50%" }} />}
+          </div>
+        </div>
+      </button>
+    );
+  }
+  function SHead({ n, title, desc }) {
+    return (
+      <div style={{ marginBottom: 26 }}>
+        {n && (
+          <div style={{ fontSize: 11, fontWeight: 800, color: TEAL, textTransform: "uppercase", letterSpacing: "0.12em", marginBottom: 8 }}>
+            Question {n} of 9
+          </div>
+        )}
+        <h2 style={{ fontSize: 21, fontWeight: 800, color: NAVY, marginBottom: desc ? 8 : 0, lineHeight: 1.3 }}>{title}</h2>
+        {desc && <p style={{ fontSize: 14, color: MUTED, lineHeight: 1.6, margin: 0 }}>{desc}</p>}
+      </div>
+    );
+  }
+  function Row({ label, value }) {
+    return (
+      <div style={{ display: "flex", gap: 16, padding: "11px 0", borderBottom: `1px solid ${BDR}` }}>
+        <div style={{ minWidth: 120, fontSize: 11, fontWeight: 700, color: MUTED, textTransform: "uppercase", letterSpacing: "0.06em", paddingTop: 2, flexShrink: 0 }}>{label}</div>
+        <div style={{ flex: 1, fontSize: 14, color: TXT, wordBreak: "break-word" }}>{value || "—"}</div>
+      </div>
+    );
+  }
+  function BusinessGrowthBlueprint() {
+    const [step, setStep] = useState(1);
+    const [form, setForm] = useState(INIT);
+    const [errs, setErrs] = useState({});
+    const [submitting, setSubmitting] = useState(false);
+    const [submitted, setSubmitted] = useState(false);
+    const [sErr, setSErr] = useState("");
+    const u = (k, v) => { setForm(p => ({...p, [k]: v})); setErrs(e => ({...e, [k]: ""})); };
+    const togFeat = id => setForm(p => ({...p, features: p.features.includes(id) ? p.features.filter(f => f !== id) : [...p.features, id]}));
+    const updInsp = (i, k, v) => setForm(p => { const a = [...p.inspiration]; a[i] = {...a[i], [k]: v}; return {...p, inspiration: a}; });
+    const togLike = (i, like) => setForm(p => { const a = [...p.inspiration]; a[i] = {...a[i], likes: a[i].likes.includes(like) ? a[i].likes.filter(l => l !== like) : [...a[i].likes, like]}; return {...p, inspiration: a}; });
+    const validate = () => {
+      const e = {};
+      if (step === 1 && !form.businessName.trim()) e.businessName = "Business name is required";
+      if (step === 2) {
+        if (!form.firstName.trim()) e.firstName = "Required";
+        if (!form.lastName.trim()) e.lastName = "Required";
+        if (!form.email.trim() || !form.email.includes("@")) e.email = "A valid email is required";
+        if (!form.location.trim()) e.location = "Required";
+      }
+      if (step === 3 && !form.serviceGoal) e.serviceGoal = "Please select an option to continue";
+      if (step === 5 && !form.timeline) e.timeline = "Please select a timeline";
+      return e;
+    };
+    const next = () => {
+      const e = validate();
+      if (Object.keys(e).length) { setErrs(e); return; }
+      setErrs({}); setSErr("");
+      setStep(s => s + 1);
+    };
+    const back = () => { setErrs({}); setSErr(""); setStep(s => s - 1); };
+    const submit = async () => {
+      setSubmitting(true); setSErr("");
+      const featLabels = form.features.map(id => FEATURES.find(f => f.id === id)?.label).filter(Boolean);
+      let blogValue = "Not selected";
+      if (form.features.includes("blog")) {
+        blogValue = form.blogType === "automated" ? "Automated Blog (keyword-optimized)"
+          : form.blogType === "self" ? "Self-Managed Blog" : "Blog (type not selected)";
+      }
+      let adsValue = "No";
+      if (form.googleAds === true) {
+        const mgmt = form.googleAdsManaged === "managed" ? "Wants Conversion Co management"
+          : form.googleAdsManaged === "self" ? "Will manage themselves" : "Not specified";
+        adsValue = `Yes — ${mgmt}${form.googleAdsNotes ? " | " + form.googleAdsNotes : ""}`;
+      }
+      const payload = {
+        access_key: WEB3_KEY,
+        subject: `New Business Growth Inquiry — ${form.businessName}`,
+        from_name: `${form.firstName} ${form.lastName}`,
+        email: form.email,
+        "Business Name": form.businessName,
+        "Contact Name": `${form.firstName} ${form.lastName}`,
+        "Email": form.email,
+        "Phone": form.phone || "Not provided",
+        "Location": form.location,
+        "Service Goal": form.serviceGoal === "basic" ? "Basic Website + Initial SEO" : "Website + Ongoing SEO",
+        "Has Domain": form.hasDomain === true ? `Yes — ${form.domain || "not specified"}` : "No — needs one",
+        "Launch Timeline": form.timeline,
+        "Charting System": form.chartingSystem || "TBD",
+        "Features Wanted": [...featLabels, form.featuresOther ? `Other: ${form.featuresOther}` : ""].filter(Boolean).join(" | ") || "None",
+        "Blog": blogValue,
+        ...form.inspiration.reduce((acc, ins, i) => {
+          acc[`Inspiration ${i+1}`] = ins.url ? `${ins.url} | Likes: ${ins.likes.join(", ")||"N/A"} | Notes: ${ins.notes||"N/A"}` : "Not provided";
+          return acc;
+        }, {}),
+        "Google Ads": adsValue,
+      };
+      try {
+        const res = await fetch("https://conversionco-mission-control.conversionco918.workers.dev/intake/1", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        if (data.success) setSubmitted(true);
+        else setSErr(data.message || "Submission failed — please try again.");
+      } catch (_e) {
+        setSErr("Network error — please check your connection.");
+      } finally {
+        setSubmitting(false);
+      }
+    };
+    const renderStep = () => {
+      switch (step) {
+        case 1: return (
+          <div>
+            <SHead n={1} title="What's your business name?" desc="This will be featured prominently on your new website." />
+            <TInput label="Business Name" required placeholder="e.g. Glow IV Therapy, Revive Mobile Infusions" value={form.businessName} onChange={e => u("businessName", e.target.value)} err={errs.businessName} />
+          </div>
+        );
+        case 2: return (
+          <div>
+            <SHead n={2} title="Your contact details" desc="So we can stay in touch throughout the project." />
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+              <TInput label="First Name" required value={form.firstName} onChange={e => u("firstName", e.target.value)} err={errs.firstName} />
+              <TInput label="Last Name" required value={form.lastName} onChange={e => u("lastName", e.target.value)} err={errs.lastName} />
+            </div>
+            <TInput label="Email Address" required type="email" placeholder="jane@yourpractice.com" value={form.email} onChange={e => u("email", e.target.value)} err={errs.email} />
+            <TInput label="Phone Number" type="tel" placeholder="(918) 000-0000" value={form.phone} onChange={e => u("phone", e.target.value)} />
+            <TInput label="City, State" required placeholder="e.g. Tulsa, OK" value={form.location} onChange={e => u("location", e.target.value)} err={errs.location} />
+          </div>
+        );
+        case 3: return (
+          <div>
+            <SHead n={3} title="What's your main goal?" desc="Choose the package that best fits where you are right now." />
+            {errs.serviceGoal && <div style={{ color: ERR, fontSize: 13, marginBottom: 12 }}>{errs.serviceGoal}</div>}
+            <CardOpt selected={form.serviceGoal === "basic"} onClick={() => u("serviceGoal", "basic")} emoji="🌱" title="Basic Website + Initial SEO" desc="A polished, professional site configured to show up on Google. Perfect for getting your foundation in place." />
+            <CardOpt selected={form.serviceGoal === "seo"} onClick={() => u("serviceGoal", "seo")} emoji="📈" title="Website + Ongoing SEO Ranking" desc="Everything in Basic, plus monthly SEO work to consistently rank higher on Google over time." />
+          </div>
+        );
+        case 4: return (
+          <div>
+            <SHead n={4} title="Do you already have a domain?" desc="A domain is your website address — like ivtherapy.com or glowinfusions.com. Think of it as your online home address. Have you already purchased one?" />
+            <YN value={form.hasDomain} onChange={v => u("hasDomain", v)} />
+            {form.hasDomain === true && (
+              <div style={{ marginTop: 18 }}>
+                <TInput label="Your Domain Address" placeholder="e.g. glowivtherapy.com" value={form.domain} onChange={e => u("domain", e.target.value)} />
+              </div>
+            )}
+            {form.hasDomain === false && (
+              <div style={{ marginTop: 16, padding: "14px 16px", background: TEAL_BG, border: `1px solid ${TEAL_BR}`, borderRadius: 10 }}>
+                <p style={{ color: TEAL, fontSize: 14, fontWeight: 500, margin: 0 }}>✅ No problem — we'll help you find and register the perfect domain for your business.</p>
+              </div>
+            )}
+          </div>
+        );
+        case 5: return (
+          <div>
+            <SHead n={5} title="When do you want to launch?" desc="Give us a rough idea so we can plan accordingly." />
+            {errs.timeline && <div style={{ color: ERR, fontSize: 13, marginBottom: 12 }}>{errs.timeline}</div>}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+              {TIMELINES.map(t => (
+                <button key={t.value} onClick={() => u("timeline", t.value)} style={{
+                  padding: "22px 14px", textAlign: "center",
+                  border: `2px solid ${form.timeline === t.value ? TEAL : BDR}`,
+                  borderRadius: 14, background: form.timeline === t.value ? TEAL_BG : WHITE,
+                  transition: "all 0.15s", fontFamily: "inherit",
+                }}>
+                  <div style={{ fontSize: 30, marginBottom: 8 }}>{t.emoji}</div>
+                  <div style={{ fontWeight: 700, fontSize: 15, color: form.timeline === t.value ? TEAL : TXT, marginBottom: 3 }}>{t.label}</div>
+                  <div style={{ fontSize: 13, color: MUTED }}>{t.sub}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+        );
+        case 6: return (
+          <div>
+            <SHead n={6} title="What charting system are you planning to use?" desc="Common options: Jane App, Vagaro, Mindbody, IntakeQ, Square — or not sure yet. Either way is fine." />
+            <TInput label="Charting / Booking Software" placeholder="e.g. Jane App, Vagaro, not sure yet..." value={form.chartingSystem} onChange={e => u("chartingSystem", e.target.value)} />
+          </div>
+        );
+        case 7: return (
+          <div>
+            <SHead n={7} title="What do you want your website to do?" desc="Select everything you'd like your site to handle. You can always add more later." />
+            <div style={{ display: "flex", flexWrap: "wrap", marginBottom: 4 }}>
+              {FEATURES.map(f => (
+                <Chip key={f.id} selected={form.features.includes(f.id)} onClick={() => togFeat(f.id)}>{f.label}</Chip>
+              ))}
+            </div>
+            {form.features.includes("blog") && (
+              <div style={{ padding: "16px 16px 6px", background: "#F8FAFC", border: `1px solid ${BDR}`, borderRadius: 12, marginTop: 4, marginBottom: 10 }}>
+                <FieldLabel>What type of blog are you looking for?</FieldLabel>
+                <CardOpt selected={form.blogType === "automated"} onClick={() => u("blogType", "automated")} emoji="🤖" title="Automated Blog" desc="Automatically updated with high-intent keywords to help you rank on Google — hands-free content working 24/7." />
+                <CardOpt selected={form.blogType === "self"} onClick={() => u("blogType", "self")} emoji="✍️" title="Self-Managed Blog" desc="You write and publish your own content on your schedule. Full creative control, your voice." />
+              </div>
+            )}
+            <div style={{ marginTop: 8 }}>
+              <TInput label="Anything else?" placeholder="Describe any other features you have in mind..." value={form.featuresOther} onChange={e => u("featuresOther", e.target.value)} />
+            </div>
+          </div>
+        );
+        case 8: return (
+          <div>
+            <SHead n={8} title="Show us websites you love" desc="Share up to 3 sites that inspire you. Tell us what you like — layout, colors, overall feel, etc." />
+            {form.inspiration.map((ins, i) => (
+              <div key={i} style={{
+                padding: 18, border: `1.5px solid ${ins.url ? TEAL : BDR}`,
+                borderRadius: 14, marginBottom: 12,
+                background: ins.url ? TEAL_BG : "#FAFBFC", transition: "all 0.2s",
+              }}>
+                <div style={{ fontWeight: 700, fontSize: 13, color: NAVY, marginBottom: 12 }}>
+                  Website {i + 1}{i > 0 && <span style={{ fontWeight: 400, color: MUTED }}> (optional)</span>}
+                </div>
+                <TInput label="Website URL" placeholder="https://example.com" value={ins.url} onChange={e => updInsp(i, "url", e.target.value)} />
+                {ins.url && (
+                  <div>
+                    <FieldLabel>What do you like about it?</FieldLabel>
+                    <div style={{ display: "flex", flexWrap: "wrap", marginBottom: 12 }}>
+                      {LIKE_OPTS.map(like => (
+                        <Chip key={like} selected={ins.likes.includes(like)} onClick={() => togLike(i, like)}>{like}</Chip>
+                      ))}
+                    </div>
+                    <TInput label="Any other notes" placeholder="Anything specific you love about this one..." value={ins.notes} onChange={e => updInsp(i, "notes", e.target.value)} />
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        );
+        case 9: return (
+          <div>
+            <SHead n={9} title="Are you interested in Google Ads?" desc="Google Ads can get clients in the door fast while your SEO builds long-term. Let us know where you're at." />
+            <YN value={form.googleAds} onChange={v => u("googleAds", v)} />
+            {form.googleAds === true && (
+              <div style={{ marginTop: 22 }}>
+                <FieldLabel>How would you like to handle them?</FieldLabel>
+                <CardOpt selected={form.googleAdsManaged === "managed"} onClick={() => u("googleAdsManaged", "managed")} emoji="🚀" title="Manage my ads for me" desc="We handle your Google Ads from setup to ongoing optimization — you focus on running your business." />
+                <CardOpt selected={form.googleAdsManaged === "self"} onClick={() => u("googleAdsManaged", "self")} emoji="🛠️" title="I'll manage them myself" desc="We build your site to be ads-ready and conversion-optimized. You run the campaigns." />
+                <TInput label="Anything else about your ads goals?" placeholder="e.g. target city, rough budget, when you want to start..." value={form.googleAdsNotes} onChange={e => u("googleAdsNotes", e.target.value)} />
+              </div>
+            )}
+            {form.googleAds === false && (
+              <div style={{ marginTop: 16, padding: "14px 16px", background: "#F8FAFC", border: `1px solid ${BDR}`, borderRadius: 10 }}>
+                <p style={{ color: MUTED, fontSize: 14, fontWeight: 500, margin: 0 }}>No worries — we'll build your site to be ads-ready whenever you're ready to scale.</p>
+              </div>
+            )}
+          </div>
+        );
+        case 10: return (
+          <div>
+            <SHead title="Almost there — review your info" desc="Give this a quick look, then hit Submit." />
+            <div style={{ marginTop: 4 }}>
+              <Row label="Business" value={form.businessName} />
+              <Row label="Name" value={`${form.firstName} ${form.lastName}`} />
+              <Row label="Email" value={form.email} />
+              <Row label="Phone" value={form.phone || "Not provided"} />
+              <Row label="Location" value={form.location} />
+              <Row label="Package" value={form.serviceGoal === "basic" ? "Basic Website + Initial SEO" : "Website + Ongoing SEO"} />
+              <Row label="Domain" value={form.hasDomain === true ? (form.domain || "Yes — not specified") : "No domain yet"} />
+              <Row label="Timeline" value={form.timeline} />
+              <Row label="Charting" value={form.chartingSystem || "TBD"} />
+              <Row label="Features" value={form.features.map(id => FEATURES.find(f => f.id === id)?.label).filter(Boolean).join(", ") || "None selected"} />
+              {form.features.includes("blog") && form.blogType && (
+                <Row label="Blog Type" value={form.blogType === "automated" ? "Automated (keyword-optimized)" : "Self-Managed"} />
+              )}
+              {form.inspiration.map((ins, i) => ins.url ? <Row key={i} label={`Site ${i+1}`} value={ins.url} /> : null)}
+              <Row label="Google Ads" value={form.googleAds === true ? `Yes — ${form.googleAdsManaged === "managed" ? "Managed by Conversion Co" : "Self-managed"}` : "No"} />
+            </div>
+            <div style={{ marginTop: 16, padding: "12px 14px", background: TEAL_BG, border: `1px solid ${TEAL_BR}`, borderRadius: 10 }}>
+              <p style={{ fontSize: 13, color: TEAL, fontWeight: 500, margin: 0 }}>✓ Once submitted, we'll review everything and reach out within 1–2 business days.</p>
+            </div>
+          </div>
+        );
+        default: return null;
+      }
+    };
+    if (submitted) return (
+      <div style={{ minHeight: "100vh", background: `linear-gradient(145deg, ${NAVY} 0%, ${NAVY2} 100%)`, display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
+        <div style={{ background: WHITE, borderRadius: 24, padding: "48px 36px", maxWidth: 440, width: "100%", textAlign: "center", boxShadow: "0 24px 80px rgba(0,0,0,0.35)" }}>
+          <div style={{ width: 72, height: 72, background: TEAL_BG, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 20px", fontSize: 34 }}>🎉</div>
+          <h2 style={{ fontSize: 24, fontWeight: 800, color: NAVY, marginBottom: 12 }}>You're in, {form.firstName}!</h2>
+          <p style={{ color: MUTED, fontSize: 15, lineHeight: 1.7, marginBottom: 24 }}>We've received your business growth blueprint and will be in touch within 1–2 business days to map out next steps.</p>
+          <div style={{ padding: "13px 16px", background: TEAL_BG, border: `1px solid ${TEAL_BR}`, borderRadius: 12 }}>
+            <p style={{ color: TEAL, fontSize: 13, fontWeight: 600, margin: 0 }}>📬 We'll reach out to you at<br />{form.email}</p>
+          </div>
+        </div>
+      </div>
+    );
+    const pct = Math.round((Math.min(step, 9) / 9) * 100);
+    return (
+      <div style={{ minHeight: "100vh", background: `linear-gradient(145deg, ${NAVY} 0%, ${NAVY2} 100%)`, display: "flex", flexDirection: "column", alignItems: "center", padding: "32px 16px 48px" }}>
+        <div style={{ textAlign: "center", marginBottom: 28 }}>
+          <div style={{ fontSize: 11, fontWeight: 800, letterSpacing: "0.22em", color: TEAL, textTransform: "uppercase", marginBottom: 10 }}>Conversion Co</div>
+          <h1 style={{ fontSize: 27, fontWeight: 800, color: WHITE, marginBottom: 6, lineHeight: 1.2 }}>Business Growth Blueprint</h1>
+          <p style={{ color: "rgba(255,255,255,0.5)", fontSize: 14, margin: 0 }}>Tell us about your business — we'll map out your custom growth plan</p>
+        </div>
+        <div style={{ width: "100%", maxWidth: 560, marginBottom: 20 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+            <span style={{ fontSize: 13, color: "rgba(255,255,255,0.6)", fontWeight: 500 }}>{step <= 9 ? `Step ${step} of 9` : "Final Review"}</span>
+            <span style={{ fontSize: 13, color: "rgba(255,255,255,0.6)", fontWeight: 500 }}>{pct}% complete</span>
+          </div>
+          <div style={{ height: 5, background: "rgba(255,255,255,0.12)", borderRadius: 100 }}>
+            <div style={{ height: "100%", width: `${pct}%`, background: `linear-gradient(90deg, ${TEAL}, #5EEAD4)`, borderRadius: 100, transition: "width 0.45s cubic-bezier(.4,0,.2,1)" }} />
+          </div>
+        </div>
+        <div style={{ background: WHITE, borderRadius: 20, padding: "32px 32px 28px", width: "100%", maxWidth: 560, boxShadow: "0 24px 80px rgba(0,0,0,0.35)" }}>
+          {renderStep()}
+          {sErr && (
+            <div style={{ padding: "12px 14px", background: ERRBG, border: `1px solid ${ERRBR}`, borderRadius: 10, marginBottom: 16 }}>
+              <p style={{ color: ERR, fontSize: 13, margin: 0 }}>{sErr}</p>
+            </div>
+          )}
+          <div style={{ display: "flex", gap: 10, marginTop: 24, paddingTop: 20, borderTop: `1px solid ${BDR}` }}>
+            {step > 1 && (
+              <button onClick={back} style={{ padding: "13px 20px", border: `1.5px solid ${BDR}`, borderRadius: 12, background: WHITE, color: MUTED, fontWeight: 600, fontSize: 14, fontFamily: "inherit" }}>
+                ← Back
+              </button>
+            )}
+            {step < 10 && (
+              <button onClick={next} onMouseEnter={e => e.target.style.background = TEAL_H} onMouseLeave={e => e.target.style.background = TEAL} style={{ flex: 1, padding: "13px 20px", border: "none", borderRadius: 12, background: TEAL, color: WHITE, fontWeight: 700, fontSize: 15, fontFamily: "inherit", transition: "background 0.15s" }}>
+                {step === 9 ? "Review Answers →" : "Continue →"}
+              </button>
+            )}
+            {step === 10 && (
+              <button onClick={submit} disabled={submitting} style={{ flex: 1, padding: "13px 20px", border: "none", borderRadius: 12, background: submitting ? ML : TEAL, color: WHITE, fontWeight: 700, fontSize: 15, fontFamily: "inherit" }}>
+                {submitting ? "Sending..." : "Submit →"}
+              </button>
+            )}
+          </div>
+        </div>
+        <p style={{ color: "rgba(255,255,255,0.2)", fontSize: 12, marginTop: 20 }}>Your information is kept private and secure.</p>
+      </div>
+    );
+  }
+  ReactDOM.render(<BusinessGrowthBlueprint />, document.getElementById("cco-form-root"));
+</script>
+
+</body>
+</html>

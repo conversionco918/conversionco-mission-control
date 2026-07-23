@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>Website Vision — ConversionCo</title>
+<style>html,body{margin:0;padding:0;background:#0C1A30;-webkit-text-size-adjust:100%}</style>
+</head>
+<body>
+<!-- ============================================================
+     CONVERSION CO — WEBSITE DESIGN INTAKE (PART 2)
+     Focuses on website/design details only. No business-basics
+     (those come from the first intake form).
+     Paste into a GoHighLevel Custom HTML / Code element.
+     Submissions go to the ConversionCo Mission Control dashboard
+     (which also forwards a copy to Web3Forms for email notification).
+============================================================ -->
+<div class="cc-intake-wrap">
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&family=Cormorant+Garamond:wght@500;600&display=swap');
+    .cc-intake-wrap *{box-sizing:border-box;margin:0;padding:0}
+    .cc-intake-wrap{
+      --navy:#12233f;
+      --navy-soft:#1c3357;
+      --gold:#b08d46;
+      --cream:#f6f3ec;
+      --ink:#1a2436;
+      --muted:#6b7688;
+      --line:#e4ddd0;
+      --white:#ffffff;
+      font-family:'Poppins','Helvetica Neue',Arial,sans-serif;
+      background:var(--cream);
+      color:var(--ink);
+      max-width:640px;margin:0 auto;padding:0;border-radius:18px;overflow:hidden;
+      box-shadow:0 20px 60px rgba(18,35,63,.12);
+    }
+    .cc-head{background:linear-gradient(135deg,var(--navy) 0%,var(--navy-soft) 100%);color:var(--white);padding:38px 34px 32px;position:relative}
+    .cc-eyebrow{font-size:11px;letter-spacing:.22em;text-transform:uppercase;color:var(--gold);font-weight:600;margin-bottom:14px}
+    .cc-title{font-family:'Cormorant Garamond',Georgia,serif;font-size:34px;line-height:1.1;font-weight:600;letter-spacing:.5px;margin-bottom:12px}
+    .cc-sub{font-size:14px;line-height:1.6;color:rgba(255,255,255,.78);font-weight:300;max-width:92%}
+    .cc-note-banner{margin-top:18px;background:rgba(176,141,70,.16);border:1px solid rgba(176,141,70,.4);border-radius:10px;padding:12px 15px;font-size:12.5px;line-height:1.55;color:#f3ead6;font-weight:300}
+    .cc-body{padding:32px 34px 38px}
+    .cc-section{margin-bottom:30px}
+    .cc-sec-label{display:flex;align-items:center;gap:10px;font-size:12px;letter-spacing:.14em;text-transform:uppercase;font-weight:600;color:var(--navy);margin-bottom:16px}
+    .cc-sec-num{width:24px;height:24px;border-radius:50%;background:var(--navy);color:var(--white);font-size:11px;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-weight:600}
+    .cc-field{margin-bottom:18px}
+    .cc-label{display:block;font-size:13px;font-weight:500;color:var(--ink);margin-bottom:7px}
+    .cc-req{color:var(--gold)}
+    .cc-hint{font-size:12px;color:var(--muted);margin-top:4px;line-height:1.5}
+    .cc-input,.cc-textarea,.cc-select{width:100%;background:var(--white);border:1.5px solid var(--line);border-radius:10px;padding:12px 14px;font-size:14px;font-family:inherit;color:var(--ink);outline:none;transition:border-color .15s,box-shadow .15s}
+    .cc-input:focus,.cc-textarea:focus,.cc-select:focus{border-color:var(--navy);box-shadow:0 0 0 3px rgba(18,35,63,.08)}
+    .cc-input::placeholder,.cc-textarea::placeholder{color:#aeb5c0}
+    .cc-textarea{resize:vertical;min-height:96px;line-height:1.6}
+    .cc-select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath fill='%2312233f' d='M6 8L0 0h12z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 16px center;padding-right:38px}
+    /* email inspo note */
+    .cc-inspo-note{display:flex;gap:13px;align-items:flex-start;border:1.5px solid var(--gold);border-radius:12px;background:rgba(176,141,70,.06);padding:16px 16px}
+    .cc-inspo-note svg{width:26px;height:26px;stroke:var(--gold);flex-shrink:0;margin-top:2px}
+    .cc-inspo-title{font-size:14px;font-weight:600;color:var(--navy);margin-bottom:4px}
+    .cc-inspo-sub{font-size:12.5px;color:var(--muted);line-height:1.55}
+    .cc-inspo-sub a{color:var(--navy);font-weight:600;text-decoration:none}
+    .cc-inspo-sub a:hover{text-decoration:underline}
+    .cc-submit{width:100%;background:var(--navy);color:var(--white);border:none;border-radius:12px;padding:16px;font-size:15px;font-weight:600;font-family:inherit;letter-spacing:.02em;cursor:pointer;transition:background .18s,transform .1s;margin-top:8px}
+    .cc-submit:hover{background:#0d1b30}
+    .cc-submit:active{transform:translateY(1px)}
+    .cc-submit:disabled{opacity:.55;cursor:not-allowed}
+    .cc-foot{text-align:center;font-size:12px;color:var(--muted);margin-top:18px;line-height:1.6}
+    .cc-success{display:none;text-align:center;padding:20px 10px}
+    .cc-success.show{display:block}
+    .cc-check{width:60px;height:60px;border-radius:50%;background:var(--navy);margin:0 auto 18px;display:flex;align-items:center;justify-content:center}
+    .cc-check svg{width:28px;height:28px;stroke:var(--gold)}
+    .cc-success h3{font-family:'Cormorant Garamond',serif;font-size:26px;color:var(--navy);margin-bottom:10px;font-weight:600}
+    .cc-success p{font-size:14px;color:var(--muted);line-height:1.6;max-width:80%;margin:0 auto}
+    @media(max-width:480px){
+      .cc-head{padding:30px 22px 26px}
+      .cc-title{font-size:28px}.cc-body{padding:26px 22px 30px}
+    }
+  </style>
+  <div class="cc-head">
+    <div class="cc-eyebrow">Website Design Details</div>
+    <h1 class="cc-title">Your Website Vision</h1>
+    <p class="cc-sub">A few design details to bring your site to life. You've already shared your business info — this is all about the look, feel, and menu.</p>
+    <div class="cc-note-banner">Don't have everything yet? Fill in what you can and we'll gather the rest as we go — though the sooner you get it to us, the sooner your site comes to life.</div>
+  </div>
+  <div class="cc-body">
+    <form id="ccIntakeForm">
+      <input type="hidden" name="access_key" value="65074046-434e-456a-bb54-f6ae869a0883">
+      <input type="hidden" name="subject" value="Website Design Details — IV Therapy Client">
+      <input type="hidden" name="from_name" value="Conversion Co Design Intake">
+      <input type="checkbox" name="botcheck" style="display:none" tabindex="-1" autocomplete="off">
+      <!-- SECTION 1: CONTACT PREFERENCE -->
+      <div class="cc-section">
+        <div class="cc-sec-label"><span class="cc-sec-num">1</span> How Clients Reach You</div>
+        <div class="cc-field">
+          <label class="cc-label">Your email <span class="cc-req">*</span></label>
+          <input class="cc-input" type="email" name="email" id="ccEmailField" required placeholder="you@yourpractice.com">
+          <p class="cc-hint">The email you've been using with us — so we can match these details to your project.</p>
+        </div>
+        <div class="cc-field">
+          <label class="cc-label">Best number for clients to reach you <span class="cc-req">*</span></label>
+          <input class="cc-input" type="tel" name="Contact Number" required placeholder="(918) 555-0100">
+        </div>
+        <div class="cc-field">
+          <label class="cc-label">Should clients primarily call or text you? <span class="cc-req">*</span></label>
+          <select class="cc-select" name="Call or Text Preference" required>
+            <option value="" disabled selected>Choose one...</option>
+            <option value="Call">Call</option>
+            <option value="Text">Text</option>
+            <option value="Either is fine">Either is fine</option>
+          </select>
+        </div>
+      </div>
+      <!-- SECTION 2: IV MENU -->
+      <div class="cc-section">
+        <div class="cc-sec-label"><span class="cc-sec-num">2</span> Your IV Menu</div>
+        <div class="cc-field">
+          <label class="cc-label">Names of your IV drips <span class="cc-req">*</span></label>
+          <textarea class="cc-textarea" name="IV Drip Names" required placeholder="One drip per line — e.g.&#10;Hydration&#10;Hangover Recovery&#10;Immunity Boost&#10;Energy"></textarea>
+          <p class="cc-hint">Just the names for now — one per line.</p>
+        </div>
+        <div class="cc-field">
+          <label class="cc-label">Pricing for your IVs</label>
+          <textarea class="cc-textarea" name="IV Pricing" placeholder="Add a price next to each drip if you'd like — e.g.&#10;Hydration — $150&#10;Hangover Recovery — $199"></textarea>
+        </div>
+      </div>
+      <!-- SECTION 3: LOOK & FEEL -->
+      <div class="cc-section">
+        <div class="cc-sec-label"><span class="cc-sec-num">3</span> Look & Feel</div>
+        <div class="cc-field">
+          <label class="cc-label">Which best describes the vibe you want?</label>
+          <select class="cc-select" name="Theme">
+            <option value="Med-spa luxury — soft neutrals, elegant, high-end wellness clinic feel">Med-spa luxury — soft, elegant, high-end</option>
+            <option value="Clean & clinical — crisp white, blues, professional and trustworthy">Clean & clinical — crisp, professional, trustworthy</option>
+            <option value="Warm & personal — earthy tones, welcoming, boutique small-business feel">Warm & personal — earthy, welcoming, boutique</option>
+            <option value="Bold & energetic — vibrant, modern, athletic recovery vibe">Bold & energetic — vibrant, athletic recovery</option>
+            <option value="Calm & spa-like — muted greens/beiges, relaxing and natural">Calm & spa-like — muted, relaxing, natural</option>
+            <option value="Not sure — I'd like a recommendation">Not sure — I'd like a recommendation</option>
+          </select>
+        </div>
+        <!-- EMAIL YOUR INSPO NOTE -->
+        <div class="cc-field">
+          <label class="cc-label">Have a picture of the look you're picturing?</label>
+          <div class="cc-inspo-note">
+            <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
+            <div>
+              <div class="cc-inspo-title">Email your inspo pic to us</div>
+              <div class="cc-inspo-sub">After you submit, email any screenshots, inspo pics, or a look you love to <a href="mailto:conversionco918@gmail.com">conversionco918@gmail.com</a> — even a rough idea helps us match your taste.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <!-- SECTION 4: BOOKING -->
+      <div class="cc-section">
+        <div class="cc-sec-label"><span class="cc-sec-num">4</span> Booking & Scheduling</div>
+        <div class="cc-field">
+          <label class="cc-label">What do you use to book clients / manage records?</label>
+          <select class="cc-select" name="Booking or EMR System">
+            <option value="" disabled selected>Choose one...</option>
+            <option value="Pabau">Pabau</option>
+            <option value="IntakeQ / Practice Better">IntakeQ / Practice Better</option>
+            <option value="Acuity Scheduling">Acuity Scheduling</option>
+            <option value="Calendly">Calendly</option>
+            <option value="Square Appointments">Square Appointments</option>
+            <option value="Jane">Jane</option>
+            <option value="GoHighLevel calendar">GoHighLevel calendar</option>
+            <option value="Just phone / text for now">Just phone / text for now</option>
+            <option value="Something else (note below)">Something else (note below)</option>
+            <option value="Not sure yet">Not sure yet</option>
+          </select>
+          <p class="cc-hint">If your system has a booking link or embed, we can connect it directly to your site.</p>
+        </div>
+        <div class="cc-field">
+          <label class="cc-label">Your booking page link (if you have one)</label>
+          <input class="cc-input" type="url" name="Booking Link" placeholder="https://...">
+          <p class="cc-hint">No link yet? No problem — your site will use text-to-book until you're ready.</p>
+        </div>
+      </div>
+      <!-- SECTION: MEMBERSHIPS -->
+      <div class="cc-section">
+        <div class="cc-sec-label"><span class="cc-sec-num">5</span> Memberships</div>
+        <div class="cc-field">
+          <label class="cc-label">Do you offer memberships or packages?</label>
+          <textarea class="cc-textarea" name="Memberships" placeholder="Name, price, and what's included — one per line. e.g.&#10;The Monthly Reset — $99/mo — one drip per month + 10% off extras&#10;VIP — $179/mo — two drips + priority booking"></textarea>
+          <p class="cc-hint">Leave blank if you don't offer them yet — we can add a memberships page later.</p>
+        </div>
+      </div>
+      <!-- SECTION: YOUR STORY -->
+      <div class="cc-section">
+        <div class="cc-sec-label"><span class="cc-sec-num">6</span> Your Story</div>
+        <div class="cc-field">
+          <label class="cc-label">Tell us your story in 2–3 sentences <span class="cc-req">*</span></label>
+          <textarea class="cc-textarea" name="Your Story" required placeholder="Why did you start this business? What do you love about caring for people? Write it like you'd say it — we'll polish it for your About page."></textarea>
+        </div>
+        <div class="cc-field">
+          <label class="cc-label">Years of nursing experience <span class="cc-req">*</span></label>
+          <input class="cc-input" type="text" name="Years of Experience" required placeholder="e.g. 8 years — ER and ICU">
+        </div>
+        <div class="cc-field">
+          <label class="cc-label">Your photo for the About page</label>
+          <div class="cc-inspo-note">
+            <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+            <div>
+              <div class="cc-inspo-title">Email us a photo in your scrubs</div>
+              <div class="cc-inspo-sub">After you submit, email a clear photo of yourself in your scrubs (a phone photo in good light works great) to <a href="mailto:conversionco918@gmail.com">conversionco918@gmail.com</a> — it makes your About page instantly more trustworthy.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <!-- SECTION 4: REVIEWS + NOTES -->
+      <div class="cc-section">
+        <div class="cc-sec-label"><span class="cc-sec-num">7</span> Reviews & Notes</div>
+        <div class="cc-field">
+          <label class="cc-label">Client reviews or testimonials</label>
+          <textarea class="cc-textarea" name="Reviews" placeholder='Paste any reviews — with the client&apos;s first name if possible. e.g.&#10;"Showed up on time and I felt amazing after!" — Sarah M.'></textarea>
+          <p class="cc-hint">No worries if you don't have these yet — we can add them later.</p>
+        </div>
+        <div class="cc-field">
+          <label class="cc-label">Anything else we should know?</label>
+          <textarea class="cc-textarea" name="Additional Notes" placeholder="Special requests, must-haves, or anything on your mind."></textarea>
+        </div>
+      </div>
+      <button type="submit" class="cc-submit" id="ccSubmitBtn">Send My Details</button>
+      <p class="cc-foot">Your details go straight to our team. We'll be in touch soon.</p>
+    </form>
+    <div class="cc-success" id="ccSuccess">
+      <div class="cc-check">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
+      </div>
+      <h3>Got it — thank you!</h3>
+      <p>Your details are on their way. We'll reach out shortly to start building your site.</p>
+    </div>
+  </div>
+  <script>
+    (function(){
+      var form=document.getElementById('ccIntakeForm');
+      var btn=document.getElementById('ccSubmitBtn');
+      var success=document.getElementById('ccSuccess');
+      // Pre-fill the client's email from the personalized link (?e=their@email.com)
+      try{
+        var pre=new URLSearchParams(window.location.search).get('e');
+        if(pre){ document.getElementById('ccEmailField').value=pre; }
+      }catch(_e){}
+      form.addEventListener('submit',function(e){
+        e.preventDefault();
+        btn.disabled=true;btn.textContent='Sending...';
+        var data=new FormData(form);
+        fetch('https://conversionco-mission-control.conversionco918.workers.dev/intake/2',{method:'POST',body:data})
+        .then(function(r){return r.json()})
+        .then(function(res){
+          if(res.success){
+            form.style.display='none';
+            success.classList.add('show');
+            success.scrollIntoView({behavior:'smooth',block:'center'});
+          }else{
+            btn.disabled=false;btn.textContent='Send My Details';
+            alert('Something went wrong sending your details. Please try again.');
+          }
+        })
+        .catch(function(){
+          btn.disabled=false;btn.textContent='Send My Details';
+          alert('Something went wrong sending your details. Please try again.');
+        });
+      });
+    })();
+  </script>
+</div>
+
+</body>
+</html>

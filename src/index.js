@@ -6,6 +6,8 @@ import { vibeToTokens } from './vibe.js';
 import { PRICES, ensureCustomer, sendInvoice, invoiceStatus, hostingCheckout, checkoutStatus } from './stripe.js';
 import { computeScore } from './score.js';
 import dashboardHtml from './ui.html';
+import form1Html from './form1.html';
+import form2Html from './form2.html';
 import loginHtml from './login.html';
 
 const app = new Hono();
@@ -519,6 +521,10 @@ app.get('/api/revision-done/:key', async (c) => {
     `${status === 'done' ? '✅ Revision applied' : '⚠️ Revision needs attention'}: "${rev.request.slice(0, 80)}"${q.note ? ' — ' + String(q.note).slice(0, 120) : ''}`);
   return c.json({ ok: true });
 });
+
+// Self-hosted intake forms (mobile-bulletproof — no funnel builder in the path)
+app.get('/form/1', (c) => c.html(form1Html));
+app.get('/form/2', (c) => c.html(form2Html));
 
 // ---------------- public: client portal, pitch pages, lead capture ----------------
 async function portalToken(env, kind, id) {
