@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { GHL } from './ghl.js';
 import { DEFAULT_TEMPLATES, BOOKING_TEMPLATES, DEFAULT_SETTINGS, renderTemplate } from './emails.js';
+import { THEMES } from './themes.js';
 import dashboardHtml from './ui.html';
 import loginHtml from './login.html';
 
@@ -555,6 +556,45 @@ app.delete('/api/clients/:id', async (c) => {
   await c.env.DB.prepare('DELETE FROM clients WHERE id = ?').bind(id).run();
   await logEvent(c.env.DB, id, 'client_deleted');
   return c.json({ ok: true });
+});
+
+// Apply a preset theme to a client's site: rewrites design tokens in site.css,
+// commits to GitHub and updates D1 so the preview restyles immediately.
+app.post('/api/clients/:id/theme', async (c) => {
+  const id = Number(c.req.param('id'));
+  const { theme } = await c.req.json();
+  const t = THEMES[theme];
+  if (!t) return c.json({ error: 'unknown theme' }, 400);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  const metas = (await db.prepare(`SELECT slug, content FROM site_files WHERE path='site-meta.json'`).all()).results || [];
+  let slug = null;
+  for (const m of metas) { try { if (JSON.parse(m.content).client_id === id) { slug = m.slug; break; } } catch {} }
+  if (!slug) return c.json({ error: 'no generated site found for this client yet' }, 404);
+  const cssRow = await db.prepare(`SELECT content FROM site_files WHERE slug=? AND path='site.css'`).bind(slug).first();
+  if (!cssRow) return c.json({ error: 'site.css not found' }, 404);
+  let css = cssRow.content;
+  for (const [k, v] of Object.entries(t.tokens)) {
+    css = css.replace(new RegExp('(' + k.replace(/-/g, '\\-') + '\\s*:\\s*)#[0-9A-Fa-f]{3,8}'), '$1' + v);
+  }
+  if (!c.env.GITHUB_TOKEN) return c.json({ error: 'GITHUB_TOKEN not set' }, 500);
+  const settings = await getSettings(db);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  const path = `sites/${slug}/site.css`;
+  const ghHeaders = { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+  const getRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, { headers: ghHeaders });
+  const existing = getRes.ok ? await getRes.json() : null;
+  const b64 = btoa(unescape(encodeURIComponent(css)));
+  const putRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+    method: 'PUT',
+    headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: `Theme: ${t.label} → ${slug}`, content: b64, ...(existing?.sha ? { sha: existing.sha } : {}) }),
+  });
+  if (!putRes.ok) return c.json({ error: `GitHub commit failed: ${putRes.status}` }, 502);
+  await db.prepare(`UPDATE site_files SET content=?, updated_at=datetime('now') WHERE slug=? AND path='site.css'`).bind(css, slug).run();
+  await logEvent(db, id, 'theme_changed', `Theme set to ${t.label} 🎨`);
+  return c.json({ ok: true, slug, theme, label: t.label });
 });
 
 // ---------------- API: settings & GHL utilities ----------------
