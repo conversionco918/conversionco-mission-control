@@ -85,6 +85,53 @@
 
   #toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: var(--navy); color: #fff; padding: 12px 22px; border-radius: 10px; font-size: 14px; display: none; z-index: 50; box-shadow: 0 10px 30px rgba(0,0,0,.3); }
   .empty { text-align: center; color: var(--muted); padding: 40px; font-size: 14px; }
+
+  /* money + needs-you strips */
+  #moneyStrip { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 14px; }
+  .stat { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px 18px; box-shadow: 0 1px 3px rgba(0,0,0,.05); }
+  .stat b { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin-bottom: 4px; }
+  .stat .v { font-size: 22px; font-weight: 800; color: var(--navy); }
+  .stat .sub { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+  #needsStrip { background: #fffbeb; border: 1px solid #fde68a; border-radius: 14px; padding: 14px 18px; margin-bottom: 18px; }
+  #needsStrip h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .6px; color: #92400e; margin-bottom: 8px; }
+  #needsStrip .need { font-size: 13.5px; padding: 7px 4px; border-bottom: 1px dashed #fde68a; cursor: pointer; border-radius: 6px; }
+  #needsStrip .need:last-child { border-bottom: 0; }
+  #needsStrip .need:hover { background: #fef3c7; }
+  #needsStrip.allgood { background: #ecfdf5; border-color: #a7f3d0; }
+  #needsStrip.allgood h3 { color: #047857; }
+
+  /* health dots */
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 99px; margin-right: 7px; vertical-align: 1px; }
+  .dot.green { background: #10b981; } .dot.yellow { background: #f59e0b; } .dot.red { background: #ef4444; box-shadow: 0 0 0 3px rgba(239,68,68,.18); } .dot.gray { background: #cbd5e1; }
+
+  /* view toggle + board */
+  .viewbar { display: flex; gap: 6px; margin-bottom: 12px; align-items: center; }
+  .viewbar button { border: 1px solid var(--line); background: var(--card); color: var(--muted); padding: 7px 14px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; }
+  .viewbar button.on { background: var(--navy); color: #fff; border-color: var(--navy); }
+  #boardWrap { display: none; overflow-x: auto; padding-bottom: 10px; -webkit-overflow-scrolling: touch; }
+  .board { display: flex; gap: 12px; align-items: flex-start; min-width: max-content; }
+  .bcol { background: #eaeff5; border-radius: 14px; padding: 10px; width: 230px; flex: 0 0 230px; }
+  .bcol h4 { font-size: 11.5px; text-transform: uppercase; letter-spacing: .6px; color: #475569; padding: 4px 6px 10px; display: flex; justify-content: space-between; }
+  .bcol h4 span { background: #fff; border-radius: 99px; padding: 0 8px; font-size: 11px; }
+  .bcard { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; cursor: pointer; box-shadow: 0 1px 2px rgba(0,0,0,.05); }
+  .bcard:hover { border-color: #94a3b8; }
+  .bcard b { font-size: 13.5px; display: block; }
+  .bcard .em { font-size: 11.5px; color: var(--muted); word-break: break-all; }
+  .bcard .tier { font-size: 10.5px; font-weight: 700; color: #7c3aed; }
+
+  /* mobile polish */
+  @media (max-width: 700px) {
+    main { padding: 12px; }
+    header { padding: 12px 14px; gap: 8px; }
+    header button { padding: 10px 12px; }
+    .addbar { padding: 12px; } #newEmail { min-width: 0; flex: 1 1 100%; } .addbar input { flex: 1 1 100%; } .addbar .btn { flex: 1 1 100%; padding: 13px; }
+    #moneyStrip { grid-template-columns: 1fr 1fr; gap: 8px; } #moneyStrip .stat:first-child { grid-column: 1 / -1; }
+    .stat .v { font-size: 19px; }
+    th:nth-child(3), td:nth-child(3) { display: none; }
+    td { padding: 12px 10px; } .btn { padding: 12px 14px; }
+    .bcol { width: 200px; flex-basis: 200px; }
+    #drawer { width: 100vw; right: -100vw; }
+  }
 </style>
 </head>
 <body>
@@ -103,7 +150,15 @@
     <button class="btn btn-primary" id="addBtn" onclick="addClient()">Send Intake 1 →</button>
   </div>
 
-  <div class="cols">
+  <div id="moneyStrip"></div>
+  <div id="needsStrip" style="display:none"></div>
+
+  <div class="viewbar">
+    <button id="vTable" class="on" onclick="setView('table')">☰ List</button>
+    <button id="vBoard" onclick="setView('board')">▦ Pipeline board</button>
+  </div>
+
+  <div class="cols" id="tableWrap">
     <div>
       <table>
         <thead><tr><th>Client</th><th>Stage</th><th>Last activity</th><th></th></tr></thead>
@@ -115,6 +170,8 @@
       <div class="feed" id="feed"></div>
     </div>
   </div>
+
+  <div id="boardWrap"><div class="board" id="board"></div></div>
 </main>
 
 <!-- client drawer -->
@@ -197,7 +254,70 @@ async function api(path, opts={}) {
 
 async function refresh() {
   STATE = await api('/api/state');
-  renderClients(); renderFeed();
+  renderOverview(); renderClients(); renderBoard(); renderFeed();
+}
+
+let VIEW = localStorage.getItem('cc_view') || 'table';
+function setView(v) {
+  VIEW = v; localStorage.setItem('cc_view', v);
+  document.getElementById('tableWrap').style.display = v === 'table' ? '' : 'none';
+  document.getElementById('boardWrap').style.display = v === 'board' ? 'block' : 'none';
+  document.getElementById('vTable').classList.toggle('on', v === 'table');
+  document.getElementById('vBoard').classList.toggle('on', v === 'board');
+}
+
+function dot(c) {
+  const h = (STATE.overview && STATE.overview.health && STATE.overview.health[c.id]) || { dot: 'gray', why: '' };
+  return `<span class="dot ${h.dot}" title="${esc(h.why)}"></span>`;
+}
+
+function renderOverview() {
+  const ov = STATE.overview;
+  const ms = document.getElementById('moneyStrip'), ns = document.getElementById('needsStrip');
+  if (!ov) { ms.innerHTML = ''; ns.style.display = 'none'; return; }
+  const m = ov.money;
+  ms.innerHTML = `
+    <div class="stat"><b>Cash collected</b><div class="v">$${(m.collected).toLocaleString()}</div><div class="sub">project fees paid</div></div>
+    <div class="stat"><b>Outstanding</b><div class="v">$${(m.outstanding).toLocaleString()}</div><div class="sub">invoices awaiting payment</div></div>
+    <div class="stat"><b>Recurring — MRR</b><div class="v">$${m.mrr.toLocaleString()}/mo</div><div class="sub">${m.hostingCount} hosting subscription${m.hostingCount === 1 ? '' : 's'} × $49</div></div>`;
+  ns.style.display = 'block';
+  if (!ov.needs.length) {
+    ns.className = 'allgood'; ns.id = 'needsStrip';
+    ns.classList.add('allgood');
+    ns.innerHTML = `<h3>Needs you — nothing 🎉</h3><div style="font-size:13.5px;color:#065f46;">No unsigned agreements, no stuck invoices, no failed checks. The machine is running itself.</div>`;
+  } else {
+    ns.classList.remove('allgood');
+    ns.innerHTML = `<h3>Needs you — ${ov.needs.length} item${ov.needs.length === 1 ? '' : 's'}</h3>` +
+      ov.needs.map(n => `<div class="need" ${n.id ? `onclick="openDrawer(${n.id})"` : ''}>${esc(n.msg)}</div>`).join('');
+  }
+}
+
+const BOARD_COLS = ['New', 'Intake 1', 'Call', 'Closing', 'Paid', 'Building', 'Preview', 'Live'];
+function colFor(c) {
+  let b = {}; try { b = JSON.parse(c.billing || '{}'); } catch {}
+  if (c.stage === 'live') return 'Live';
+  if (c.stage === 'preview_ready') return 'Preview';
+  if (c.stage === 'generating') return 'Building';
+  if (b.invoice_status === 'paid') return (c.stage === 'intake2_sent' || c.stage === 'intake2_done') ? 'Building' : 'Paid';
+  if (b.invoice_status === 'open' || b.agr_sent) return 'Closing';
+  if (c.stage === 'intake1_done' || c.stage === 'intake2_sent' || c.stage === 'intake2_done') return 'Call';
+  if (c.stage === 'intake1_sent') return 'Intake 1';
+  return 'New';
+}
+function renderBoard() {
+  const el = document.getElementById('board');
+  const active = STATE.clients.filter(c => c.stage !== 'archived');
+  const byCol = {}; BOARD_COLS.forEach(k => byCol[k] = []);
+  active.forEach(c => byCol[colFor(c)].push(c));
+  el.innerHTML = BOARD_COLS.map(k => `
+    <div class="bcol"><h4>${k} <span>${byCol[k].length}</span></h4>
+      ${byCol[k].map(c => `<div class="bcard" onclick="openDrawer(${c.id})">
+        <b>${dot(c)}${esc(c.business_name || c.name || c.email)}</b>
+        <span class="em">${esc(c.email)}</span>
+        ${c.tier === 'premium' ? '<span class="tier">★ PREMIUM</span>' : ''}
+        <div style="font-size:11px;color:var(--muted);margin-top:3px;">${ago(c.updated_at)}</div>
+      </div>`).join('') || '<div style="font-size:12px;color:#94a3b8;padding:6px;">—</div>'}
+    </div>`).join('');
 }
 
 function renderClients() {
@@ -206,7 +326,7 @@ function renderClients() {
   tb.innerHTML = STATE.clients.map(c => {
     const st = STAGES[c.stage] || STAGES.new;
     return `<tr class="rowclick" onclick="openDrawer(${c.id})">
-      <td><b>${esc(c.name || c.email)}</b>${c.name ? `<br><span style="color:var(--muted);font-size:12px">${esc(c.email)}</span>` : ''}</td>
+      <td>${dot(c)}<b>${esc(c.name || c.email)}</b>${c.name ? `<br><span style="color:var(--muted);font-size:12px;margin-left:16px;">${esc(c.email)}</span>` : ''}</td>
       <td><span class="chip" style="background:${st.bg};color:${st.fg}">${st.label}</span></td>
       <td style="color:var(--muted);font-size:13px">${ago(c.updated_at)}</td>
       <td>${c.stage === 'intake1_done' ? `<button class="btn btn-green" onclick="event.stopPropagation();sendIntake2(${c.id}, this)">Approve → Intake 2</button>` : ''}</td>
@@ -630,6 +750,7 @@ async function saveSettings(btn) {
   btn.disabled = false; closeSettings(); toast('Settings saved ✓'); refresh();
 }
 
+setView(VIEW);
 refresh();
 setInterval(refresh, 60000);
 </script>

@@ -536,6 +536,13 @@ app.get('/api/set-from/:key', async (c) => {
   return c.json({ ok: true, email_from: value });
 });
 
+// Keyed: fire the weekly owner digest on demand (testing / catch-up)
+app.get('/api/digest-now/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  await weeklyOwnerDigest(c.env);
+  return c.json({ ok: true });
+});
+
 // Deliverability test (keyed): sends a styled test email so inbox placement can be verified
 app.get('/api/test-email/:key', async (c) => {
   if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
@@ -976,6 +983,50 @@ app.use('*', async (c, next) => {
 app.get('/', (c) => c.html(dashboardHtml));
 
 // ---------------- API: clients ----------------
+// Money + Needs-You + health, computed from data the system already tracks
+async function computeOverview(db, clients, settings) {
+  const signedRows = (await db.prepare('SELECT DISTINCT client_id FROM agreements').all()).results || [];
+  const signed = new Set(signedRows.map((r) => r.client_id));
+  const revFailed = (await db.prepare(`SELECT client_id, request FROM revisions WHERE status='failed' ORDER BY id DESC LIMIT 20`).all()).results || [];
+  const revFailedByClient = {};
+  for (const r of revFailed) (revFailedByClient[r.client_id] = revFailedByClient[r.client_id] || []).push(r.request);
+  const newLeads = (await db.prepare(`SELECT l.*, c.business_name AS cbiz, c.name AS cname FROM leads l LEFT JOIN clients c ON c.id = l.client_id WHERE l.created_at > datetime('now','-2 days') ORDER BY l.id DESC LIMIT 20`).all()).results || [];
+
+  let collected = 0, outstanding = 0, hostingCount = 0;
+  const needs = [], health = {};
+  const dayMs = 86400000;
+  for (const cl of clients) {
+    if (cl.stage === 'archived') { health[cl.id] = { dot: 'gray', why: 'archived' }; continue; }
+    const label = cl.business_name || cl.name || cl.email;
+    let b = {}; try { b = JSON.parse(cl.billing || '{}'); } catch {}
+    const tierKey = b.invoice_tier || (cl.tier === 'premium' ? 'premium' : 'standard');
+    const amt = PRICES[tierKey].amount / 100;
+    if (b.invoice_status === 'paid') collected += amt;
+    else if (b.invoice_status === 'open') { outstanding += amt; needs.push({ id: cl.id, sev: 2, kind: 'invoice', msg: `💳 ${label} — invoice outstanding (${PRICES[tierKey].display})` }); }
+    if (b.sub_status === 'active') hostingCount++;
+
+    let why = [], dot = 'green';
+    let upt = {}; try { upt = JSON.parse(settings[`uptime_${cl.id}`] || '{}'); } catch {}
+    if (upt.last === 'down') { dot = 'red'; why.push('site check failed'); needs.push({ id: cl.id, sev: 1, kind: 'down', msg: `⛔ ${label} — site check FAILED (${upt.how || ''})` }); }
+    if (revFailedByClient[cl.id]) { dot = 'red'; why.push('revision needs attention'); needs.push({ id: cl.id, sev: 1, kind: 'revision', msg: `✏️ ${label} — revision needs attention: "${String(revFailedByClient[cl.id][0]).slice(0, 60)}"` }); }
+    if (b.agr_sent && !signed.has(cl.id)) {
+      const days = Math.floor((Date.now() - Date.parse(b.agr_sent)) / dayMs);
+      if (days >= 2) { if (dot === 'green') dot = 'yellow'; why.push('agreement unsigned'); needs.push({ id: cl.id, sev: 2, kind: 'agreement', msg: `📄 ${label} — agreement unsigned for ${days} day${days === 1 ? '' : 's'} (nudge them)` }); }
+    }
+    if (b.invoice_status === 'open' && dot === 'green') { dot = 'yellow'; why.push('invoice open'); }
+    if (b.invoice_status === 'paid' && !cl.intake2_data && !['generating', 'preview_ready', 'live'].includes(cl.stage)) {
+      if (dot === 'green') dot = 'yellow'; why.push('paid — needs Intake 2');
+      if (cl.stage !== 'intake2_sent') needs.push({ id: cl.id, sev: 2, kind: 'intake2', msg: `🚀 ${label} — PAID and ready: send Intake 2 to start their build` });
+    }
+    if (cl.stage === 'intake1_done') needs.push({ id: cl.id, sev: 3, kind: 'call', msg: `📞 ${label} — Intake 1 done, book/hold the pricing call` });
+    health[cl.id] = { dot, why: why.join(' · ') || 'all good' };
+  }
+  for (const l of newLeads) needs.push({ id: l.client_id, sev: 3, kind: 'lead', msg: `🔥 New lead for ${l.cbiz || l.cname || 'client'}: ${l.name || l.email || l.phone || 'someone'} (${ago2(l.created_at)})` });
+  needs.sort((a, b2) => a.sev - b2.sev);
+  return { money: { collected, outstanding, hostingCount, mrr: hostingCount * 49 }, needs: needs.slice(0, 12), health };
+}
+function ago2(iso) { if (!iso) return ''; const m = (Date.now() - Date.parse(iso + (String(iso).includes('Z') ? '' : 'Z'))) / 60000; if (m < 60) return `${Math.max(1, Math.floor(m))}m ago`; if (m < 1440) return `${Math.floor(m / 60)}h ago`; return `${Math.floor(m / 1440)}d ago`; }
+
 app.get('/api/state', async (c) => {
   const db = c.env.DB;
   const clients = (await db.prepare('SELECT * FROM clients ORDER BY updated_at DESC').all()).results || [];
@@ -983,8 +1034,10 @@ app.get('/api/state', async (c) => {
     'SELECT e.*, c.name AS client_name, c.email AS client_email FROM events e LEFT JOIN clients c ON c.id = e.client_id ORDER BY e.id DESC LIMIT 50'
   ).all()).results || [];
   const settings = await getSettings(db);
+  let overview = null;
+  try { overview = await computeOverview(db, clients, settings); } catch { /* dashboard still renders without it */ }
   const webhookSecret = (await hmac(c.env.SESSION_SECRET, 'webhook')).slice(0, 16);
-  return c.json({ clients, events, settings, webhook_path: `/webhooks/ghl/${webhookSecret}` });
+  return c.json({ clients, events, settings, overview, webhook_path: `/webhooks/ghl/${webhookSecret}` });
 });
 
 // Add client + send Intake 1
@@ -1846,6 +1899,50 @@ async function dailyUptime(env) {
   return results;
 }
 
+// Monday owner's digest: the week in one email, straight to Tiffany
+async function weeklyOwnerDigest(env) {
+  const db = env.DB;
+  const settings = await getSettings(db);
+  if (!env.GHL_TOKEN || !settings.ghl_location_id) return;
+  const to = settings.notify_email || 'tiffany.anywhereinfusions@gmail.com';
+  const clients = (await db.prepare('SELECT * FROM clients ORDER BY updated_at DESC').all()).results || [];
+  const overview = await computeOverview(db, clients, settings);
+  const wk = (await db.prepare(`SELECT type, COUNT(*) AS n FROM events WHERE created_at > datetime('now','-7 days') GROUP BY type`).all()).results || [];
+  const count = (t) => wk.find((r) => r.type === t)?.n || 0;
+  const leads7 = (await db.prepare(`SELECT COUNT(*) AS n FROM leads WHERE created_at > datetime('now','-7 days')`).first())?.n || 0;
+  const money = overview.money;
+  const row = (k, v) => `<tr><td style="padding:6px 14px 6px 0;color:#64748b;font-size:13px;">${k}</td><td style="padding:6px 0;font-weight:700;font-size:14px;color:#0B1D33;">${v}</td></tr>`;
+  const needsHtml = overview.needs.length
+    ? `<ol style="padding-left:18px;margin:8px 0;">${overview.needs.map((n) => `<li style="margin:6px 0;font-size:13.5px;">${n.msg}</li>`).join('')}</ol>`
+    : `<p style="font-size:13.5px;">Nothing is waiting on you — the machine is humming. 🎉</p>`;
+  try {
+    const ghl = new GHL(env.GHL_TOKEN, settings.ghl_location_id);
+    const contact = await ghl.upsertContact({ email: to, name: 'ConversionCo Owner' });
+    await ghl.sendEmail({
+      contactId: contact.id || contact.contactId,
+      subject: `📊 Your ConversionCo week — $${money.collected} collected · ${leads7} lead${leads7 === 1 ? '' : 's'} · MRR $${money.mrr}`,
+      html: `<h2 style="color:#0B1D33;margin:0 0 4px;">Your week at ConversionCo</h2>
+<p style="color:#64748b;font-size:13px;margin:0 0 16px;">Every number below is live from Mission Control.</p>
+<table style="border-collapse:collapse;">
+${row('Cash collected (all time)', `$${money.collected.toLocaleString()}`)}
+${row('Invoices outstanding', `$${money.outstanding.toLocaleString()}`)}
+${row('Hosting subscriptions', `${money.hostingCount} active — <b>$${money.mrr}/mo recurring</b>`)}
+${row('New leads (7 days)', leads7)}
+${row('Intakes submitted (7 days)', count('intake1_done') + count('intake2_done'))}
+${row('Invoices paid (7 days)', count('invoice_paid'))}
+${row('Sites hitting preview (7 days)', count('preview_ready') || count('site_published'))}
+${row('Revisions applied (7 days)', count('revision_done'))}
+</table>
+<h3 style="color:#0B1D33;margin:18px 0 4px;">Waiting on you</h3>
+${needsHtml}
+<p style="margin:22px 0;"><a href="${BASE_URL}" style="background:#0B1D33;color:#fff;padding:13px 26px;border-radius:8px;text-decoration:none;font-weight:bold;">Open Mission Control &rarr;</a></p>
+<p style="font-size:12.5px;color:#667788;">Button not working? Copy this link into your browser:<br><span style="color:#0B1D33;word-break:break-all;">${BASE_URL}</span></p>`,
+      emailFrom: settings.email_from || undefined,
+    });
+    await logEvent(db, null, 'owner_digest', `📊 Weekly owner digest sent to ${to}`);
+  } catch (e) { await logEvent(db, null, 'error', `Owner digest failed: ${e.message}`); }
+}
+
 export default {
   fetch: app.fetch,
   async scheduled(event, env, ctx) {
@@ -1854,6 +1951,11 @@ export default {
       ctx.waitUntil(dailyUptime(env).catch((e) =>
         logEvent(env.DB, null, 'error', `Uptime check failed: ${e.message}`)
       ));
+      if (new Date(event.scheduledTime || Date.now()).getUTCDay() === 1) {
+        ctx.waitUntil(weeklyOwnerDigest(env).catch((e) =>
+          logEvent(env.DB, null, 'error', `Owner digest failed: ${e.message}`)
+        ));
+      }
       return;
     }
     const settings = await getSettings(env.DB);
