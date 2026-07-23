@@ -326,6 +326,15 @@ function openDrawer(id) {
       ${intakeBlock('Intake 1 — Client details', c.intake1_data)}
       ${intakeBlock('Intake 2 — Website vision', c.intake2_data)}
       <div>
+        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Share links</label>
+        <div class="actions">
+          <button class="btn btn-ghost" onclick="copyLink(${c.id}, 'portal', this)">🔗 Copy client portal link</button>
+          <button class="btn btn-ghost" onclick="copyLink(${c.id}, 'pitch', this)">✨ Copy pitch page link</button>
+        </div>
+        <p style="font-size:11px;color:#94a3b8;margin-top:6px;">Portal = their live dashboard (send after purchase). Pitch = personalized proposal page (send before/during the pricing call).</p>
+      </div>
+      <div id="leadsBox"></div>
+      <div>
         <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Client logo</label>
         <div style="display:flex;gap:14px;align-items:center;">
           <img id="logoPrev" src="/api/clients/${c.id}/logo?cb=${Date.now()}" alt="" style="height:52px;max-width:150px;object-fit:contain;border:1px solid #e2e8f0;border-radius:8px;padding:4px;background:#fff;" onerror="this.style.display='none';document.getElementById('logoNone').style.display='inline'">
@@ -372,6 +381,14 @@ function openDrawer(id) {
       </div>
     </div>`;
   document.getElementById('drawer').classList.add('open');
+  api(`/api/clients/${id}/leads`).then((r) => {
+    const box = document.getElementById('leadsBox');
+    if (!box || !r.leads) return;
+    box.innerHTML = `<label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Leads from their website ${r.leads.length ? `(${r.leads.length} recent)` : ''}</label>` +
+      (r.leads.length
+        ? `<div class="intake" style="padding:12px 14px;">${r.leads.map(l => `<div style="padding:7px 0;border-bottom:1px dashed #e2e8f0;font-size:13px;"><b>${esc(l.name || 'No name')}</b> · ${esc(l.phone || l.email || '')}<br><span style="color:#64748b;">${esc((l.message || '').slice(0, 120))}</span><br><span style="color:#94a3b8;font-size:11px;">${esc(l.created_at)}</span></div>`).join('')}</div>`
+        : `<p style="font-size:12px;color:#94a3b8;">None yet — leads from their site's contact form appear here (and email you instantly).</p>`);
+  });
   api(`/api/clients/${id}/score`).then((sc) => {
     const el = document.getElementById('seoScore');
     if (!el || !sc || sc.error) return;
@@ -441,6 +458,14 @@ async function startHosting(id, btn) {
   refresh(); setTimeout(() => openDrawer(id), 400);
 }
 function copyText(t){ navigator.clipboard?.writeText(t).catch(()=>{}); }
+async function copyLink(id, kind, btn) {
+  btn.disabled = true;
+  const r = await api(`/api/clients/${id}/links`);
+  btn.disabled = false;
+  if (!r[kind]) return toast('⚠ could not build link');
+  copyText(r[kind]);
+  toast(kind === 'portal' ? 'Portal link copied 🔗 — send it to the client' : 'Pitch link copied ✨ — send before the call');
+}
 async function billingBypass(id, what) {
   if (!confirm(what === 'hosting' ? 'Mark hosting & security as ACTIVE without Stripe? (bypass)' : 'Mark the invoice as PAID without Stripe? (bypass)')) return;
   const r = await api(`/api/clients/${id}/billing-bypass`, { method:'POST', body: JSON.stringify({ what }) });

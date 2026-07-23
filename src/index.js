@@ -45,6 +45,10 @@ async function ensureSchema(db) {
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN launch_checklist TEXT DEFAULT ''`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN vibe TEXT DEFAULT ''`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN billing TEXT DEFAULT ''`).run(); } catch {}
+  try { await db.prepare(`CREATE TABLE IF NOT EXISTS leads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER, slug TEXT DEFAULT '',
+    name TEXT DEFAULT '', email TEXT DEFAULT '', phone TEXT DEFAULT '', message TEXT DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')))`).run(); } catch {}
   schemaReady = true;
 }
 
@@ -468,6 +472,184 @@ app.get('/api/grabimg/:key', async (c) => {
   </body></html>`);
 });
 
+
+// ---------------- public: client portal, pitch pages, lead capture ----------------
+async function portalToken(env, kind, id) {
+  const t = await hmac(env.SESSION_SECRET, `${kind}:${id}`);
+  return t.replace(/[+/=]/g, '').slice(0, 16);
+}
+async function slugForClient(db, id) {
+  const metas = (await db.prepare(`SELECT slug, content FROM site_files WHERE path='site-meta.json'`).all()).results || [];
+  for (const m of metas) { try { if (JSON.parse(m.content).client_id === id) return m.slug; } catch {} }
+  return null;
+}
+const PORTAL_STAGES = [
+  ['intake1_sent', 'Getting to know you'], ['intake1_done', 'Blueprint received'],
+  ['intake2_done', 'Vision captured'], ['generating', 'Designing & building'],
+  ['preview_ready', 'Preview ready'], ['live', 'LIVE on the web'],
+];
+app.get('/portal/:id/:token', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'portal', id)) return c.text('not found', 404);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.text('not found', 404);
+  const settings = await getSettings(db);
+  const score = await computeScore(db, client, settings);
+  let up = null; try { up = JSON.parse(settings[`uptime_${id}`] || 'null'); } catch {}
+  const slug = await slugForClient(db, id);
+  const blogs = slug ? ((await db.prepare(`SELECT path FROM site_files WHERE slug=? AND path LIKE 'blog-%' ORDER BY updated_at DESC LIMIT 6`).bind(slug).all()).results || []) : [];
+  const biz = client.business_name || client.name || 'Your Business';
+  const stageIdx = PORTAL_STAGES.findIndex(([k]) => k === client.stage);
+  const doneIdx = stageIdx === -1 ? (client.stage === 'intake2_sent' ? 2 : 0) : stageIdx;
+  const siteUrl = client.live_url || client.preview_url || '';
+  const upPct = up && up.total ? Math.round(100 * (up.total - (up.fails || 0)) / up.total) : null;
+  const bars = score ? Object.entries(score.breakdown).map(([k, v]) =>
+    `<div class="bar"><span>${k === 'offsite' ? 'off-site' : k}</span><div class="tr"><div class="fl" style="width:${Math.round(100 * v.score / v.max)}%"></div></div><b>${v.score}/${v.max}</b></div>`).join('') : '';
+  return c.html(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex"><title>${biz} — Client Portal | ConversionCo</title>
+<style>
+  *{box-sizing:border-box;margin:0}body{font-family:-apple-system,'Segoe UI',sans-serif;background:#0B1D33;color:#EDF2F7;line-height:1.6}
+  .wrap{max-width:760px;margin:0 auto;padding:40px 20px 80px}
+  .head{display:flex;align-items:center;gap:14px;margin-bottom:6px}
+  .head img{height:44px;max-width:130px;object-fit:contain;background:#fff;border-radius:10px;padding:4px}
+  h1{font-size:26px}.sub{color:#8EA3BC;font-size:13px;margin-bottom:34px}
+  .card{background:#10263F;border:1px solid #1E3A5C;border-radius:16px;padding:24px;margin-bottom:18px}
+  .card h2{font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:#C9A254;margin-bottom:16px}
+  .steps{display:flex;flex-direction:column;gap:10px}
+  .step{display:flex;gap:12px;align-items:center;font-size:15px}
+  .dot{width:26px;height:26px;border-radius:50%;display:grid;place-items:center;font-size:13px;flex:0 0 26px;background:#1E3A5C;color:#8EA3BC}
+  .done .dot{background:#059669;color:#fff}.now .dot{background:#C9A254;color:#0B1D33}
+  .now{font-weight:600}.pend{color:#5C7794}
+  .scorebig{display:flex;gap:26px;align-items:center;flex-wrap:wrap}
+  .num{font-size:64px;font-weight:700;color:#C9A254;line-height:1}.num small{font-size:20px;color:#8EA3BC}
+  .bars{flex:1;min-width:240px;display:flex;flex-direction:column;gap:8px}
+  .bar{display:flex;align-items:center;gap:10px;font-size:12px}
+  .bar span{width:74px;color:#8EA3BC;text-transform:capitalize}.bar b{width:44px;text-align:right;font-size:11.5px}
+  .tr{flex:1;height:8px;background:#1E3A5C;border-radius:99px;overflow:hidden}.fl{height:100%;background:linear-gradient(90deg,#C9A254,#DDBE7A);border-radius:99px}
+  .statrow{display:flex;gap:14px;flex-wrap:wrap}
+  .stat{flex:1;min-width:150px;background:#0C2036;border:1px solid #1E3A5C;border-radius:12px;padding:16px;text-align:center}
+  .stat .v{font-size:26px;font-weight:700;color:#EDF2F7}.stat .l{font-size:11.5px;color:#8EA3BC;letter-spacing:.06em;text-transform:uppercase;margin-top:4px}
+  ul.blog{list-style:none;display:flex;flex-direction:column;gap:8px}ul.blog a{color:#DDBE7A;text-decoration:none;font-size:14.5px}
+  .btn{display:inline-block;background:#C9A254;color:#0B1D33;font-weight:700;padding:14px 26px;border-radius:10px;text-decoration:none;margin-top:6px}
+  .foot{text-align:center;color:#5C7794;font-size:12px;margin-top:30px}.foot a{color:#8EA3BC}
+</style></head><body><div class="wrap">
+  <div class="head">${slug ? `<img src="/preview/${slug}/img/logo.png" onerror="this.remove()">` : ''}<div><h1>${biz}</h1></div></div>
+  <p class="sub">Your live project portal · ConversionCo</p>
+  <div class="card"><h2>Where your project stands</h2><div class="steps">
+    ${PORTAL_STAGES.map(([k, label], i) => `<div class="step ${i < doneIdx ? 'done' : i === doneIdx ? 'now' : 'pend'}"><span class="dot">${i < doneIdx ? '✓' : i === doneIdx ? '●' : i + 1}</span>${label}</div>`).join('')}
+  </div>${siteUrl ? `<a class="btn" href="${siteUrl}" target="_blank" style="margin-top:18px">View your website →</a>` : ''}</div>
+  ${score ? `<div class="card"><h2>Your SEO Score</h2><div class="scorebig"><div class="num">${score.total}<small>/100</small></div><div class="bars">${bars}</div></div></div>` : ''}
+  <div class="statrow">
+    <div class="stat"><div class="v">${upPct === null ? '—' : upPct + '%'}</div><div class="l">Uptime${up && up.total ? ` (${up.total} daily checks)` : ' — monitoring active'}</div></div>
+    <div class="stat"><div class="v">${score ? score.pages.total : '—'}</div><div class="l">Pages live</div></div>
+    <div class="stat"><div class="v">${score ? score.pages.blogPosts : '—'}</div><div class="l">Blog posts published</div></div>
+  </div>
+  ${blogs.length ? `<div class="card" style="margin-top:18px"><h2>Recently published for you</h2><ul class="blog">${blogs.map((b) => `<li><a href="/preview/${slug}/${b.path}" target="_blank">→ ${b.path.replace('blog-', '').replace('.html', '').replace(/-/g, ' ')}</a></li>`).join('')}</ul></div>` : ''}
+  <p class="foot">Questions? Reply to any of our emails — a human answers.<br>Website care by <a href="https://conversionco918.com">ConversionCo</a></p>
+</div></body></html>`);
+});
+
+// Pitch page: personalized pre-proposal generated from Intake 1
+app.get('/pitch/:id/:token', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'pitch', id)) return c.text('not found', 404);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.text('not found', 404);
+  let i1 = {}; try { i1 = JSON.parse(client.intake1_data || '{}'); } catch {}
+  const biz = client.business_name || i1['Business Name'] || client.name || 'Your IV Bar';
+  const loc = (i1['Location'] || 'your city').split(',')[0];
+  const { tokens } = vibeToTokens(client.vibe || 'warm luxury elegant');
+  const t = tokens;
+  const settings = await getSettings(db);
+  const drips = [['Hydration', '#5BC8D8'], ['Recovery', '#E8873A'], ['Glow', '#E88BA5']];
+  return c.html(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex"><title>A website for ${biz} — ConversionCo</title>
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;1,400&family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
+<style>
+  *{box-sizing:border-box;margin:0}body{font-family:'Outfit',sans-serif;background:${t['--porcelain']};color:${t['--espresso']};line-height:1.65}
+  .hero{background:${t['--night']};color:${t['--porcelain']};padding:90px 20px 70px;text-align:center}
+  .eyebrow{font-size:11px;letter-spacing:.3em;text-transform:uppercase;color:${t['--gold-soft']}}
+  h1{font-family:'Cormorant Garamond',serif;font-size:clamp(44px,9vw,84px);font-weight:400;margin:16px 0 8px}
+  h1 em{font-style:italic;color:${t['--gold-soft']}}
+  .hero p{color:${t['--taupe']};max-width:46ch;margin:0 auto}
+  .wrap{max-width:860px;margin:0 auto;padding:56px 20px}
+  .drips{display:flex;gap:18px;justify-content:center;flex-wrap:wrap;margin:-40px auto 0;position:relative}
+  .drip{background:${t['--night']};border-radius:14px;padding:26px 20px;width:150px;text-align:center;color:${t['--porcelain']};box-shadow:0 18px 40px rgba(0,0,0,.25)}
+  .bag{width:44px;height:64px;border-radius:10px 10px 14px 14px;margin:0 auto 12px;position:relative}
+  .drip span{font-family:'Cormorant Garamond',serif;font-size:17px}
+  h2{font-family:'Cormorant Garamond',serif;font-size:clamp(28px,5vw,40px);font-weight:400;text-align:center;margin-bottom:10px}
+  .sub{text-align:center;color:${t['--cocoa']};max-width:52ch;margin:0 auto 36px}
+  .pk{display:flex;gap:18px;flex-wrap:wrap;justify-content:center}
+  .p{background:#fff;border:1px solid ${t['--bone']};border-radius:16px;padding:30px;width:300px}
+  .p h3{font-family:'Cormorant Garamond',serif;font-size:24px}.p .pr{font-size:38px;font-weight:600;margin:8px 0}
+  .p ul{padding-left:18px;color:${t['--cocoa']};font-size:14px;margin:12px 0}
+  .p.best{border:2px solid ${t['--gold']};position:relative}
+  .p.best::before{content:"MOST POPULAR";position:absolute;top:-11px;left:50%;transform:translateX(-50%);background:${t['--gold']};color:#fff;font-size:10px;letter-spacing:.15em;padding:4px 12px;border-radius:99px}
+  .cta{text-align:center;background:${t['--night']};color:${t['--porcelain']};padding:60px 20px;margin-top:56px}
+  .btn{display:inline-block;background:${t['--gold']};color:${t['--night']};font-weight:600;padding:16px 34px;border-radius:10px;text-decoration:none;margin-top:14px}
+  .foot{text-align:center;font-size:12px;color:${t['--taupe']};padding:26px}
+</style></head><body>
+  <div class="hero"><span class="eyebrow">Prepared exclusively for</span><h1>${biz.replace(/ IV| Iv/, ' <em>IV</em>')}</h1>
+  <p>A glimpse of the website we'd build for you — luxury design, glowing drip menu, and Google-ready from day one, serving ${loc}.</p></div>
+  <div class="drips">${drips.map(([n, col]) => `<div class="drip"><div class="bag" style="background:radial-gradient(ellipse at 50% 35%, ${col}, ${col}66);box-shadow:0 0 28px ${col}88"></div><span>The ${n}</span></div>`).join('')}</div>
+  <div class="wrap"><h2>Two ways to start</h2><p class="sub">Both include custom luxury design, mobile-first build, booking integration, and full search-engine setup — reviewed with you before anything goes live.</p>
+  <div class="pk">
+    <div class="p"><h3>Standard</h3><div class="pr">$649</div><ul><li>6-page custom website</li><li>Glowing IV drip menu</li><li>Booking built in</li><li>Full SEO foundation</li><li>Monthly performance report</li></ul></div>
+    <div class="p best"><h3>Premium</h3><div class="pr">$999</div><ul><li>Everything in Standard</li><li>A landing page for every drip</li><li>City pages for local Google</li><li>Weekly SEO blog — written for you</li><li>Weekly performance report</li></ul></div>
+  </div>
+  <p class="sub" style="margin-top:26px">+ $49/month hosting &amp; security — daily uptime checks, monitoring, and updates. Starts only when your site is live.</p></div>
+  <div class="cta"><h2 style="color:inherit">Ready when you are, ${(client.name || 'friend').split(' ')[0]}.</h2>
+  <p style="opacity:.75">Grab a time and we'll walk through it together.</p>
+  ${settings.booking_link ? `<a class="btn" href="${settings.booking_link}">Book your call</a>` : ''}</div>
+  <div class="foot">Crafted by ConversionCo · conversionco918.com</div>
+</body></html>`);
+});
+
+// Lead capture from client sites (public, CORS)
+app.options('/lead/:slug', (c) => { corsHeaders(c); return c.body(null, 204); });
+app.post('/lead/:slug', async (c) => {
+  corsHeaders(c);
+  const slug = c.req.param('slug');
+  const db = c.env.DB;
+  let f = {}; try { f = await c.req.json(); } catch { try { f = Object.fromEntries(Object.entries(await c.req.parseBody()).map(([k, v]) => [k, String(v)])); } catch {} }
+  const meta = await db.prepare(`SELECT content FROM site_files WHERE slug=? AND path='site-meta.json'`).bind(slug).first();
+  let clientId = null; try { clientId = JSON.parse(meta?.content || '{}').client_id ?? null; } catch {}
+  await db.prepare(`INSERT INTO leads (client_id, slug, name, email, phone, message) VALUES (?, ?, ?, ?, ?, ?)`)
+    .bind(clientId, slug, String(f.name || '').slice(0, 120), String(f.email || '').slice(0, 160), String(f.phone || '').slice(0, 40), String(f.message || '').slice(0, 1500)).run();
+  await logEvent(db, clientId, 'lead_received', `🔥 New lead on ${slug}: ${f.name || 'no name'} ${f.phone || f.email || ''}`);
+  const settings = await getSettings(db);
+  if (settings.notify_email && c.env.GHL_TOKEN && settings.ghl_location_id) {
+    try {
+      const ghl = ghlFor(c.env, settings);
+      const contact = await ghl.upsertContact({ email: settings.notify_email, name: 'ConversionCo Notifications' });
+      await ghl.sendEmail({ contactId: contact.id || contact.contactId,
+        subject: `🔥 New lead for ${slug}: ${f.name || 'someone'}`,
+        html: `<p><b>${f.name || ''}</b> · ${f.phone || ''} · ${f.email || ''}</p><p>${String(f.message || '').slice(0, 600)}</p><p>Site: ${slug}</p>`,
+        emailFrom: settings.email_from || undefined });
+    } catch {}
+  }
+  return c.json({ ok: true });
+});
+
+// Public portfolio feed (for the ConversionCo showcase page)
+app.get('/portfolio.json', async (c) => {
+  const db = c.env.DB;
+  const clients = (await db.prepare(`SELECT * FROM clients WHERE stage IN ('preview_ready','live')`).all()).results || [];
+  const settings = await getSettings(db);
+  const out = [];
+  for (const cl of clients) {
+    const score = await computeScore(db, cl, settings).catch(() => null);
+    let up = null; try { up = JSON.parse(settings[`uptime_${cl.id}`] || 'null'); } catch {}
+    out.push({ business: cl.business_name || cl.name, url: cl.live_url || cl.preview_url,
+      tier: cl.tier || 'standard', score: score?.total ?? null, pages: score?.pages?.total ?? null,
+      uptimePct: up && up.total ? Math.round(100 * (up.total - (up.fails || 0)) / up.total) : null });
+  }
+  c.header('Access-Control-Allow-Origin', '*');
+  return c.json({ sites: out });
+});
+
 // Everything below requires a session
 app.use('*', async (c, next) => {
   if (await checkSession(c.env, c.req.header('Cookie'))) return next();
@@ -689,6 +871,19 @@ app.get('/api/clients/:id/score', async (c) => {
   const settings = await getSettings(db);
   const score = await computeScore(db, client, settings);
   return c.json(score || { error: 'no site yet' });
+});
+
+app.get('/api/clients/:id/leads', async (c) => {
+  const id = Number(c.req.param('id'));
+  const rows = (await c.env.DB.prepare('SELECT * FROM leads WHERE client_id = ? ORDER BY id DESC LIMIT 12').bind(id).all()).results || [];
+  return c.json({ leads: rows });
+});
+app.get('/api/clients/:id/links', async (c) => {
+  const id = Number(c.req.param('id'));
+  return c.json({
+    portal: `${BASE_URL}/portal/${id}/${await portalToken(c.env, 'portal', id)}`,
+    pitch: `${BASE_URL}/pitch/${id}/${await portalToken(c.env, 'pitch', id)}`,
+  });
 });
 
 app.post('/api/billing/poll', async (c) => {
