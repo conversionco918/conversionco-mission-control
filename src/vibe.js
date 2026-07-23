@@ -15,7 +15,7 @@ function hsl(h, s, l) {
 const HUE_WORDS = [
   [/ocean|beach|coast|sea|wave|nautical/i, 205], [/navy/i, 216], [/sky/i, 208], [/blue/i, 212],
   [/forest|botanical|nature|jungle/i, 138], [/sage/i, 128], [/olive/i, 82], [/mint/i, 160],
-  [/teal/i, 180], [/aqua|turquoise/i, 175], [/lavender|lilac|violet|purple/i, 268],
+  [/spa|zen|tranquil|serene/i, 166], [/teal/i, 180], [/aqua|turquoise/i, 175], [/lavender|lilac|violet|purple/i, 268],
   [/romantic|rose|blush|pink/i, 347], [/berry|plum/i, 328], [/wine|burgundy|maroon/i, 352],
   [/sunset|amber|orange/i, 26], [/terracotta|clay|desert|southwest/i, 18], [/peach|coral/i, 22],
   [/sand|beige|cream|ivory|neutral/i, 40], [/charcoal|slate|gr[ae]y|stone/i, 220],
