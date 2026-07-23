@@ -5,265 +5,184 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="robots" content="noindex">
 <title>Website Vision — ConversionCo</title>
-<style>html,body{margin:0;padding:0;background:#0C1A30;-webkit-text-size-adjust:100%}</style>
+<style>html,body{margin:0;padding:0;background:#0C1A30;-webkit-text-size-adjust:100%}
+*{box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}
+button{cursor:pointer;font-family:inherit}</style>
 </head>
 <body>
-<!-- ============================================================
-     CONVERSION CO — WEBSITE DESIGN INTAKE (PART 2)
-     Focuses on website/design details only. No business-basics
-     (those come from the first intake form).
-     Paste into a GoHighLevel Custom HTML / Code element.
-     Submissions go to the ConversionCo Mission Control dashboard
-     (which also forwards a copy to Web3Forms for email notification).
-============================================================ -->
-<div class="cc-intake-wrap">
-  <style>
-    @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&family=Cormorant+Garamond:wght@500;600&display=swap');
-    .cc-intake-wrap *{box-sizing:border-box;margin:0;padding:0}
-    .cc-intake-wrap{
-      --navy:#12233f;
-      --navy-soft:#1c3357;
-      --gold:#b08d46;
-      --cream:#f6f3ec;
-      --ink:#1a2436;
-      --muted:#6b7688;
-      --line:#e4ddd0;
-      --white:#ffffff;
-      font-family:'Poppins','Helvetica Neue',Arial,sans-serif;
-      background:var(--cream);
-      color:var(--ink);
-      max-width:640px;margin:0 auto;padding:0;border-radius:18px;overflow:hidden;
-      box-shadow:0 20px 60px rgba(18,35,63,.12);
-    }
-    .cc-head{background:linear-gradient(135deg,var(--navy) 0%,var(--navy-soft) 100%);color:var(--white);padding:38px 34px 32px;position:relative}
-    .cc-eyebrow{font-size:11px;letter-spacing:.22em;text-transform:uppercase;color:var(--gold);font-weight:600;margin-bottom:14px}
-    .cc-title{font-family:'Cormorant Garamond',Georgia,serif;font-size:34px;line-height:1.1;font-weight:600;letter-spacing:.5px;margin-bottom:12px}
-    .cc-sub{font-size:14px;line-height:1.6;color:rgba(255,255,255,.78);font-weight:300;max-width:92%}
-    .cc-note-banner{margin-top:18px;background:rgba(176,141,70,.16);border:1px solid rgba(176,141,70,.4);border-radius:10px;padding:12px 15px;font-size:12.5px;line-height:1.55;color:#f3ead6;font-weight:300}
-    .cc-body{padding:32px 34px 38px}
-    .cc-section{margin-bottom:30px}
-    .cc-sec-label{display:flex;align-items:center;gap:10px;font-size:12px;letter-spacing:.14em;text-transform:uppercase;font-weight:600;color:var(--navy);margin-bottom:16px}
-    .cc-sec-num{width:24px;height:24px;border-radius:50%;background:var(--navy);color:var(--white);font-size:11px;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-weight:600}
-    .cc-field{margin-bottom:18px}
-    .cc-label{display:block;font-size:13px;font-weight:500;color:var(--ink);margin-bottom:7px}
-    .cc-req{color:var(--gold)}
-    .cc-hint{font-size:12px;color:var(--muted);margin-top:4px;line-height:1.5}
-    .cc-input,.cc-textarea,.cc-select{width:100%;background:var(--white);border:1.5px solid var(--line);border-radius:10px;padding:12px 14px;font-size:14px;font-family:inherit;color:var(--ink);outline:none;transition:border-color .15s,box-shadow .15s}
-    .cc-input:focus,.cc-textarea:focus,.cc-select:focus{border-color:var(--navy);box-shadow:0 0 0 3px rgba(18,35,63,.08)}
-    .cc-input::placeholder,.cc-textarea::placeholder{color:#aeb5c0}
-    .cc-textarea{resize:vertical;min-height:96px;line-height:1.6}
-    .cc-select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath fill='%2312233f' d='M6 8L0 0h12z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 16px center;padding-right:38px}
-    /* email inspo note */
-    .cc-inspo-note{display:flex;gap:13px;align-items:flex-start;border:1.5px solid var(--gold);border-radius:12px;background:rgba(176,141,70,.06);padding:16px 16px}
-    .cc-inspo-note svg{width:26px;height:26px;stroke:var(--gold);flex-shrink:0;margin-top:2px}
-    .cc-inspo-title{font-size:14px;font-weight:600;color:var(--navy);margin-bottom:4px}
-    .cc-inspo-sub{font-size:12.5px;color:var(--muted);line-height:1.55}
-    .cc-inspo-sub a{color:var(--navy);font-weight:600;text-decoration:none}
-    .cc-inspo-sub a:hover{text-decoration:underline}
-    .cc-submit{width:100%;background:var(--navy);color:var(--white);border:none;border-radius:12px;padding:16px;font-size:15px;font-weight:600;font-family:inherit;letter-spacing:.02em;cursor:pointer;transition:background .18s,transform .1s;margin-top:8px}
-    .cc-submit:hover{background:#0d1b30}
-    .cc-submit:active{transform:translateY(1px)}
-    .cc-submit:disabled{opacity:.55;cursor:not-allowed}
-    .cc-foot{text-align:center;font-size:12px;color:var(--muted);margin-top:18px;line-height:1.6}
-    .cc-success{display:none;text-align:center;padding:20px 10px}
-    .cc-success.show{display:block}
-    .cc-check{width:60px;height:60px;border-radius:50%;background:var(--navy);margin:0 auto 18px;display:flex;align-items:center;justify-content:center}
-    .cc-check svg{width:28px;height:28px;stroke:var(--gold)}
-    .cc-success h3{font-family:'Cormorant Garamond',serif;font-size:26px;color:var(--navy);margin-bottom:10px;font-weight:600}
-    .cc-success p{font-size:14px;color:var(--muted);line-height:1.6;max-width:80%;margin:0 auto}
-    @media(max-width:480px){
-      .cc-head{padding:30px 22px 26px}
-      .cc-title{font-size:28px}.cc-body{padding:26px 22px 30px}
-    }
-  </style>
-  <div class="cc-head">
-    <div class="cc-eyebrow">Website Design Details</div>
-    <h1 class="cc-title">Your Website Vision</h1>
-    <p class="cc-sub">A few design details to bring your site to life. You've already shared your business info — this is all about the look, feel, and menu.</p>
-    <div class="cc-note-banner">Don't have everything yet? Fill in what you can and we'll gather the rest as we go — though the sooner you get it to us, the sooner your site comes to life.</div>
-  </div>
-  <div class="cc-body">
-    <form id="ccIntakeForm">
-      <input type="hidden" name="access_key" value="65074046-434e-456a-bb54-f6ae869a0883">
-      <input type="hidden" name="subject" value="Website Design Details — IV Therapy Client">
-      <input type="hidden" name="from_name" value="Conversion Co Design Intake">
-      <input type="checkbox" name="botcheck" style="display:none" tabindex="-1" autocomplete="off">
-      <!-- SECTION 1: CONTACT PREFERENCE -->
-      <div class="cc-section">
-        <div class="cc-sec-label"><span class="cc-sec-num">1</span> How Clients Reach You</div>
-        <div class="cc-field">
-          <label class="cc-label">Your email <span class="cc-req">*</span></label>
-          <input class="cc-input" type="email" name="email" id="ccEmailField" required placeholder="you@yourpractice.com">
-          <p class="cc-hint">The email you've been using with us — so we can match these details to your project.</p>
-        </div>
-        <div class="cc-field">
-          <label class="cc-label">Best number for clients to reach you <span class="cc-req">*</span></label>
-          <input class="cc-input" type="tel" name="Contact Number" required placeholder="(918) 555-0100">
-        </div>
-        <div class="cc-field">
-          <label class="cc-label">Should clients primarily call or text you? <span class="cc-req">*</span></label>
-          <select class="cc-select" name="Call or Text Preference" required>
-            <option value="" disabled selected>Choose one...</option>
-            <option value="Call">Call</option>
-            <option value="Text">Text</option>
-            <option value="Either is fine">Either is fine</option>
-          </select>
+<div id="cco-form-root"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script type="text/babel" data-presets="react">
+// Shared multi-step engine (injected into both forms)
+const { useState } = React;
+function Engine({ title, subtitle, steps, submitUrl, extra, accent }) {
+  const [i, setI] = useState(0);
+  const [a, setA] = useState(() => {
+    const init = {};
+    const p = new URLSearchParams(window.location.search);
+    if (p.get('e')) init['Email'] = p.get('e');
+    return init;
+  });
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState(false);
+  const [err, setErr] = useState('');
+  const s = steps[i];
+  const set = (k, v) => setA((o) => ({ ...o, [k]: v }));
+  const valid = () => !s.fields.some((f) => f.req && !(a[f.k] && String(a[f.k]).trim()));
+  const next = async () => {
+    if (!valid()) { setErr('Please fill in the required field(s).'); return; }
+    setErr('');
+    if (i < steps.length - 1) { setI(i + 1); window.scrollTo(0, 0); return; }
+    setBusy(true);
+    try {
+      const payload = { ...extra, ...a };
+      await fetch(submitUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+      setDone(true);
+    } catch (e) { setErr('Something went wrong — please try again.'); }
+    setBusy(false);
+  };
+  const F = {
+    text: (f) => <input key={f.k} style={ST.in} placeholder={f.ph || ''} value={a[f.k] || ''} onChange={(e) => set(f.k, e.target.value)} inputMode={f.mode} />,
+    area: (f) => <textarea key={f.k} style={{ ...ST.in, minHeight: 96, resize: 'vertical' }} placeholder={f.ph || ''} value={a[f.k] || ''} onChange={(e) => set(f.k, e.target.value)} />,
+    select: (f) => (
+      <div key={f.k} style={ST.optWrap}>{f.opts.map((o) => (
+        <button key={o} style={{ ...ST.opt, ...(a[f.k] === o ? ST.optOn : {}) }} onClick={() => set(f.k, o)}>{o}</button>))}
+      </div>),
+    chips: (f) => (
+      <div key={f.k} style={ST.optWrap}>{f.opts.map((o) => {
+        const cur = (a[f.k] || '').split(' | ').filter(Boolean);
+        const on = cur.includes(o);
+        return <button key={o} style={{ ...ST.chip, ...(on ? ST.optOn : {}) }} onClick={() => set(f.k, (on ? cur.filter((x) => x !== o) : [...cur, o]).join(' | '))}>{on ? '✓ ' : ''}{o}</button>;
+      })}</div>),
+    rows: (f) => {
+      let rows = [];
+      try { rows = JSON.parse(a[f.k + ' JSON'] || '[]'); } catch {}
+      if (!rows.length) rows = [{}];
+      const save = (r) => {
+        set(f.k + ' JSON', JSON.stringify(r));
+        set(f.k, r.filter((x) => x[f.cols[0].k]).map((x) => f.cols.map((c) => (c.pre || '') + (x[c.k] || '')).filter((v) => v && v !== '$').join(' — ')).join('\n'));
+      };
+      return (
+        <div key={f.k}>
+          {rows.map((r, ri) => (
+            <div key={ri} style={{ display: 'flex', gap: 8, marginBottom: 8, flexWrap: 'wrap' }}>
+              {f.cols.map((c) => (
+                <input key={c.k} style={{ ...ST.in, flex: c.flex || 1, minWidth: c.w || 90, marginBottom: 0 }} placeholder={c.ph}
+                  value={r[c.k] || ''} inputMode={c.mode}
+                  onChange={(e) => { const n = rows.map((x, xi) => xi === ri ? { ...x, [c.k]: e.target.value } : x); save(n); }} />))}
+              {rows.length > 1 && <button style={ST.x} onClick={() => save(rows.filter((_, xi) => xi !== ri))}>✕</button>}
+            </div>))}
+          {rows.length < (f.max || 10) && <button style={ST.add} onClick={() => save([...rows, {}])}>+ {f.addLabel || 'Add another'}</button>}
+        </div>);
+    },
+  };
+  if (done) return (
+    <div style={ST.page}><div style={{ ...ST.card, textAlign: 'center' }}>
+      <div style={{ fontSize: 46 }}>🎉</div>
+      <h2 style={{ margin: '10px 0 8px', color: ST.navy }}>Got it — thank you!</h2>
+      <p style={{ color: '#556', fontSize: 15 }}>{title === 'Business Growth Blueprint' ? "We've received your blueprint. Watch your inbox — your next step is picking a time to talk." : "Your vision is locked in. We're on it — you'll get a preview link soon."}</p>
+    </div></div>);
+  return (
+    <div style={ST.page}>
+      <div style={{ textAlign: 'center', padding: '34px 16px 10px' }}>
+        <div style={{ color: accent, fontSize: 11, letterSpacing: '.25em', fontWeight: 700 }}>CONVERSION CO</div>
+        <h1 style={{ color: '#fff', fontSize: 26, margin: '8px 0 4px' }}>{title}</h1>
+        <p style={{ color: 'rgba(255,255,255,.65)', fontSize: 13.5 }}>{subtitle}</p>
+      </div>
+      <div style={{ maxWidth: 620, margin: '0 auto', padding: '0 16px 8px', display: 'flex', justifyContent: 'space-between', color: 'rgba(255,255,255,.7)', fontSize: 12.5 }}>
+        <span>Step {i + 1} of {steps.length}</span><span>{Math.round(100 * (i + 1) / steps.length)}% complete</span>
+      </div>
+      <div style={{ maxWidth: 620, margin: '0 auto 14px', padding: '0 16px' }}>
+        <div style={{ height: 5, background: 'rgba(255,255,255,.15)', borderRadius: 99 }}><div style={{ height: 5, width: `${Math.round(100 * (i + 1) / steps.length)}%`, background: accent, borderRadius: 99, transition: 'width .3s' }} /></div>
+      </div>
+      <div style={ST.card}>
+        <div style={{ color: accent, fontSize: 11, letterSpacing: '.18em', fontWeight: 700, marginBottom: 6 }}>QUESTION {i + 1} OF {steps.length}</div>
+        <h2 style={{ color: ST.navy, fontSize: 21, marginBottom: 6 }}>{s.q}</h2>
+        {s.hint && <p style={{ color: '#667', fontSize: 13.5, marginBottom: 14 }}>{s.hint}</p>}
+        {s.fields.map((f) => (
+          <div key={f.k} style={{ marginBottom: 14 }}>
+            {f.label && <label style={{ display: 'block', fontSize: 11.5, fontWeight: 700, letterSpacing: '.08em', color: '#445', marginBottom: 6 }}>{f.label.toUpperCase()}{f.req ? ' *' : ''}</label>}
+            {F[f.t || 'text'](f)}
+          </div>))}
+        {err && <p style={{ color: '#C0392B', fontSize: 13.5, marginBottom: 10 }}>{err}</p>}
+        <div style={{ display: 'flex', gap: 10 }}>
+          {i > 0 && <button style={ST.back} onClick={() => { setErr(''); setI(i - 1); window.scrollTo(0, 0); }}>← Back</button>}
+          <button style={{ ...ST.go, background: accent, opacity: busy ? .6 : 1 }} disabled={busy} onClick={next}>{busy ? 'Sending…' : i === steps.length - 1 ? 'Submit ✓' : 'Continue →'}</button>
         </div>
       </div>
-      <!-- SECTION 2: IV MENU -->
-      <div class="cc-section">
-        <div class="cc-sec-label"><span class="cc-sec-num">2</span> Your IV Menu</div>
-        <div class="cc-field">
-          <label class="cc-label">Names of your IV drips <span class="cc-req">*</span></label>
-          <textarea class="cc-textarea" name="IV Drip Names" required placeholder="One drip per line — e.g.&#10;Hydration&#10;Hangover Recovery&#10;Immunity Boost&#10;Energy"></textarea>
-          <p class="cc-hint">Just the names for now — one per line.</p>
-        </div>
-        <div class="cc-field">
-          <label class="cc-label">Pricing for your IVs</label>
-          <textarea class="cc-textarea" name="IV Pricing" placeholder="Add a price next to each drip if you'd like — e.g.&#10;Hydration — $150&#10;Hangover Recovery — $199"></textarea>
-        </div>
-      </div>
-      <!-- SECTION 3: LOOK & FEEL -->
-      <div class="cc-section">
-        <div class="cc-sec-label"><span class="cc-sec-num">3</span> Look & Feel</div>
-        <div class="cc-field">
-          <label class="cc-label">Which best describes the vibe you want?</label>
-          <select class="cc-select" name="Theme">
-            <option value="Med-spa luxury — soft neutrals, elegant, high-end wellness clinic feel">Med-spa luxury — soft, elegant, high-end</option>
-            <option value="Clean & clinical — crisp white, blues, professional and trustworthy">Clean & clinical — crisp, professional, trustworthy</option>
-            <option value="Warm & personal — earthy tones, welcoming, boutique small-business feel">Warm & personal — earthy, welcoming, boutique</option>
-            <option value="Bold & energetic — vibrant, modern, athletic recovery vibe">Bold & energetic — vibrant, athletic recovery</option>
-            <option value="Calm & spa-like — muted greens/beiges, relaxing and natural">Calm & spa-like — muted, relaxing, natural</option>
-            <option value="Not sure — I'd like a recommendation">Not sure — I'd like a recommendation</option>
-          </select>
-        </div>
-        <!-- EMAIL YOUR INSPO NOTE -->
-        <div class="cc-field">
-          <label class="cc-label">Have a picture of the look you're picturing?</label>
-          <div class="cc-inspo-note">
-            <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
-            <div>
-              <div class="cc-inspo-title">Email your inspo pic to us</div>
-              <div class="cc-inspo-sub">After you submit, email any screenshots, inspo pics, or a look you love to <a href="mailto:conversionco918@gmail.com">conversionco918@gmail.com</a> — even a rough idea helps us match your taste.</div>
-            </div>
-          </div>
-        </div>
-      </div>
-      <!-- SECTION 4: BOOKING -->
-      <div class="cc-section">
-        <div class="cc-sec-label"><span class="cc-sec-num">4</span> Booking & Scheduling</div>
-        <div class="cc-field">
-          <label class="cc-label">What do you use to book clients / manage records?</label>
-          <select class="cc-select" name="Booking or EMR System">
-            <option value="" disabled selected>Choose one...</option>
-            <option value="Pabau">Pabau</option>
-            <option value="IntakeQ / Practice Better">IntakeQ / Practice Better</option>
-            <option value="Acuity Scheduling">Acuity Scheduling</option>
-            <option value="Calendly">Calendly</option>
-            <option value="Square Appointments">Square Appointments</option>
-            <option value="Jane">Jane</option>
-            <option value="GoHighLevel calendar">GoHighLevel calendar</option>
-            <option value="Just phone / text for now">Just phone / text for now</option>
-            <option value="Something else (note below)">Something else (note below)</option>
-            <option value="Not sure yet">Not sure yet</option>
-          </select>
-          <p class="cc-hint">If your system has a booking link or embed, we can connect it directly to your site.</p>
-        </div>
-        <div class="cc-field">
-          <label class="cc-label">Your booking page link (if you have one)</label>
-          <input class="cc-input" type="url" name="Booking Link" placeholder="https://...">
-          <p class="cc-hint">No link yet? No problem — your site will use text-to-book until you're ready.</p>
-        </div>
-      </div>
-      <!-- SECTION: MEMBERSHIPS -->
-      <div class="cc-section">
-        <div class="cc-sec-label"><span class="cc-sec-num">5</span> Memberships</div>
-        <div class="cc-field">
-          <label class="cc-label">Do you offer memberships or packages?</label>
-          <textarea class="cc-textarea" name="Memberships" placeholder="Name, price, and what's included — one per line. e.g.&#10;The Monthly Reset — $99/mo — one drip per month + 10% off extras&#10;VIP — $179/mo — two drips + priority booking"></textarea>
-          <p class="cc-hint">Leave blank if you don't offer them yet — we can add a memberships page later.</p>
-        </div>
-      </div>
-      <!-- SECTION: YOUR STORY -->
-      <div class="cc-section">
-        <div class="cc-sec-label"><span class="cc-sec-num">6</span> Your Story</div>
-        <div class="cc-field">
-          <label class="cc-label">Tell us your story in 2–3 sentences <span class="cc-req">*</span></label>
-          <textarea class="cc-textarea" name="Your Story" required placeholder="Why did you start this business? What do you love about caring for people? Write it like you'd say it — we'll polish it for your About page."></textarea>
-        </div>
-        <div class="cc-field">
-          <label class="cc-label">Years of nursing experience <span class="cc-req">*</span></label>
-          <input class="cc-input" type="text" name="Years of Experience" required placeholder="e.g. 8 years — ER and ICU">
-        </div>
-        <div class="cc-field">
-          <label class="cc-label">Your photo for the About page</label>
-          <div class="cc-inspo-note">
-            <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
-            <div>
-              <div class="cc-inspo-title">Email us a photo in your scrubs</div>
-              <div class="cc-inspo-sub">After you submit, email a clear photo of yourself in your scrubs (a phone photo in good light works great) to <a href="mailto:conversionco918@gmail.com">conversionco918@gmail.com</a> — it makes your About page instantly more trustworthy.</div>
-            </div>
-          </div>
-        </div>
-      </div>
-      <!-- SECTION 4: REVIEWS + NOTES -->
-      <div class="cc-section">
-        <div class="cc-sec-label"><span class="cc-sec-num">7</span> Reviews & Notes</div>
-        <div class="cc-field">
-          <label class="cc-label">Client reviews or testimonials</label>
-          <textarea class="cc-textarea" name="Reviews" placeholder='Paste any reviews — with the client&apos;s first name if possible. e.g.&#10;"Showed up on time and I felt amazing after!" — Sarah M.'></textarea>
-          <p class="cc-hint">No worries if you don't have these yet — we can add them later.</p>
-        </div>
-        <div class="cc-field">
-          <label class="cc-label">Anything else we should know?</label>
-          <textarea class="cc-textarea" name="Additional Notes" placeholder="Special requests, must-haves, or anything on your mind."></textarea>
-        </div>
-      </div>
-      <button type="submit" class="cc-submit" id="ccSubmitBtn">Send My Details</button>
-      <p class="cc-foot">Your details go straight to our team. We'll be in touch soon.</p>
-    </form>
-    <div class="cc-success" id="ccSuccess">
-      <div class="cc-check">
-        <svg viewBox="0 0 24 24" fill="none" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
-      </div>
-      <h3>Got it — thank you!</h3>
-      <p>Your details are on their way. We'll reach out shortly to start building your site.</p>
-    </div>
-  </div>
-  <script>
-    (function(){
-      var form=document.getElementById('ccIntakeForm');
-      var btn=document.getElementById('ccSubmitBtn');
-      var success=document.getElementById('ccSuccess');
-      // Pre-fill the client's email from the personalized link (?e=their@email.com)
-      try{
-        var pre=new URLSearchParams(window.location.search).get('e');
-        if(pre){ document.getElementById('ccEmailField').value=pre; }
-      }catch(_e){}
-      form.addEventListener('submit',function(e){
-        e.preventDefault();
-        btn.disabled=true;btn.textContent='Sending...';
-        var data=new FormData(form);
-        fetch('https://conversionco-mission-control.conversionco918.workers.dev/intake/2',{method:'POST',body:data})
-        .then(function(r){return r.json()})
-        .then(function(res){
-          if(res.success){
-            form.style.display='none';
-            success.classList.add('show');
-            success.scrollIntoView({behavior:'smooth',block:'center'});
-          }else{
-            btn.disabled=false;btn.textContent='Send My Details';
-            alert('Something went wrong sending your details. Please try again.');
-          }
-        })
-        .catch(function(){
-          btn.disabled=false;btn.textContent='Send My Details';
-          alert('Something went wrong sending your details. Please try again.');
-        });
-      });
-    })();
-  </script>
-</div>
+      <p style={{ textAlign: 'center', color: 'rgba(255,255,255,.45)', fontSize: 12, padding: '14px 0 40px' }}>Your information is kept private and secure.</p>
+    </div>);
+}
+const ST = {
+  navy: '#0C1A30',
+  page: { minHeight: '100vh', background: 'linear-gradient(170deg,#0C1A30,#0F2847)' },
+  card: { maxWidth: 620, margin: '0 auto', background: '#fff', borderRadius: 16, padding: '26px 22px', boxShadow: '0 20px 60px rgba(0,0,0,.35)' },
+  in: { width: '100%', padding: '13px 14px', border: '1.5px solid #D6DCE5', borderRadius: 10, fontSize: 16, marginBottom: 2, fontFamily: 'inherit', background: '#FAFBFC' },
+  optWrap: { display: 'flex', flexDirection: 'column', gap: 8 },
+  opt: { padding: '13px 14px', border: '1.5px solid #D6DCE5', borderRadius: 10, background: '#fff', fontSize: 15, textAlign: 'left' },
+  chip: { padding: '11px 14px', border: '1.5px solid #D6DCE5', borderRadius: 99, background: '#fff', fontSize: 14, textAlign: 'left' },
+  optOn: { borderColor: '#0D9488', background: '#F0FDFA', fontWeight: 600 },
+  add: { padding: '10px 14px', border: '1.5px dashed #0D9488', borderRadius: 10, background: '#F0FDFA', color: '#0B7A6F', fontSize: 14, fontWeight: 600 },
+  x: { border: 0, background: '#FEE', color: '#C0392B', borderRadius: 8, width: 38, fontSize: 15 },
+  back: { flex: '0 0 auto', padding: '14px 18px', border: '1.5px solid #D6DCE5', borderRadius: 10, background: '#fff', fontSize: 15 },
+  go: { flex: 1, padding: '14px 18px', border: 0, borderRadius: 10, color: '#fff', fontSize: 16, fontWeight: 700 },
+};
 
+const STEPS2 = [
+  { q: "First, confirm your contact info.", fields: [
+    { k: 'Email', label: 'Email', req: 1, mode: 'email', ph: 'you@example.com' },
+    { k: 'Contact Number', label: 'Best number', req: 1, mode: 'tel', ph: '(918) 555-0100' },
+    { k: 'Call or Text Preference', t: 'select', req: 1, opts: ['Text me', 'Call me', 'Either is fine'] }] },
+  { q: "Build your drip menu.", hint: "One row per drip — name, price, and a few words on what it's for. This becomes your glowing menu, exactly as you write it.",
+    fields: [{ k: 'IV Menu', t: 'rows', req: 1, addLabel: 'Add another drip', max: 10, cols: [
+      { k: 'name', ph: 'Drip name (e.g. The Hydration)', flex: 2, w: 150 },
+      { k: 'price', ph: 'Price', pre: '$', w: 70, mode: 'numeric' },
+      { k: 'notes', ph: "What's in it / who it's for (optional)", flex: 3, w: 170 }] }] },
+  { q: "Any add-ons or boosters?", hint: "Extra shots, vitamins, upgrades — optional.",
+    fields: [{ k: 'Add-Ons', t: 'rows', addLabel: 'Add an add-on', max: 8, cols: [
+      { k: 'name', ph: 'Add-on (e.g. Extra B12)', flex: 2, w: 150 },
+      { k: 'price', ph: 'Price', pre: '$', w: 70, mode: 'numeric' }] }] },
+  { q: "Which drip is your signature?", hint: "We'll spotlight it as your most-popular.",
+    fields: [{ k: 'Signature Drip', ph: 'e.g. The Gold Standard' }] },
+  { q: "Do you offer a membership?", fields: [
+    { k: 'Membership', t: 'select', req: 1, opts: ['Yes', 'Not yet — maybe later', 'No'] },
+    { k: 'Membership Details', label: 'If yes: name, monthly price, what is included', ph: 'e.g. The Glow Club — $199/mo — one drip per month + 10% off add-ons' }] },
+  { q: "What feeling should your website give?", hint: "Pick every word that fits, then add your own.",
+    fields: [
+    { k: 'Vibe Words', t: 'chips', req: 1, opts: ['Warm & luxurious', 'Clean & clinical', 'Beachy & coastal', 'Moody & dramatic', 'Soft & feminine', 'Bold & energetic', 'Earthy & natural', 'Modern & minimal'] },
+    { k: 'Vibe In Your Words', label: 'Describe it your way', ph: 'e.g. like a high-end spa that texts you back fast' }] },
+  { q: "Brand colors?", fields: [
+    { k: 'Brand Colors', label: 'Colors we MUST use', ph: 'e.g. teal + gold, or hex codes if you have them' },
+    { k: 'Colors To Avoid', label: 'Colors you hate', ph: 'e.g. no pink, no neon' }] },
+  { q: "How should clients book?", fields: [
+    { k: 'Booking Method', t: 'select', req: 1, opts: ['Text me to book', 'Call me to book', 'Online booking (I have a system)'] },
+    { k: 'Booking Link', label: 'Booking link (if you have one)', ph: 'paste it here' }] },
+  { q: "Tell us your story.", hint: "2–4 sentences, like you're telling a friend why you started. This becomes your About page — real beats polished.",
+    fields: [
+    { k: 'Your Story', t: 'area', req: 1, ph: 'e.g. After 10 years in the ER, I kept seeing people who just needed hydration and care without the hospital chaos. So I brought it to their couch…' },
+    { k: 'Years of Experience & Credentials', label: 'Years + credentials', req: 1, ph: 'e.g. 10 years — RN, BSN' }] },
+  { q: "Real reviews from real clients?", hint: "Paste up to 3 — even texts from happy clients count. Real quotes beat anything we could write.",
+    fields: [
+    { k: 'Review 1', ph: '“…” — first name' },
+    { k: 'Review 2', ph: '“…” — first name' },
+    { k: 'Review 3', ph: '“…” — first name' }] },
+  { q: "Your socials?", fields: [
+    { k: 'Instagram', ph: '@handle or link' },
+    { k: 'TikTok', ph: '@handle or link' },
+    { k: 'Facebook', ph: 'page link' }] },
+  { q: "Photos make the site feel like YOU.", hint: "Email 3–6 photos to conversionco918@gmail.com — you in scrubs, your setup, your city. Phone photos are perfect.",
+    fields: [{ k: 'Photos', t: 'select', req: 1, opts: ["I'll email photos right after this", 'I already sent them', 'Use beautiful stock photos for now'] }] },
+  { q: "Last one: anything we should NOT do?", fields: [
+    { k: 'Do Not Include', t: 'area', ph: 'Anything you don\\'t want on the site — words, colors, claims, photos of you, etc.' },
+    { k: 'Additional Notes', t: 'area', ph: 'Anything else on your mind?' }] },
+];
+ReactDOM.createRoot(document.getElementById('cco-form-root')).render(
+  <Engine title="Website Vision" subtitle="Everything we need to build your website exactly how you imagine it"
+    steps={STEPS2} accent="#C9A254" submitUrl="https://conversionco-mission-control.conversionco918.workers.dev/intake/2"
+    extra={{ access_key: '65074046-434e-456a-bb54-f6ae869a0883', subject: 'Website Design Details — IV Therapy Client', from_name: 'ConversionCo Design Intake' }} />);
+
+</script>
 </body>
 </html>
