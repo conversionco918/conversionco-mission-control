@@ -536,6 +536,34 @@ app.get('/api/set-from/:key', async (c) => {
   return c.json({ ok: true, email_from: value });
 });
 
+// Keyed: trace what GHL/Mailgun actually did with emails to an address (delivery status)
+app.get('/api/email-status/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const email = String(c.req.query('email') || '').trim();
+  if (!email) return c.json({ ok: false, error: '?email= required' });
+  const settings = await getSettings(c.env.DB);
+  const ghl = new GHL(c.env.GHL_TOKEN, settings.ghl_location_id);
+  try {
+    const contact = await ghl.upsertContact({ email });
+    const contactId = contact.id || contact.contactId;
+    const conv = await ghl.req('GET', '/conversations/search', { query: { locationId: settings.ghl_location_id, contactId, limit: 5 } });
+    const convs = conv.conversations || [];
+    const out = [];
+    for (const cv of convs) {
+      try {
+        const msgs = await ghl.req('GET', `/conversations/${cv.id}/messages`, { query: { limit: 20 } });
+        const list = msgs.messages?.messages || msgs.messages || [];
+        for (const m of list) {
+          if (String(m.messageType || m.type || '').toLowerCase().includes('email') || m.type === 3) {
+            out.push({ dateAdded: m.dateAdded, status: m.status, source: m.source, direction: m.direction, meta: m.meta?.email || undefined, id: m.id });
+          }
+        }
+      } catch (e) { out.push({ convError: String(e.message).slice(0, 200) }); }
+    }
+    return c.json({ ok: true, email, contactId, conversations: convs.length, emails: out });
+  } catch (e) { return c.json({ ok: false, error: String(e.message || e).slice(0, 300) }); }
+});
+
 // Keyed: fire the weekly owner digest on demand (testing / catch-up)
 app.get('/api/digest-now/:key', async (c) => {
   if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
