@@ -299,7 +299,8 @@ function openDrawer(id) {
           } else {
             host = `<p style="font-size:11px;color:#94a3b8;margin-top:8px;">$49/mo hosting starts at the end — the button appears when the site is ready.</p>`;
           }
-          return `<div>${inv}</div>${host}`;
+          const bypass = `<p style="margin-top:10px;font-size:11px;color:#94a3b8;">Paid outside Stripe? ${b.invoice_status==='paid' ? '' : `<a href="#" onclick="billingBypass(${c.id},'invoice');return false;">mark invoice paid</a>`}${b.invoice_status!=='paid' && b.sub_status!=='active' ? ' · ' : ''}${b.sub_status==='active' ? '' : `<a href="#" onclick="billingBypass(${c.id},'hosting');return false;">mark hosting active</a>`}</p>`;
+          return `<div>${inv}</div>${host}${bypass}`;
         })()}
       </div>
       <div>
@@ -396,6 +397,13 @@ async function startHosting(id, btn) {
   refresh(); setTimeout(() => openDrawer(id), 400);
 }
 function copyText(t){ navigator.clipboard?.writeText(t).catch(()=>{}); }
+async function billingBypass(id, what) {
+  if (!confirm(what === 'hosting' ? 'Mark hosting & security as ACTIVE without Stripe? (bypass)' : 'Mark the invoice as PAID without Stripe? (bypass)')) return;
+  const r = await api(`/api/clients/${id}/billing-bypass`, { method:'POST', body: JSON.stringify({ what }) });
+  if (r.error) return toast('⚠ ' + r.error);
+  toast('Bypassed ✓ — logged in the activity feed');
+  refresh(); setTimeout(() => openDrawer(id), 400);
+}
 async function applyVibe(id, btn) {
   const v = document.getElementById('vibeInput').value.trim();
   if (!v) return toast('Type a feeling first — e.g. "moody and romantic"');

@@ -644,6 +644,25 @@ async function pollBilling(env) {
   return changed;
 }
 
+// Manual bypass: mark paid / hosting active when handled outside Stripe (cash, Venmo, comp)
+app.post('/api/clients/:id/billing-bypass', async (c) => {
+  const id = Number(c.req.param('id'));
+  const { what } = await c.req.json();
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  const billing = getBilling(client);
+  if (what === 'hosting') {
+    billing.sub_status = 'active'; billing.sub_bypass = true;
+    await logEvent(db, id, 'hosting_active', 'Hosting marked ACTIVE manually (bypass — handled outside Stripe) 🔓');
+  } else {
+    billing.invoice_status = 'paid'; billing.invoice_bypass = true; billing.paid_at = new Date().toISOString();
+    await logEvent(db, id, 'invoice_paid', 'Invoice marked PAID manually (bypass — paid outside Stripe) 🔓💰');
+  }
+  await touchClient(db, id, { billing: JSON.stringify(billing) });
+  return c.json({ ok: true });
+});
+
 app.post('/api/billing/poll', async (c) => {
   const n = await pollBilling(c.env);
   return c.json({ ok: true, changed: n });
