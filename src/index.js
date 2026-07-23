@@ -212,6 +212,8 @@ app.post('/intake/:n', async (c) => {
             emailFrom: settings.email_from || undefined,
           });
           await logEvent(db, clientId, 'booking_email_sent', `Booking link sent to ${email}`);
+          await trySMS(ghl, db, clientId, contactId,
+            `Hi ${firstName}! ConversionCo here — got your intake, thank you! Grab a time for your quick planning call: ${settings.booking_link}`);
         } catch (e) {
           await logEvent(db, clientId, 'error', `Booking email failed: ${e.message}`);
         }
@@ -574,6 +576,14 @@ app.get('/api/email-status/:key', async (c) => {
   } catch (e) { return c.json({ ok: false, error: String(e.message || e).slice(0, 300) }); }
 });
 
+// Keyed: clear stored email-template overrides so the code defaults (personal style) apply
+app.get('/api/reset-templates/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const keys = ['intake1_subject', 'intake1_body', 'intake2_subject', 'intake2_body', 'booking_subject', 'booking_body'];
+  for (const k of keys) await c.env.DB.prepare('DELETE FROM settings WHERE key = ?').bind(k).run();
+  return c.json({ ok: true, cleared: keys });
+});
+
 // Keyed: fire the weekly owner digest on demand (testing / catch-up)
 app.get('/api/digest-now/:key', async (c) => {
   if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
@@ -597,9 +607,8 @@ app.get('/api/test-email/:key', async (c) => {
       contactId: contact.id || contact.contactId,
       subject: `Quick test from ConversionCo (${stamp.slice(-6)})`,
       html: `<p>Hi there,</p>
-<p>This is a quick delivery test from the ConversionCo system on our new sending setup. If you're reading this in your <b>inbox</b>, everything is working exactly as it should.</p>
-<p style="margin:24px 0;"><a href="${link}" style="background:#0B1D33;color:#ffffff;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:bold;">Test the Button &rarr;</a></p>
-<p style="font-size:12.5px;color:#667788;">Button not working? Copy this link into your browser:<br><span style="color:#0B1D33;word-break:break-all;">${link}</span></p>
+<p>This is a quick delivery test from the ConversionCo system. If you're reading this in your inbox, everything is working exactly as it should. Here's a test link to tap:</p>
+<p><a href="${link}">${link}</a></p>
 <p>Talk soon,<br>The ConversionCo Team</p>`,
       emailFrom: settings.email_from || undefined,
     });
@@ -707,8 +716,8 @@ app.post('/agreement-sign/:id/:token', async (c) => {
       // copy to client
       const contact = await ghl.upsertContact({ email: client.email, name: client.name || '' });
       await ghl.sendEmail({ contactId: contact.id || contact.contactId,
-        subject: `Your signed agreement with ConversionCo ✍️`,
-        html: `<p>Hi ${(client.name || '').split(' ')[0] || 'there'},</p><p>Thanks — your service agreement is signed and on file. You can view it any time here:</p><p><a href="${url}">View your signed agreement</a></p><p>Next up: your invoice. Once that's settled, the build begins.</p><p>Talk soon,<br>The ConversionCo Team</p>`,
+        subject: `Your signed agreement with ConversionCo`,
+        html: `<p>Hi ${(client.name || '').split(' ')[0] || 'there'},</p><p>Thanks — your service agreement is signed and on file. You can view it any time here:</p><p><a href="${url}">${url}</a></p><p>Next up: your invoice. Once that's settled, the build begins. Questions any time — just reply.</p><p>Talk soon,<br>The ConversionCo Team</p>`,
         emailFrom: settings.email_from || undefined });
       // copy to Tiffany
       const me = await ghl.upsertContact({ email: settings.notify_email, name: 'ConversionCo Notifications' });
@@ -1109,6 +1118,8 @@ app.post('/api/clients', async (c) => {
       html: renderTemplate(settings.intake1_body, { name: firstName, form_link: settings.form1_link }),
       emailFrom: settings.email_from || undefined,
     });
+    await trySMS(ghl, db, clientId, contactId,
+      `Hi ${firstName === 'there' ? '' : firstName + '! '}It's ConversionCo — excited to build your website. Step 1 is a quick 10-min intake form: ${settings.form1_link}`.replace('Hi It', "Hi! It"));
     await touchClient(db, clientId, { stage: 'intake1_sent', ghl_contact_id: contactId, name: name || existing?.name || '' });
     await logEvent(db, clientId, 'intake1_sent', `Sent to ${email.trim()}`);
     return c.json({ ok: true, id: clientId });
@@ -1143,6 +1154,8 @@ app.post('/api/clients/:id/send-intake2', async (c) => {
       html: renderTemplate(settings.intake2_body, { name: firstName, form_link: link2 }),
       emailFrom: settings.email_from || undefined,
     });
+    await trySMS(ghl, db, id, contactId,
+      `Hi ${firstName}! ConversionCo here — last step before design starts: your Website Vision form. ${link2}`);
     await touchClient(db, id, { stage: 'intake2_sent', ghl_contact_id: contactId });
     await logEvent(db, id, 'intake2_sent', `Sent to ${client.email}`);
     return c.json({ ok: true });
@@ -1183,17 +1196,32 @@ async function sendPortalEmail(env, db, client, settings) {
     const contact = await ghl.upsertContact({ email: client.email, name: client.name || '' });
     await ghl.sendEmail({
       contactId: contact.id || contact.contactId,
-      subject: `Welcome aboard! Your private client portal 🔑 — ${biz}`,
+      subject: `Your private client portal — ${biz}`,
       html: `<p>Hi ${first},</p>
-<p>You're officially on the books — and your <b>private client portal</b> is live. It's your window into everything we do for ${biz}: watch your website get built stage by stage, see your SEO score, your uptime monitoring, and every piece of content we publish for you.</p>
-<p style="margin:24px 0;"><a href="${url}" style="background:#0B1D33;color:#ffffff;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:bold;">Open My Portal &rarr;</a></p>
-<p style="font-size:12.5px;color:#667788;">Button not working? Copy this link into your browser:<br><span style="color:#0B1D33;word-break:break-all;">${url}</span></p><p>This link is your personal key — no password needed. Bookmark it; it updates in real time. You can also message us directly from inside it any time.</p>
+<p>You're officially on the books. Your private client portal is live — it's your window into everything we do for ${biz}: watch your website get built stage by stage, see your SEO score, your uptime monitoring, and everything we publish for you.</p>
+<p><a href="${url}">${url}</a></p>
+<p>That link is your personal key — no password needed. Bookmark it; it updates in real time, and you can message us directly from inside it any time. Or just reply to this email.</p>
 <p>Talk soon,<br>The ConversionCo Team</p>`,
       emailFrom: settings.email_from || undefined,
     });
+    await trySMS(ghl, db, client.id, contact.id || contact.contactId,
+      `Hi ${first}! It's ConversionCo — you're officially on the books. Your private client portal is live (bookmark it): ${url}`);
     await logEvent(db, client.id, 'portal_invited', `Portal login auto-sent to ${client.email} 🔑`);
     return true;
   } catch { return false; }
+}
+
+// Best-effort SMS alongside key emails — clients can't miss the notification.
+// Silently skips if the contact has no phone or no SMS number is configured in GHL.
+async function trySMS(ghl, db, clientId, contactId, message) {
+  try {
+    await ghl.sendSMS({ contactId, message });
+    await logEvent(db, clientId, 'sms_sent', `📱 Text sent: "${message.slice(0, 70)}…"`);
+    return true;
+  } catch (e) {
+    await logEvent(db, clientId, 'sms_skipped', `Text not sent (${String(e.message || e).slice(0, 120)})`);
+    return false;
+  }
 }
 
 // ---------------- Stripe billing ----------------
@@ -1340,14 +1368,16 @@ app.post('/api/clients/:id/portal-invite', async (c) => {
     const contact = await ghl.upsertContact({ email: client.email, name: client.name || '' });
     await ghl.sendEmail({
       contactId: contact.id || contact.contactId,
-      subject: `Your private client portal is live 🔑 — ${biz}`,
+      subject: `Your private client portal — ${biz}`,
       html: `<p>Hi ${first},</p>
-<p>Your project now has a <b>live client portal</b> — your window into everything we're doing for ${biz}: where your project stands, your website's SEO score, uptime monitoring, and every piece of content we publish for you.</p>
-<p style="margin:26px 0;"><a href="${url}" style="background:#0B1D33;color:#ffffff;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:bold;">Open My Portal &rarr;</a></p>
-<p style="font-size:12.5px;color:#667788;">Button not working? Copy this link into your browser:<br><span style="color:#0B1D33;word-break:break-all;">${url}</span></p><p>This link is your personal key — no password needed. Bookmark it and check in any time; it updates in real time as we work.</p>
+<p>Your project now has a live client portal — your window into everything we're doing for ${biz}: where your project stands, your website's SEO score, uptime monitoring, and everything we publish for you.</p>
+<p><a href="${url}">${url}</a></p>
+<p>That link is your personal key — no password needed. Bookmark it and check in any time; it updates in real time as we work. Or just reply to this email with any question.</p>
 <p>Talk soon,<br>The ConversionCo Team</p>`,
       emailFrom: settings.email_from || undefined,
     });
+    await trySMS(ghl, db, id, contact.id || contact.contactId,
+      `Hi ${first}! It's ConversionCo — your private client portal is live (bookmark it): ${url}`);
     await logEvent(db, id, 'portal_invited', `Portal login emailed to ${client.email} 🔑`);
     return c.json({ ok: true });
   } catch (e) {
@@ -1368,13 +1398,15 @@ app.post('/api/clients/:id/agreement-invite', async (c) => {
     const ghl = ghlFor(c.env, settings);
     const contact = await ghl.upsertContact({ email: client.email, name: client.name || '' });
     await ghl.sendEmail({ contactId: contact.id || contact.contactId,
-      subject: `One quick signature before we begin — ${biz} × ConversionCo`,
+      subject: `One quick signature before we begin — ${biz}`,
       html: `<p>Hi ${(client.name || '').split(' ')[0] || 'there'},</p>
-<p>We're excited to build this with you! Before your invoice, here's our simple service agreement — plain English, takes two minutes to read, and it protects both of us. The short version: <b>your domain and your website are yours</b>, and we spell out exactly what our service covers.</p>
-<p style="margin:24px 0;"><a href="${url}" style="background:#0B1D33;color:#fff;padding:14px 26px;border-radius:8px;text-decoration:none;font-weight:bold;">Read &amp; Sign the Agreement &rarr;</a></p>
-<p style="font-size:12.5px;color:#667788;">Button not working? Copy this link into your browser:<br><span style="color:#0B1D33;word-break:break-all;">${url}</span></p><p>Your invoice follows right after you sign. Questions? Just reply.</p>
+<p>We're excited to build this with you. Before your invoice, here's our service agreement — plain English, about two minutes to read, and it protects both of us. The short version: your domain and your website are yours, and it spells out exactly what our service covers:</p>
+<p><a href="${url}">${url}</a></p>
+<p>Your invoice follows right after you sign. Questions about anything in it? Just reply — happy to walk you through.</p>
 <p>Talk soon,<br>The ConversionCo Team</p>`,
       emailFrom: settings.email_from || undefined });
+    await trySMS(ghl, db, id, contact.id || contact.contactId,
+      `Hi ${(client.name || '').split(' ')[0] || 'there'}! ConversionCo here — quick e-signature on your service agreement before we begin (2-min read): ${url}`);
     let billing = {}; try { billing = JSON.parse(client.billing || '{}'); } catch {}
     billing.agr_sent = new Date().toISOString();
     await touchClient(db, id, { billing: JSON.stringify(billing) });

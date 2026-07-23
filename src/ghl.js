@@ -117,6 +117,11 @@ export class GHL {
     if (emailFrom) body.emailFrom = emailFrom;
     return this.req('POST', '/conversations/messages', { body });
   }
+
+  // ---- SMS via Conversations (requires a phone number configured in GHL) ----
+  async sendSMS({ contactId, message }) {
+    return this.req('POST', '/conversations/messages', { body: { type: 'SMS', contactId, message } });
+  }
 }
 
 export class GHLError extends Error {
