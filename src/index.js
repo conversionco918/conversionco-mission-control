@@ -324,6 +324,16 @@ app.get('/debug/:key', async (c) => {
           intake1: r.intake1_data || '', intake2: r.intake2_data || '' };
       });
     })(),
+    counters: await (async () => {
+      const rows = (await c.env.DB.prepare('SELECT id FROM clients').all()).results || [];
+      const out = {};
+      for (const r of rows) {
+        const l = (await c.env.DB.prepare('SELECT COUNT(*) AS n FROM leads WHERE client_id = ?').bind(r.id).first())?.n || 0;
+        const v = (await c.env.DB.prepare(`SELECT COUNT(*) AS n FROM revisions WHERE client_id = ? AND status='done'`).bind(r.id).first())?.n || 0;
+        out[r.id] = { leads: l, revisionsDone: v };
+      }
+      return out;
+    })(),
     scores: await (async () => {
       const rows = (await c.env.DB.prepare('SELECT * FROM clients').all()).results || [];
       const settings2 = await getSettings(c.env.DB);
@@ -534,23 +544,45 @@ app.get('/portal/:id/:token', async (c) => {
   const settings = await getSettings(db);
   const score = await computeScore(db, client, settings);
   let up = null; try { up = JSON.parse(settings[`uptime_${id}`] || 'null'); } catch {}
+  let billing = {}; try { billing = JSON.parse(client.billing || '{}'); } catch {}
   const slug = await slugForClient(db, id);
-  const blogs = slug ? ((await db.prepare(`SELECT path FROM site_files WHERE slug=? AND path LIKE 'blog-%' ORDER BY updated_at DESC LIMIT 6`).bind(slug).all()).results || []) : [];
+  const blogs = slug ? ((await db.prepare(`SELECT path FROM site_files WHERE slug=? AND path LIKE 'blog-%' ORDER BY updated_at DESC LIMIT 5`).bind(slug).all()).results || []) : [];
+  const leadsN = (await db.prepare('SELECT COUNT(*) AS n FROM leads WHERE client_id = ?').bind(id).first())?.n || 0;
+  const revsN = (await db.prepare(`SELECT COUNT(*) AS n FROM revisions WHERE client_id = ? AND status = 'done'`).bind(id).first())?.n || 0;
+  const FRIENDLY = { auto_published: '🚀 Website updated & republished', revision_done: '✅ A requested change was completed',
+    theme_changed: '🎨 Fresh look applied to your site', logo_uploaded: '🖼 Your logo was added', photo_uploaded: '📷 New photo added to your site',
+    lead_received: '🔥 New lead captured from your website', preview_ready: '👀 A new version was published', hosting_active: '🛡 Hosting & security activated' };
+  const evRows = (await db.prepare(`SELECT type, created_at FROM events WHERE client_id = ? AND type IN ('auto_published','revision_done','theme_changed','logo_uploaded','photo_uploaded','lead_received','preview_ready','hosting_active') ORDER BY id DESC LIMIT 8`).bind(id).all()).results || [];
+  // reports list from GitHub (best effort)
+  let reports = [];
+  if (slug && c.env.GITHUB_TOKEN) {
+    try {
+      const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+      const r = await fetch(`https://api.github.com/repos/${repo}/contents/reports/${slug}`, {
+        headers: { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' } });
+      if (r.ok) reports = (await r.json()).filter((f) => f.name.endsWith('.html')).map((f) => f.name).sort().reverse().slice(0, 6);
+    } catch {}
+  }
   const biz = client.business_name || client.name || 'Your Business';
   const stageIdx = PORTAL_STAGES.findIndex(([k]) => k === client.stage);
   const doneIdx = stageIdx === -1 ? (client.stage === 'intake2_sent' ? 2 : 0) : stageIdx;
   const siteUrl = client.live_url || client.preview_url || '';
   const upPct = up && up.total ? Math.round(100 * (up.total - (up.fails || 0)) / up.total) : null;
+  const tok = c.req.param('token');
+  const isPremium = client.tier === 'premium';
   const bars = score ? Object.entries(score.breakdown).map(([k, v]) =>
     `<div class="bar"><span>${k === 'offsite' ? 'off-site' : k}</span><div class="tr"><div class="fl" style="width:${Math.round(100 * v.score / v.max)}%"></div></div><b>${v.score}/${v.max}</b></div>`).join('') : '';
+  const plan = isPremium
+    ? ['Custom luxury website — every page designed for you', 'A landing page for every drip (Google loves depth)', 'City pages for local search domination', 'A new SEO article written & published every week', 'Weekly performance report with your SEO Score', 'Daily uptime & security monitoring', 'Review funnel — happy clients routed to Google']
+    : ['Custom luxury website — every page designed for you', 'Full search-engine foundation (schema, sitemap, local targeting)', 'Monthly performance report with your SEO Score', 'Daily uptime & security monitoring', 'Booking built into every page'];
   return c.html(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex"><title>${biz} — Client Portal | ConversionCo</title>
 <style>
   *{box-sizing:border-box;margin:0}body{font-family:-apple-system,'Segoe UI',sans-serif;background:#0B1D33;color:#EDF2F7;line-height:1.6}
-  .wrap{max-width:760px;margin:0 auto;padding:40px 20px 80px}
+  .wrap{max-width:780px;margin:0 auto;padding:40px 20px 80px}
   .head{display:flex;align-items:center;gap:14px;margin-bottom:6px}
   .head img{height:44px;max-width:130px;object-fit:contain;background:#fff;border-radius:10px;padding:4px}
-  h1{font-size:26px}.sub{color:#8EA3BC;font-size:13px;margin-bottom:34px}
+  h1{font-size:26px}.sub{color:#8EA3BC;font-size:13px;margin-bottom:30px}
   .card{background:#10263F;border:1px solid #1E3A5C;border-radius:16px;padding:24px;margin-bottom:18px}
   .card h2{font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:#C9A254;margin-bottom:16px}
   .steps{display:flex;flex-direction:column;gap:10px}
@@ -564,27 +596,118 @@ app.get('/portal/:id/:token', async (c) => {
   .bar{display:flex;align-items:center;gap:10px;font-size:12px}
   .bar span{width:74px;color:#8EA3BC;text-transform:capitalize}.bar b{width:44px;text-align:right;font-size:11.5px}
   .tr{flex:1;height:8px;background:#1E3A5C;border-radius:99px;overflow:hidden}.fl{height:100%;background:linear-gradient(90deg,#C9A254,#DDBE7A);border-radius:99px}
-  .statrow{display:flex;gap:14px;flex-wrap:wrap}
-  .stat{flex:1;min-width:150px;background:#0C2036;border:1px solid #1E3A5C;border-radius:12px;padding:16px;text-align:center}
-  .stat .v{font-size:26px;font-weight:700;color:#EDF2F7}.stat .l{font-size:11.5px;color:#8EA3BC;letter-spacing:.06em;text-transform:uppercase;margin-top:4px}
-  ul.blog{list-style:none;display:flex;flex-direction:column;gap:8px}ul.blog a{color:#DDBE7A;text-decoration:none;font-size:14.5px}
-  .btn{display:inline-block;background:#C9A254;color:#0B1D33;font-weight:700;padding:14px 26px;border-radius:10px;text-decoration:none;margin-top:6px}
+  .grid4{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+  .stat{background:#0C2036;border:1px solid #1E3A5C;border-radius:12px;padding:16px;text-align:center}
+  .stat .v{font-size:26px;font-weight:700}.stat .l{font-size:11px;color:#8EA3BC;letter-spacing:.05em;text-transform:uppercase;margin-top:4px}
+  ul.plan{list-style:none;display:flex;flex-direction:column;gap:9px;font-size:14.5px}
+  ul.plan li::before{content:"✓  ";color:#059669;font-weight:700}
+  .chipA{display:inline-block;background:#059669;color:#fff;font-size:11px;letter-spacing:.08em;padding:4px 12px;border-radius:99px;font-weight:700}
+  ul.blog{list-style:none;display:flex;flex-direction:column;gap:8px}ul.blog a, .replist a{color:#DDBE7A;text-decoration:none;font-size:14.5px}
+  .feed{display:flex;flex-direction:column;gap:9px;font-size:14px}.feed time{color:#5C7794;font-size:11.5px;display:block}
+  .btn{display:inline-block;background:#C9A254;color:#0B1D33;font-weight:700;padding:14px 26px;border-radius:10px;text-decoration:none;border:0;font-size:15px;cursor:pointer}
+  textarea{width:100%;background:#0C2036;border:1px solid #1E3A5C;border-radius:10px;color:#EDF2F7;padding:14px;font-family:inherit;font-size:14.5px;margin-bottom:12px}
   .foot{text-align:center;color:#5C7794;font-size:12px;margin-top:30px}.foot a{color:#8EA3BC}
+  .two{display:grid;grid-template-columns:1fr;gap:0}@media(min-width:720px){.two{grid-template-columns:1fr 1fr;gap:18px}}
 </style></head><body><div class="wrap">
   <div class="head">${slug ? `<img src="/preview/${slug}/img/logo.png" onerror="this.remove()">` : ''}<div><h1>${biz}</h1></div></div>
-  <p class="sub">Your live project portal · ConversionCo</p>
+  <p class="sub">Your private client portal · ConversionCo ${isPremium ? '· <b style="color:#C9A254">★ Premium</b>' : ''}</p>
+
   <div class="card"><h2>Where your project stands</h2><div class="steps">
     ${PORTAL_STAGES.map(([k, label], i) => `<div class="step ${i < doneIdx ? 'done' : i === doneIdx ? 'now' : 'pend'}"><span class="dot">${i < doneIdx ? '✓' : i === doneIdx ? '●' : i + 1}</span>${label}</div>`).join('')}
   </div>${siteUrl ? `<a class="btn" href="${siteUrl}" target="_blank" style="margin-top:18px">View your website →</a>` : ''}</div>
-  ${score ? `<div class="card"><h2>Your SEO Score</h2><div class="scorebig"><div class="num">${score.total}<small>/100</small></div><div class="bars">${bars}</div></div></div>` : ''}
-  <div class="statrow">
-    <div class="stat"><div class="v">${upPct === null ? '—' : upPct + '%'}</div><div class="l">Uptime${up && up.total ? ` (${up.total} daily checks)` : ' — monitoring active'}</div></div>
-    <div class="stat"><div class="v">${score ? score.pages.total : '—'}</div><div class="l">Pages live</div></div>
-    <div class="stat"><div class="v">${score ? score.pages.blogPosts : '—'}</div><div class="l">Blog posts published</div></div>
+
+  ${score ? `<div class="card"><h2>Your SEO Score</h2><div class="scorebig"><div class="num">${score.total}<small>/100</small></div><div class="bars">${bars}</div></div>
+  <p style="color:#8EA3BC;font-size:12.5px;margin-top:14px">A real audit of your website's search-readiness — technical health, content depth, local signals, reliability, and off-site presence. It climbs as we work.</p></div>` : ''}
+
+  <div class="card"><h2>Your investment at work</h2><div class="grid4">
+    <div class="stat"><div class="v">${up && up.total ? up.total : '—'}</div><div class="l">Security checks run</div></div>
+    <div class="stat"><div class="v">${upPct === null ? '—' : upPct + '%'}</div><div class="l">Uptime</div></div>
+    <div class="stat"><div class="v">${score ? score.pages.total : '—'}</div><div class="l">Pages built &amp; maintained</div></div>
+    <div class="stat"><div class="v">${score ? score.pages.blogPosts : 0}</div><div class="l">Articles written for you</div></div>
+    <div class="stat"><div class="v">${revsN}</div><div class="l">Changes completed</div></div>
+    <div class="stat"><div class="v">${leadsN}</div><div class="l">Leads captured</div></div>
+  </div></div>
+
+  <div class="two">
+    <div class="card"><h2>Your plan${billing.sub_status === 'active' ? ' <span class="chipA">🛡 PROTECTED</span>' : ''}</h2>
+      <ul class="plan">${plan.map((p) => `<li>${p}</li>`).join('')}</ul>
+    </div>
+    <div class="card"><h2>Recent activity</h2><div class="feed">
+      ${evRows.length ? evRows.map((e) => `<div>${FRIENDLY[e.type] || e.type}<time>${e.created_at} UTC</time></div>`).join('') : '<p style="color:#8EA3BC;font-size:13.5px">Activity appears here as we work.</p>'}
+    </div></div>
   </div>
-  ${blogs.length ? `<div class="card" style="margin-top:18px"><h2>Recently published for you</h2><ul class="blog">${blogs.map((b) => `<li><a href="/preview/${slug}/${b.path}" target="_blank">→ ${b.path.replace('blog-', '').replace('.html', '').replace(/-/g, ' ')}</a></li>`).join('')}</ul></div>` : ''}
-  <p class="foot">Questions? Reply to any of our emails — a human answers.<br>Website care by <a href="https://conversionco918.com">ConversionCo</a></p>
-</div></body></html>`);
+
+  ${reports.length ? `<div class="card"><h2>Your performance reports</h2><div class="replist" style="display:flex;flex-direction:column;gap:8px">
+    ${reports.map((r) => `<a href="/portal/${id}/${tok}/report/${r}" target="_blank">📊 ${r.replace('.html', '')}</a>`).join('')}
+  </div></div>` : ''}
+
+  ${blogs.length ? `<div class="card"><h2>Recently published for you</h2><ul class="blog">${blogs.map((b) => `<li><a href="/preview/${slug}/${b.path}" target="_blank">→ ${b.path.replace('blog-', '').replace('.html', '').replace(/-/g, ' ')}</a></li>`).join('')}</ul></div>` : ''}
+
+  <div class="card"><h2>Message us</h2>
+    <p style="color:#8EA3BC;font-size:13.5px;margin-bottom:12px">Questions, change requests, ideas — send them straight to your ConversionCo team. A human replies, usually same day.</p>
+    <form id="msgForm"><textarea name="message" rows="3" required placeholder="Type your message…"></textarea>
+    <button class="btn" type="submit">Send message</button>
+    <p id="msgOk" style="display:none;color:#34D399;font-weight:600;margin-top:10px">Sent! We'll get back to you shortly. 💛</p></form>
+  </div>
+
+  <p class="foot">Website care by <a href="https://conversionco918.com">ConversionCo</a> · This portal updates in real time</p>
+</div>
+<script>
+document.getElementById('msgForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const msg = new FormData(e.target).get('message');
+  try { await fetch('/portal-msg/${id}/${tok}', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: msg }) }); } catch {}
+  e.target.querySelector('button').style.display = 'none';
+  document.getElementById('msgOk').style.display = 'block';
+});
+</script>
+</body></html>`);
+});
+
+// Portal message → instant email to Tiffany + logged like a lead
+app.post('/portal-msg/:id/:token', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'portal', id)) return c.text('nope', 403);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'not found' }, 404);
+  let f = {}; try { f = await c.req.json(); } catch {}
+  const msg = String(f.message || '').slice(0, 2000);
+  if (!msg.trim()) return c.json({ error: 'empty' }, 400);
+  await db.prepare(`INSERT INTO leads (client_id, slug, name, email, phone, message) VALUES (?, 'portal-message', ?, ?, ?, ?)`)
+    .bind(id, client.name || '', client.email || '', client.phone || '', msg).run();
+  await logEvent(db, id, 'portal_message', `💬 Portal message from ${client.name || client.email}: "${msg.slice(0, 100)}"`);
+  const settings = await getSettings(db);
+  if (settings.notify_email && c.env.GHL_TOKEN && settings.ghl_location_id) {
+    try {
+      const ghl = ghlFor(c.env, settings);
+      const contact = await ghl.upsertContact({ email: settings.notify_email, name: 'ConversionCo Notifications' });
+      await ghl.sendEmail({ contactId: contact.id || contact.contactId,
+        subject: `💬 Portal message from ${client.business_name || client.name || client.email}`,
+        html: `<p><b>${client.name || ''}</b> (${client.email || ''}, ${client.phone || ''}) wrote via their portal:</p><blockquote style="border-left:3px solid #C9A254;padding-left:12px;">${msg.slice(0, 1200)}</blockquote><p><a href="${BASE_URL}">Open Mission Control</a></p>`,
+        emailFrom: settings.email_from || undefined });
+    } catch {}
+  }
+  return c.json({ ok: true });
+});
+
+// Render a stored report inside the portal (proxied from GitHub)
+app.get('/portal/:id/:token/report/:name', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'portal', id)) return c.text('not found', 404);
+  const name = c.req.param('name');
+  if (!/^[\w.-]+\.html$/.test(name)) return c.text('bad name', 400);
+  const db = c.env.DB;
+  const slug = await slugForClient(db, id);
+  if (!slug || !c.env.GITHUB_TOKEN) return c.text('no reports', 404);
+  const settings = await getSettings(db);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  const r = await fetch(`https://api.github.com/repos/${repo}/contents/reports/${slug}/${name}`, {
+    headers: { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' } });
+  if (!r.ok) return c.text('report not found', 404);
+  const data = await r.json();
+  const html = decodeURIComponent(escape(atob((data.content || '').replace(/\n/g, ''))));
+  return c.html(html);
 });
 
 // Pitch page: personalized pre-proposal generated from Intake 1
