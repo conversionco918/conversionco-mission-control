@@ -526,6 +526,16 @@ app.get('/api/revision-done/:key', async (c) => {
   return c.json({ ok: true });
 });
 
+// Keyed setter for the sending identity (email_from) — used during deliverability setup
+app.get('/api/set-from/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const value = String(c.req.query('value') || '').trim();
+  if (value && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) return c.json({ ok: false, error: 'invalid email' });
+  await c.env.DB.prepare(`INSERT INTO settings (key, value) VALUES ('email_from', ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value`).bind(value).run();
+  return c.json({ ok: true, email_from: value });
+});
+
 // Deliverability test (keyed): sends a styled test email so inbox placement can be verified
 app.get('/api/test-email/:key', async (c) => {
   if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
