@@ -1060,7 +1060,7 @@ async function sendPortalEmail(env, db, client, settings) {
       html: `<p>Hi ${first},</p>
 <p>You're officially on the books — and your <b>private client portal</b> is live. It's your window into everything we do for ${biz}: watch your website get built stage by stage, see your SEO score, your uptime monitoring, and every piece of content we publish for you.</p>
 <p style="margin:24px 0;"><a href="${url}" style="background:#0B1D33;color:#ffffff;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:bold;">Open My Portal &rarr;</a></p>
-<p>This link is your personal key — no password needed. Bookmark it; it updates in real time. You can also message us directly from inside it any time.</p>
+<p style="font-size:12.5px;color:#667788;">Button not working? Copy this link into your browser:<br><span style="color:#0B1D33;word-break:break-all;">${url}</span></p><p>This link is your personal key — no password needed. Bookmark it; it updates in real time. You can also message us directly from inside it any time.</p>
 <p>Talk soon,<br>The ConversionCo Team</p>`,
       emailFrom: settings.email_from || undefined,
     });
@@ -1217,7 +1217,7 @@ app.post('/api/clients/:id/portal-invite', async (c) => {
       html: `<p>Hi ${first},</p>
 <p>Your project now has a <b>live client portal</b> — your window into everything we're doing for ${biz}: where your project stands, your website's SEO score, uptime monitoring, and every piece of content we publish for you.</p>
 <p style="margin:26px 0;"><a href="${url}" style="background:#0B1D33;color:#ffffff;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:bold;">Open My Portal &rarr;</a></p>
-<p>This link is your personal key — no password needed. Bookmark it and check in any time; it updates in real time as we work.</p>
+<p style="font-size:12.5px;color:#667788;">Button not working? Copy this link into your browser:<br><span style="color:#0B1D33;word-break:break-all;">${url}</span></p><p>This link is your personal key — no password needed. Bookmark it and check in any time; it updates in real time as we work.</p>
 <p>Talk soon,<br>The ConversionCo Team</p>`,
       emailFrom: settings.email_from || undefined,
     });
@@ -1245,7 +1245,7 @@ app.post('/api/clients/:id/agreement-invite', async (c) => {
       html: `<p>Hi ${(client.name || '').split(' ')[0] || 'there'},</p>
 <p>We're excited to build this with you! Before your invoice, here's our simple service agreement — plain English, takes two minutes to read, and it protects both of us. The short version: <b>your domain and your website are yours</b>, and we spell out exactly what our service covers.</p>
 <p style="margin:24px 0;"><a href="${url}" style="background:#0B1D33;color:#fff;padding:14px 26px;border-radius:8px;text-decoration:none;font-weight:bold;">Read &amp; Sign the Agreement &rarr;</a></p>
-<p>Your invoice follows right after you sign. Questions? Just reply.</p>
+<p style="font-size:12.5px;color:#667788;">Button not working? Copy this link into your browser:<br><span style="color:#0B1D33;word-break:break-all;">${url}</span></p><p>Your invoice follows right after you sign. Questions? Just reply.</p>
 <p>Talk soon,<br>The ConversionCo Team</p>`,
       emailFrom: settings.email_from || undefined });
     let billing = {}; try { billing = JSON.parse(client.billing || '{}'); } catch {}

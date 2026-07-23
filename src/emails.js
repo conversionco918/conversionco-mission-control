@@ -14,6 +14,7 @@ export const DEFAULT_TEMPLATES = {
 <p style="margin:24px 0;">
   <a href="{{form_link}}" style="background:#071B33;color:#ffffff;padding:12px 24px;border-radius:6px;text-decoration:none;font-weight:bold;">Start Intake Form 1 &rarr;</a>
 </p>
+<p style="font-size:12.5px;color:#667788;">Button not working? Copy this link into your browser:<br><span style="color:#0B1D33;word-break:break-all;">{{form_link}}</span></p>
 <p>It takes about 10 minutes. Once you submit it, I'll review everything and reach out to go over pricing and next steps.</p>
 <p>Talk soon,<br>The ConversionCo Team</p>
 `,
@@ -25,6 +26,7 @@ export const DEFAULT_TEMPLATES = {
 <p style="margin:24px 0;">
   <a href="{{form_link}}" style="background:#071B33;color:#ffffff;padding:12px 24px;border-radius:6px;text-decoration:none;font-weight:bold;">Start the Website Vision Form &rarr;</a>
 </p>
+<p style="font-size:12.5px;color:#667788;">Button not working? Copy this link into your browser:<br><span style="color:#0B1D33;word-break:break-all;">{{form_link}}</span></p>
 <p>As soon as you submit it, my build process kicks off automatically and I'll have a preview link for you shortly after.</p>
 <p>Talk soon,<br>The ConversionCo Team</p>
 `,
@@ -39,6 +41,7 @@ export const BOOKING_TEMPLATES = {
 <p style="margin:24px 0;">
   <a href="{{booking_link}}" style="background:#071B33;color:#ffffff;padding:12px 24px;border-radius:6px;text-decoration:none;font-weight:bold;">Pick Your Call Time &rarr;</a>
 </p>
+<p style="font-size:12.5px;color:#667788;">Button not working? Copy this link into your browser:<br><span style="color:#0B1D33;word-break:break-all;">{{booking_link}}</span></p>
 <p>As soon as you book, you'll get a confirmation with a Google Meet link — that's where we'll meet.</p>
 <p>Talk soon,<br>The ConversionCo Team</p>
 `,
