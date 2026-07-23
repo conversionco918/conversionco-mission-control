@@ -333,6 +333,15 @@ function openDrawer(id) {
         </div>
         <p style="font-size:11px;color:#94a3b8;margin-top:6px;">Portal = their live dashboard (send after purchase). Pitch = personalized proposal page (send before/during the pricing call).</p>
       </div>
+      <div>
+        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Request any revision</label>
+        <textarea id="revInput" rows="2" placeholder='e.g. "Change the NAD+ price to $850" · "Make the hero headline about energy, not luxury" · "Swap the About photo for their photo #2"'></textarea>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:8px;">
+          <button class="btn btn-primary" onclick="queueRevision(${c.id}, this)">✏️ Queue revision</button>
+          <span style="font-size:11px;color:#94a3b8;">Applied automatically within the hour — you get the usual email when it's live.</span>
+        </div>
+        <div id="revList" style="margin-top:10px;"></div>
+      </div>
       <div id="leadsBox"></div>
       <div>
         <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Client logo</label>
@@ -381,6 +390,16 @@ function openDrawer(id) {
       </div>
     </div>`;
   document.getElementById('drawer').classList.add('open');
+  api(`/api/clients/${id}/revisions`).then((r) => {
+    const el = document.getElementById('revList');
+    if (!el || !r.revisions || !r.revisions.length) return;
+    el.innerHTML = r.revisions.map(v => {
+      const chip = v.status === 'done' ? '<span class="chip" style="background:#ecfdf5;color:#059669">done</span>'
+        : v.status === 'failed' ? '<span class="chip" style="background:#fef2f2;color:#dc2626">needs attention</span>'
+        : '<span class="chip" style="background:#fef9c3;color:#a16207">queued</span>';
+      return `<div style="font-size:12.5px;padding:6px 0;border-bottom:1px dashed #e2e8f0;">${chip} ${esc(v.request.slice(0, 110))}${v.note ? `<br><span style="color:#94a3b8;font-size:11px;">${esc(v.note)}</span>` : ''}</div>`;
+    }).join('');
+  });
   api(`/api/clients/${id}/leads`).then((r) => {
     const box = document.getElementById('leadsBox');
     if (!box || !r.leads) return;
@@ -458,6 +477,17 @@ async function startHosting(id, btn) {
   refresh(); setTimeout(() => openDrawer(id), 400);
 }
 function copyText(t){ navigator.clipboard?.writeText(t).catch(()=>{}); }
+async function queueRevision(id, btn) {
+  const v = document.getElementById('revInput').value.trim();
+  if (!v) return toast('Describe the change first');
+  btn.disabled = true;
+  const r = await api(`/api/clients/${id}/revision`, { method:'POST', body: JSON.stringify({ request: v }) });
+  btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error);
+  document.getElementById('revInput').value = '';
+  toast('Revision queued ✏️ — it applies automatically within the hour');
+  refresh(); setTimeout(() => openDrawer(id), 400);
+}
 async function copyLink(id, kind, btn) {
   btn.disabled = true;
   const r = await api(`/api/clients/${id}/links`);

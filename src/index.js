@@ -45,6 +45,10 @@ async function ensureSchema(db) {
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN launch_checklist TEXT DEFAULT ''`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN vibe TEXT DEFAULT ''`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN billing TEXT DEFAULT ''`).run(); } catch {}
+  try { await db.prepare(`CREATE TABLE IF NOT EXISTS revisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER NOT NULL, request TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending', note TEXT DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')), done_at TEXT DEFAULT '')`).run(); } catch {}
   try { await db.prepare(`CREATE TABLE IF NOT EXISTS leads (
     id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER, slug TEXT DEFAULT '',
     name TEXT DEFAULT '', email TEXT DEFAULT '', phone TEXT DEFAULT '', message TEXT DEFAULT '',
@@ -306,6 +310,10 @@ app.get('/debug/:key', async (c) => {
           paid: b.invoice_status === 'paid', hosting: b.sub_status === 'active' };
       });
     })(),
+    revisionQueue: await (async () => {
+      const rows = (await c.env.DB.prepare(`SELECT r.*, cl.business_name, cl.tier, cl.email FROM revisions r JOIN clients cl ON cl.id = r.client_id WHERE r.status = 'pending' ORDER BY r.id`).all()).results || [];
+      return rows;
+    })(),
     buildQueue: await (async () => {
       const rows = (await c.env.DB.prepare(`SELECT * FROM clients WHERE stage IN ('intake2_done','generating')`).all()).results || [];
       return rows.map((r) => {
@@ -486,6 +494,21 @@ app.get('/api/grabimg/:key', async (c) => {
   </body></html>`);
 });
 
+
+// Revision runner callbacks (keyed; GET so headless sessions can call via WebFetch)
+app.get('/api/revision-done/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const q = c.req.query();
+  const id = Number(q.id);
+  const status = q.status === 'failed' ? 'failed' : 'done';
+  const rev = await c.env.DB.prepare('SELECT * FROM revisions WHERE id = ?').bind(id).first();
+  if (!rev) return c.json({ ok: false, error: 'revision not found' });
+  await c.env.DB.prepare(`UPDATE revisions SET status = ?, note = ?, done_at = datetime('now') WHERE id = ?`)
+    .bind(status, String(q.note || '').slice(0, 400), id).run();
+  await logEvent(c.env.DB, rev.client_id, status === 'done' ? 'revision_done' : 'revision_failed',
+    `${status === 'done' ? '✅ Revision applied' : '⚠️ Revision needs attention'}: "${rev.request.slice(0, 80)}"${q.note ? ' — ' + String(q.note).slice(0, 120) : ''}`);
+  return c.json({ ok: true });
+});
 
 // ---------------- public: client portal, pitch pages, lead capture ----------------
 async function portalToken(env, kind, id) {
@@ -885,6 +908,22 @@ app.get('/api/clients/:id/score', async (c) => {
   const settings = await getSettings(db);
   const score = await computeScore(db, client, settings);
   return c.json(score || { error: 'no site yet' });
+});
+
+app.post('/api/clients/:id/revision', async (c) => {
+  const id = Number(c.req.param('id'));
+  const { request } = await c.req.json();
+  if (!request || !String(request).trim()) return c.json({ error: 'describe the change first' }, 400);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  const r = await db.prepare('INSERT INTO revisions (client_id, request) VALUES (?, ?)').bind(id, String(request).slice(0, 2000)).run();
+  await logEvent(db, id, 'revision_requested', `✏️ Revision queued: "${String(request).slice(0, 100)}"`);
+  return c.json({ ok: true, id: r.meta.last_row_id });
+});
+app.get('/api/clients/:id/revisions', async (c) => {
+  const rows = (await c.env.DB.prepare('SELECT * FROM revisions WHERE client_id = ? ORDER BY id DESC LIMIT 10').bind(Number(c.req.param('id'))).all()).results || [];
+  return c.json({ revisions: rows });
 });
 
 app.get('/api/clients/:id/leads', async (c) => {
