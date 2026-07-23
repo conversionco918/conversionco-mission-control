@@ -33,8 +33,8 @@ async function stripeReq(key, method, path, params) {
 }
 
 export const PRICES = {
-  standard: { amount: 49900, label: 'Standard Website Package', display: '$499' },
-  premium: { amount: 64900, label: 'Premium Website + SEO Engine', display: '$649' },
+  standard: { amount: 64900, label: 'Standard Website Package', display: '$649' },
+  premium: { amount: 99900, label: 'Premium Website + SEO Engine', display: '$999' },
   hosting: { amount: 4900, label: 'Website Hosting & Security', display: '$49/mo' },
 };
 
