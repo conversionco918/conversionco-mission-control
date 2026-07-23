@@ -255,7 +255,7 @@ function openDrawer(id) {
   document.getElementById('drawer').innerHTML = `
     <div class="dhead"><h2>${esc(c.name || c.email)}</h2><p>${esc(c.email)}${c.phone ? ' · ' + esc(c.phone) : ''}</p></div>
     <div class="dbody">
-      <div><span class="chip" style="background:${st.bg};color:${st.fg}">${st.label}</span></div>
+      <div><span class="chip" style="background:${st.bg};color:${st.fg}">${st.label}</span> <span id="seoScore" style="font-size:12.5px;color:#64748b;"></span></div>
       <div class="actions">
         ${c.stage === 'intake1_done' || c.stage === 'intake2_sent' ? `<button class="btn btn-green" onclick="sendIntake2(${c.id}, this)">${c.stage==='intake2_sent'?'Resend Intake 2':'Approve → Send Intake 2'}</button>` : ''}
         ${c.stage === 'new' || c.stage === 'intake1_sent' ? `<button class="btn btn-primary" onclick="resendIntake1('${esc(c.email)}', this)">${c.stage==='intake1_sent'?'Resend Intake 1':'Send Intake 1'}</button>` : ''}
@@ -361,6 +361,17 @@ function openDrawer(id) {
       </div>
     </div>`;
   document.getElementById('drawer').classList.add('open');
+  api(`/api/clients/${id}/score`).then((sc) => {
+    const el = document.getElementById('seoScore');
+    if (!el || !sc || sc.error) return;
+    const col = sc.total >= 80 ? '#059669' : sc.total >= 60 ? '#d97706' : '#dc2626';
+    el.innerHTML = `<b style="color:${col};font-size:14px;">SEO Score ${sc.total}/100</b>
+      <span style="color:#94a3b8;"> · tech ${sc.breakdown.technical.score}/${sc.breakdown.technical.max}
+      · content ${sc.breakdown.content.score}/${sc.breakdown.content.max}
+      · local ${sc.breakdown.local.score}/${sc.breakdown.local.max}
+      · uptime ${sc.breakdown.reliability.score}/${sc.breakdown.reliability.max}
+      · off-site ${sc.breakdown.offsite.done}/${sc.breakdown.offsite.of} done</span>`;
+  });
   document.getElementById('overlay').classList.add('open');
 }
 function closeDrawer(){ document.getElementById('drawer').classList.remove('open'); document.getElementById('overlay').classList.remove('open'); }

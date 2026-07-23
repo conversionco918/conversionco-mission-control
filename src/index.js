@@ -4,6 +4,7 @@ import { DEFAULT_TEMPLATES, BOOKING_TEMPLATES, DEFAULT_SETTINGS, renderTemplate 
 import { THEMES } from './themes.js';
 import { vibeToTokens } from './vibe.js';
 import { PRICES, ensureCustomer, sendInvoice, invoiceStatus, hostingCheckout, checkoutStatus } from './stripe.js';
+import { computeScore } from './score.js';
 import dashboardHtml from './ui.html';
 import loginHtml from './login.html';
 
@@ -296,6 +297,13 @@ app.get('/debug/:key', async (c) => {
     tiers: await (async () => {
       const rows = (await c.env.DB.prepare('SELECT id, email, business_name, tier, stage FROM clients').all()).results || [];
       return rows;
+    })(),
+    scores: await (async () => {
+      const rows = (await c.env.DB.prepare('SELECT * FROM clients').all()).results || [];
+      const settings2 = await getSettings(c.env.DB);
+      const out = {};
+      for (const cl of rows) { try { const sc = await computeScore(c.env.DB, cl, settings2); if (sc) out[cl.id] = sc; } catch {} }
+      return out;
     })(),
   });
 });
@@ -671,6 +679,16 @@ app.post('/api/clients/:id/billing-bypass', async (c) => {
   }
   await touchClient(db, id, { billing: JSON.stringify(billing) });
   return c.json({ ok: true });
+});
+
+app.get('/api/clients/:id/score', async (c) => {
+  const id = Number(c.req.param('id'));
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  const settings = await getSettings(db);
+  const score = await computeScore(db, client, settings);
+  return c.json(score || { error: 'no site yet' });
 });
 
 app.post('/api/billing/poll', async (c) => {
