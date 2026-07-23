@@ -338,6 +338,17 @@ function openDrawer(id) {
         <p style="font-size:11px;color:#94a3b8;margin-top:6px;">PNG with transparent background works best. It's used on their website automatically — and always links home.</p>
       </div>
       <div>
+        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Client photos <span style="font-weight:400;color:#94a3b8;">(their real shots — scrubs, setup, city; up to 6)</span></label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+          ${[1,2,3,4,5,6].map(n => `<img src="/api/clients/${c.id}/photo/${n}?cb=${Date.now()}" onerror="this.remove()" style="height:48px;width:48px;object-fit:cover;border-radius:8px;border:1px solid #e2e8f0;">`).join('')}
+          <label class="btn btn-ghost" style="cursor:pointer;padding:8px 12px;">
+            + Add photo
+            <input type="file" accept="image/png,image/jpeg,image/webp" multiple style="display:none" onchange="uploadPhotos(${c.id}, this)">
+          </label>
+        </div>
+        <p style="font-size:11px;color:#94a3b8;margin-top:6px;">Real photos beat stock — the builder weaves them into the hero and About page.</p>
+      </div>
+      <div>
         <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Launch &amp; Ranking Checklist</label>
         <div class="intake" style="padding:12px 14px;">
           ${LAUNCH_ITEMS.map(it => {
@@ -376,6 +387,28 @@ function openDrawer(id) {
 }
 function closeDrawer(){ document.getElementById('drawer').classList.remove('open'); document.getElementById('overlay').classList.remove('open'); }
 async function patchClient(id, body, quiet) { await api(`/api/clients/${id}`, { method:'PATCH', body: JSON.stringify(body) }); if (!quiet) { toast('Updated ✓'); refresh(); } }
+async function uploadPhotos(id, input) {
+  const files = [...input.files].slice(0, 6);
+  if (!files.length) return;
+  toast(`Uploading ${files.length} photo(s)…`);
+  let slot = 1;
+  // find next free slots by probing existing previews
+  for (const f of files) {
+    if (f.size > 3_000_000) { toast('⚠ One photo skipped — over 3MB'); continue; }
+    const ext = f.type.includes('webp') ? 'webp' : f.type.includes('png') ? 'png' : 'jpg';
+    const b64 = await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(f); });
+    while (slot <= 6) {
+      const probe = await fetch(`/api/clients/${id}/photo/${slot}`, { method: 'HEAD' });
+      if (!probe.ok) break; slot++;
+    }
+    if (slot > 6) { toast('⚠ All 6 photo slots full'); break; }
+    const r = await api(`/api/clients/${id}/photo`, { method:'POST', body: JSON.stringify({ b64, ext, n: slot }) });
+    if (r.error) { toast('⚠ ' + r.error); break; }
+    slot++;
+  }
+  toast('Photos saved 📷');
+  refresh(); setTimeout(() => openDrawer(id), 400);
+}
 async function uploadLogo(id, input) {
   const f = input.files[0]; if (!f) return;
   if (f.size > 1_800_000) return toast('⚠ Logo too large — keep it under 1.8MB');

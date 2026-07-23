@@ -782,6 +782,58 @@ app.post('/api/clients/:id/logo', async (c) => {
   return c.json({ ok: true, applied });
 });
 
+// Client photos: up to 6, same pattern as logo (master copy + push into built site)
+app.post('/api/clients/:id/photo', async (c) => {
+  const id = Number(c.req.param('id'));
+  const { b64, ext = 'jpg', n = 1 } = await c.req.json();
+  if (!b64) return c.json({ error: 'b64 required' }, 400);
+  const slot = Math.min(6, Math.max(1, Number(n) || 1));
+  const safeExt = ['png', 'jpg', 'webp'].includes(ext) ? ext : 'jpg';
+  const mime = safeExt === 'webp' ? 'image/webp' : safeExt === 'png' ? 'image/png' : 'image/jpeg';
+  const clean = b64.replace(/^data:[^,]+,/, '');
+  if (clean.length > 4_000_000) return c.json({ error: 'photo too large — keep under ~3MB' }, 400);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  await db.prepare(`INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
+    VALUES (?, ?, ?, ?, 1, datetime('now'))
+    ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, content_type=excluded.content_type, updated_at=datetime('now')`)
+    .bind(`_assets-${id}`, `photo-${slot}`, clean, mime).run();
+  let applied = false;
+  const metas = (await db.prepare(`SELECT slug, content FROM site_files WHERE path='site-meta.json'`).all()).results || [];
+  let slug = null;
+  for (const m of metas) { try { if (JSON.parse(m.content).client_id === id) { slug = m.slug; break; } } catch {} }
+  if (slug && c.env.GITHUB_TOKEN) {
+    const settings = await getSettings(db);
+    const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+    const path = `sites/${slug}/img/client-photo-${slot}.${safeExt}`;
+    const ghHeaders = { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+    const getRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, { headers: ghHeaders });
+    const existing = getRes.ok ? await getRes.json() : null;
+    const putRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+      method: 'PUT', headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: `Client photo ${slot} → ${slug}`, content: clean, ...(existing?.sha ? { sha: existing.sha } : {}) }),
+    });
+    if (putRes.ok) {
+      await db.prepare(`INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
+        VALUES (?, ?, ?, ?, 1, datetime('now'))
+        ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, content_type=excluded.content_type, updated_at=datetime('now')`)
+        .bind(slug, `img/client-photo-${slot}.${safeExt}`, clean, mime).run();
+      applied = true;
+    }
+  }
+  await logEvent(db, id, 'photo_uploaded', `Client photo ${slot} uploaded 📷${applied ? ' — available on the live site' : ' (used at build time)'}`);
+  return c.json({ ok: true, slot, applied });
+});
+
+app.get('/api/clients/:id/photo/:n', async (c) => {
+  const row = await c.env.DB.prepare(`SELECT content, content_type FROM site_files WHERE slug=? AND path=?`)
+    .bind(`_assets-${Number(c.req.param('id'))}`, `photo-${Math.min(6, Math.max(1, Number(c.req.param('n')) || 1))}`).first();
+  if (!row) return c.text('no photo', 404);
+  const bytes = Uint8Array.from(atob(row.content), (ch) => ch.charCodeAt(0));
+  return c.body(bytes, 200, { 'Content-Type': row.content_type, 'Cache-Control': 'no-store' });
+});
+
 // Serve the stored logo for the dashboard preview
 app.get('/api/clients/:id/logo', async (c) => {
   const row = await c.env.DB.prepare(`SELECT content, content_type FROM site_files WHERE slug=? AND path='logo'`)
