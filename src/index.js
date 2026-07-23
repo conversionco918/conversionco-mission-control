@@ -526,6 +526,32 @@ app.get('/api/revision-done/:key', async (c) => {
   return c.json({ ok: true });
 });
 
+// Deliverability test (keyed): sends a styled test email so inbox placement can be verified
+app.get('/api/test-email/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const to = String(c.req.query('to') || '').trim();
+  if (!/.+@.+\..+/.test(to)) return c.json({ ok: false, error: 'valid ?to= required' });
+  const settings = await getSettings(c.env.DB);
+  if (!c.env.GHL_TOKEN || !settings.ghl_location_id) return c.json({ ok: false, error: 'GHL not configured' });
+  const stamp = String(c.req.query('stamp') || Date.now());
+  const link = `${BASE_URL}/portfolio.json`;
+  try {
+    const ghl = new GHL(c.env.GHL_TOKEN, settings.ghl_location_id);
+    const contact = await ghl.upsertContact({ email: to, name: 'Deliverability Test' });
+    await ghl.sendEmail({
+      contactId: contact.id || contact.contactId,
+      subject: `Quick test from ConversionCo (${stamp.slice(-6)})`,
+      html: `<p>Hi there,</p>
+<p>This is a quick delivery test from the ConversionCo system on our new sending setup. If you're reading this in your <b>inbox</b>, everything is working exactly as it should.</p>
+<p style="margin:24px 0;"><a href="${link}" style="background:#0B1D33;color:#ffffff;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:bold;">Test the Button &rarr;</a></p>
+<p style="font-size:12.5px;color:#667788;">Button not working? Copy this link into your browser:<br><span style="color:#0B1D33;word-break:break-all;">${link}</span></p>
+<p>Talk soon,<br>The ConversionCo Team</p>`,
+      emailFrom: settings.email_from || undefined,
+    });
+    return c.json({ ok: true, to, stamp });
+  } catch (e) { return c.json({ ok: false, error: String(e.message || e) }); }
+});
+
 // Self-hosted intake forms (mobile-bulletproof — no funnel builder in the path)
 app.get('/form/1', (c) => c.html(form1Html));
 app.get('/form/2', (c) => c.html(form2Html));
