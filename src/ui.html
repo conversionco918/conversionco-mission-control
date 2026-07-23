@@ -328,7 +328,8 @@ function openDrawer(id) {
       <div>
         <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Share links</label>
         <div class="actions">
-          <button class="btn btn-ghost" onclick="copyLink(${c.id}, 'portal', this)">🔗 Copy client portal link</button>
+          <button class="btn btn-green" onclick="sendPortalInvite(${c.id}, this)">📧 Email portal login to client</button>
+          <button class="btn btn-ghost" onclick="copyLink(${c.id}, 'portal', this)">🔗 Copy portal link</button>
           <button class="btn btn-ghost" onclick="copyLink(${c.id}, 'pitch', this)">✨ Copy pitch page link</button>
         </div>
         <p style="font-size:11px;color:#94a3b8;margin-top:6px;">Portal = their live dashboard (send after purchase). Pitch = personalized proposal page (send before/during the pricing call).</p>
@@ -487,6 +488,15 @@ async function queueRevision(id, btn) {
   document.getElementById('revInput').value = '';
   toast('Revision queued ✏️ — it applies automatically within the hour');
   refresh(); setTimeout(() => openDrawer(id), 400);
+}
+async function sendPortalInvite(id, btn) {
+  if (!confirm('Email this client their private portal login link?')) return;
+  btn.disabled = true;
+  const r = await api(`/api/clients/${id}/portal-invite`, { method:'POST', body: '{}' });
+  btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error);
+  toast('Portal login emailed 🔑');
+  refresh();
 }
 async function copyLink(id, kind, btn) {
   btn.disabled = true;

@@ -926,6 +926,38 @@ app.get('/api/clients/:id/revisions', async (c) => {
   return c.json({ revisions: rows });
 });
 
+// Email the client their portal login (magic link)
+app.post('/api/clients/:id/portal-invite', async (c) => {
+  const id = Number(c.req.param('id'));
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  if (!client.email) return c.json({ error: 'client has no email' }, 400);
+  const settings = await getSettings(db);
+  if (!c.env.GHL_TOKEN || !settings.ghl_location_id) return c.json({ error: 'GHL not configured' }, 500);
+  const url = `${BASE_URL}/portal/${id}/${await portalToken(c.env, 'portal', id)}`;
+  const biz = client.business_name || client.name || 'your business';
+  const first = (client.name || '').split(' ')[0] || 'there';
+  try {
+    const ghl = ghlFor(c.env, settings);
+    const contact = await ghl.upsertContact({ email: client.email, name: client.name || '' });
+    await ghl.sendEmail({
+      contactId: contact.id || contact.contactId,
+      subject: `Your private client portal is live 🔑 — ${biz}`,
+      html: `<p>Hi ${first},</p>
+<p>Your project now has a <b>live client portal</b> — your window into everything we're doing for ${biz}: where your project stands, your website's SEO score, uptime monitoring, and every piece of content we publish for you.</p>
+<p style="margin:26px 0;"><a href="${url}" style="background:#0B1D33;color:#ffffff;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:bold;">Open My Portal &rarr;</a></p>
+<p>This link is your personal key — no password needed. Bookmark it and check in any time; it updates in real time as we work.</p>
+<p>Talk soon,<br>The ConversionCo Team</p>`,
+      emailFrom: settings.email_from || undefined,
+    });
+    await logEvent(db, id, 'portal_invited', `Portal login emailed to ${client.email} 🔑`);
+    return c.json({ ok: true });
+  } catch (e) {
+    return c.json({ error: 'Email failed: ' + e.message }, 502);
+  }
+});
+
 app.get('/api/clients/:id/leads', async (c) => {
   const id = Number(c.req.param('id'));
   const rows = (await c.env.DB.prepare('SELECT * FROM leads WHERE client_id = ? ORDER BY id DESC LIMIT 12').bind(id).all()).results || [];
