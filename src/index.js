@@ -38,6 +38,7 @@ async function ensureSchema(db) {
   await db.batch(SCHEMA_SQL.map((s) => db.prepare(s)));
   // additive migrations (safe to fail if the column already exists)
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN theme TEXT DEFAULT ''`).run(); } catch {}
+  try { await db.prepare(`ALTER TABLE clients ADD COLUMN tier TEXT DEFAULT 'standard'`).run(); } catch {}
   schemaReady = true;
 }
 
@@ -544,7 +545,7 @@ app.patch('/api/clients/:id', async (c) => {
   const id = Number(c.req.param('id'));
   const body = await c.req.json();
   const allowed = {};
-  for (const k of ['stage', 'notes', 'name', 'phone', 'business_name', 'preview_url', 'live_url', 'theme']) {
+  for (const k of ['stage', 'notes', 'name', 'phone', 'business_name', 'preview_url', 'live_url', 'theme', 'tier']) {
     if (k in body) allowed[k] = body[k];
   }
   if (!Object.keys(allowed).length) return c.json({ error: 'nothing to update' }, 400);

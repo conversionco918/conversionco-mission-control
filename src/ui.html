@@ -263,6 +263,19 @@ function openDrawer(id) {
       </div>
       ${c.preview_url ? `<div class="kv"><b>Preview site</b><a href="${esc(c.preview_url)}" target="_blank">${esc(c.preview_url)}</a></div>` : ''}
       <div>
+        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Website tier — set after the pricing call</label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <button class="themesw${(c.tier||'standard')==='standard' ? ' sel' : ''}" onclick="setTier(${c.id}, 'standard', this)">
+            <span style="font-size:12px;font-weight:600;color:#334155;">Standard${(c.tier||'standard')==='standard' ? ' ✓' : ''}</span>
+            <span style="font-size:10.5px;color:#64748b;">Framework site — 6 pages</span>
+          </button>
+          <button class="themesw${c.tier==='premium' ? ' sel' : ''}" onclick="setTier(${c.id}, 'premium', this)">
+            <span style="font-size:12px;font-weight:600;color:#7c3aed;">★ Premium${c.tier==='premium' ? ' ✓' : ''}</span>
+            <span style="font-size:10.5px;color:#64748b;">+ drip pages, city pages, weekly blog</span>
+          </button>
+        </div>
+      </div>
+      <div>
         <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Theme ${c.preview_url ? '— one click restyles the live preview' : '— picked now, applied automatically when the site is built'}</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap;">
           ${THEMES.map(t => `
@@ -299,6 +312,13 @@ const THEMES = [
   { key: 'fresh-clinical', label: 'Fresh Clinical', dots: ['#0E2E32', '#2FA8B5', '#FDFEFE'] },
   { key: 'rose-spa',       label: 'Rosé Spa',       dots: ['#2E1B26', '#C98A7D', '#FBF6F3'] },
 ];
+async function setTier(id, tier, btn) {
+  btn.disabled = true;
+  await api(`/api/clients/${id}`, { method:'PATCH', body: JSON.stringify({ tier }) });
+  btn.disabled = false;
+  toast(tier === 'premium' ? 'Upgraded to ★ Premium — SEO engine will be included in the build' : 'Set to Standard');
+  refresh(); openDrawer(id);
+}
 async function applyTheme(id, theme, btn) {
   btn.disabled = true;
   const r = await api(`/api/clients/${id}/theme`, { method:'POST', body: JSON.stringify({ theme }) });
