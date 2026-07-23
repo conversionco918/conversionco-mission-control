@@ -290,6 +290,18 @@ function openDrawer(id) {
       ${intakeBlock('Intake 1 — Client details', c.intake1_data)}
       ${intakeBlock('Intake 2 — Website vision', c.intake2_data)}
       <div>
+        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Launch &amp; Ranking Checklist</label>
+        <div class="intake" style="padding:12px 14px;">
+          ${LAUNCH_ITEMS.map(it => {
+            const done = getChecklist(c)[it.k];
+            return `<label style="display:flex;gap:9px;align-items:flex-start;padding:6px 0;font-size:13px;cursor:pointer;${done?'color:#059669;':''}">
+              <input type="checkbox" ${done?'checked':''} onchange="toggleLaunch(${c.id}, '${it.k}', this.checked)" style="width:auto;margin-top:2px;">
+              <span><b style="font-weight:600;">${it.t}</b><br><span style="color:#94a3b8;font-size:11.5px;">${it.d}</span></span>
+            </label>`;
+          }).join('')}
+        </div>
+      </div>
+      <div>
         <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:5px;">Stage (manual override)</label>
         <select onchange="patchClient(${c.id}, {stage: this.value})">
           ${Object.entries(STAGES).map(([k,v]) => `<option value="${k}" ${k===c.stage?'selected':''}>${v.label}</option>`).join('')}
@@ -305,6 +317,24 @@ function openDrawer(id) {
 }
 function closeDrawer(){ document.getElementById('drawer').classList.remove('open'); document.getElementById('overlay').classList.remove('open'); }
 async function patchClient(id, body, quiet) { await api(`/api/clients/${id}`, { method:'PATCH', body: JSON.stringify(body) }); if (!quiet) { toast('Updated ✓'); refresh(); } }
+const LAUNCH_ITEMS = [
+  { k:'domain',    t:'Domain connected',              d:'Client domain pointed at the site in Cloudflare' },
+  { k:'gbp',       t:'Google Business Profile live',  d:'Created, verified, category "IV therapy service" / "Medical spa"' },
+  { k:'gbp_full',  t:'GBP fully built out',           d:'Photos, services with prices, hours, booking link, description' },
+  { k:'reviewlink',t:'Review link wired',             d:'GBP review link added to the site review funnel + texted after visits' },
+  { k:'gsc',       t:'Search Console verified',       d:'Property verified, ownership confirmed' },
+  { k:'sitemap',   t:'Sitemap submitted',             d:'sitemap.xml submitted in Search Console' },
+  { k:'citations', t:'Core citations placed',         d:'Yelp, Apple Maps, Bing Places, Healthgrades, Nextdoor — identical name/phone' },
+  { k:'reviews5',  t:'First 5 reviews collected',     d:'Ask the 5 happiest clients — velocity matters more than volume' },
+];
+function getChecklist(c){ try { return JSON.parse(c.launch_checklist||'{}'); } catch { return {}; } }
+async function toggleLaunch(id, key, val){
+  const c = STATE.clients.find(x=>x.id===id); const cl = getChecklist(c); cl[key]=val;
+  c.launch_checklist = JSON.stringify(cl);
+  await api(`/api/clients/${id}`, { method:'PATCH', body: JSON.stringify({ launch_checklist: c.launch_checklist }) });
+  const done = LAUNCH_ITEMS.filter(i=>cl[i.k]).length;
+  toast(`Launch checklist: ${done}/${LAUNCH_ITEMS.length}`);
+}
 const THEMES = [
   { key: 'warm-luxury',    label: 'Warm Luxury',    dots: ['#1A1512', '#A8874F', '#F7F4EF'] },
   { key: 'soft-neutrals',  label: 'Soft Neutrals',  dots: ['#282019', '#B08D57', '#FAF8F4'] },
