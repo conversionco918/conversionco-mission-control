@@ -299,8 +299,12 @@ app.get('/debug/:key', async (c) => {
       return out;
     })(),
     tiers: await (async () => {
-      const rows = (await c.env.DB.prepare('SELECT id, email, business_name, tier, stage FROM clients').all()).results || [];
-      return rows;
+      const rows = (await c.env.DB.prepare('SELECT id, email, business_name, tier, stage, billing FROM clients').all()).results || [];
+      return rows.map((r) => {
+        let b = {}; try { b = JSON.parse(r.billing || '{}'); } catch {}
+        return { id: r.id, email: r.email, business_name: r.business_name, tier: r.tier, stage: r.stage,
+          paid: b.invoice_status === 'paid', hosting: b.sub_status === 'active' };
+      });
     })(),
     scores: await (async () => {
       const rows = (await c.env.DB.prepare('SELECT * FROM clients').all()).results || [];
