@@ -562,6 +562,60 @@ app.delete('/api/clients/:id', async (c) => {
   return c.json({ ok: true });
 });
 
+// Client logo: upload (stores master copy; also pushes into the client's site if built)
+app.post('/api/clients/:id/logo', async (c) => {
+  const id = Number(c.req.param('id'));
+  const { b64, ext = 'png' } = await c.req.json();
+  if (!b64) return c.json({ error: 'b64 required' }, 400);
+  const safeExt = ['png', 'jpg', 'webp'].includes(ext) ? ext : 'png';
+  const mime = safeExt === 'webp' ? 'image/webp' : safeExt === 'jpg' ? 'image/jpeg' : 'image/png';
+  const clean = b64.replace(/^data:[^,]+,/, '');
+  if (clean.length > 2_600_000) return c.json({ error: 'logo too large — keep it under ~1.8MB' }, 400);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  // master copy (slug outside sites/ namespace, never published)
+  await db.prepare(`INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
+    VALUES (?, 'logo', ?, ?, 1, datetime('now'))
+    ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, content_type=excluded.content_type, updated_at=datetime('now')`)
+    .bind(`_assets-${id}`, clean, mime).run();
+  // if a site exists, push the logo into it (GitHub + D1) as img/logo.<ext>
+  let applied = false;
+  const metas = (await db.prepare(`SELECT slug, content FROM site_files WHERE path='site-meta.json'`).all()).results || [];
+  let slug = null;
+  for (const m of metas) { try { if (JSON.parse(m.content).client_id === id) { slug = m.slug; break; } } catch {} }
+  if (slug && c.env.GITHUB_TOKEN) {
+    const settings = await getSettings(db);
+    const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+    const path = `sites/${slug}/img/logo.${safeExt}`;
+    const ghHeaders = { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+    const getRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, { headers: ghHeaders });
+    const existing = getRes.ok ? await getRes.json() : null;
+    const putRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+      method: 'PUT', headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: `Client logo → ${slug}`, content: clean, ...(existing?.sha ? { sha: existing.sha } : {}) }),
+    });
+    if (putRes.ok) {
+      await db.prepare(`INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
+        VALUES (?, ?, ?, ?, 1, datetime('now'))
+        ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, content_type=excluded.content_type, updated_at=datetime('now')`)
+        .bind(slug, `img/logo.${safeExt}`, clean, mime).run();
+      applied = true;
+    }
+  }
+  await logEvent(db, id, 'logo_uploaded', applied ? 'Logo uploaded and pushed to the live site 🖼' : 'Logo uploaded 🖼 (will be used at build time)');
+  return c.json({ ok: true, applied });
+});
+
+// Serve the stored logo for the dashboard preview
+app.get('/api/clients/:id/logo', async (c) => {
+  const row = await c.env.DB.prepare(`SELECT content, content_type FROM site_files WHERE slug=? AND path='logo'`)
+    .bind(`_assets-${Number(c.req.param('id'))}`).first();
+  if (!row) return c.text('no logo', 404);
+  const bytes = Uint8Array.from(atob(row.content), (ch) => ch.charCodeAt(0));
+  return c.body(bytes, 200, { 'Content-Type': row.content_type, 'Cache-Control': 'no-store' });
+});
+
 // Apply a preset theme to a client's site: rewrites design tokens in site.css,
 // commits to GitHub and updates D1 so the preview restyles immediately.
 app.post('/api/clients/:id/theme', async (c) => {

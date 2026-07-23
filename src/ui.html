@@ -290,6 +290,18 @@ function openDrawer(id) {
       ${intakeBlock('Intake 1 — Client details', c.intake1_data)}
       ${intakeBlock('Intake 2 — Website vision', c.intake2_data)}
       <div>
+        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Client logo</label>
+        <div style="display:flex;gap:14px;align-items:center;">
+          <img id="logoPrev" src="/api/clients/${c.id}/logo?cb=${Date.now()}" alt="" style="height:52px;max-width:150px;object-fit:contain;border:1px solid #e2e8f0;border-radius:8px;padding:4px;background:#fff;" onerror="this.style.display='none';document.getElementById('logoNone').style.display='inline'">
+          <span id="logoNone" style="display:none;font-size:12px;color:#94a3b8;">No logo yet</span>
+          <label class="btn btn-ghost" style="cursor:pointer;">
+            Upload logo
+            <input type="file" accept="image/png,image/jpeg,image/webp" style="display:none" onchange="uploadLogo(${c.id}, this)">
+          </label>
+        </div>
+        <p style="font-size:11px;color:#94a3b8;margin-top:6px;">PNG with transparent background works best. It's used on their website automatically — and always links home.</p>
+      </div>
+      <div>
         <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Launch &amp; Ranking Checklist</label>
         <div class="intake" style="padding:12px 14px;">
           ${LAUNCH_ITEMS.map(it => {
@@ -317,6 +329,17 @@ function openDrawer(id) {
 }
 function closeDrawer(){ document.getElementById('drawer').classList.remove('open'); document.getElementById('overlay').classList.remove('open'); }
 async function patchClient(id, body, quiet) { await api(`/api/clients/${id}`, { method:'PATCH', body: JSON.stringify(body) }); if (!quiet) { toast('Updated ✓'); refresh(); } }
+async function uploadLogo(id, input) {
+  const f = input.files[0]; if (!f) return;
+  if (f.size > 1_800_000) return toast('⚠ Logo too large — keep it under 1.8MB');
+  const ext = f.type.includes('webp') ? 'webp' : f.type.includes('jpeg') ? 'jpg' : 'png';
+  const b64 = await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(f); });
+  toast('Uploading logo…');
+  const r = await api(`/api/clients/${id}/logo`, { method:'POST', body: JSON.stringify({ b64, ext }) });
+  if (r.error) return toast('⚠ ' + r.error);
+  toast(r.applied ? 'Logo uploaded — live on their site 🖼' : 'Logo saved — will be used when the site is built 🖼');
+  refresh(); openDrawer(id);
+}
 const LAUNCH_ITEMS = [
   { k:'domain',    t:'Domain connected',              d:'Client domain pointed at the site in Cloudflare' },
   { k:'gbp',       t:'Google Business Profile live',  d:'Created, verified, category "IV therapy service" / "Medical spa"' },
