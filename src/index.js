@@ -306,6 +306,16 @@ app.get('/debug/:key', async (c) => {
           paid: b.invoice_status === 'paid', hosting: b.sub_status === 'active' };
       });
     })(),
+    buildQueue: await (async () => {
+      const rows = (await c.env.DB.prepare(`SELECT * FROM clients WHERE stage IN ('intake2_done','generating')`).all()).results || [];
+      return rows.map((r) => {
+        let b = {}; try { b = JSON.parse(r.billing || '{}'); } catch {}
+        return { id: r.id, email: r.email, name: r.name, business_name: r.business_name,
+          tier: r.tier || 'standard', theme: r.theme || '', vibe: r.vibe || '',
+          paid: b.invoice_status === 'paid',
+          intake1: r.intake1_data || '', intake2: r.intake2_data || '' };
+      });
+    })(),
     scores: await (async () => {
       const rows = (await c.env.DB.prepare('SELECT * FROM clients').all()).results || [];
       const settings2 = await getSettings(c.env.DB);
