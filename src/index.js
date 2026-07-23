@@ -1046,6 +1046,29 @@ app.delete('/api/clients/:id', async (c) => {
   return c.json({ ok: true });
 });
 
+async function sendPortalEmail(env, db, client, settings) {
+  if (!client?.email || !env.GHL_TOKEN || !settings.ghl_location_id) return false;
+  const url = `${BASE_URL}/portal/${client.id}/${await portalToken(env, 'portal', client.id)}`;
+  const biz = client.business_name || client.name || 'your business';
+  const first = (client.name || '').split(' ')[0] || 'there';
+  try {
+    const ghl = new GHL(env.GHL_TOKEN, settings.ghl_location_id);
+    const contact = await ghl.upsertContact({ email: client.email, name: client.name || '' });
+    await ghl.sendEmail({
+      contactId: contact.id || contact.contactId,
+      subject: `Welcome aboard! Your private client portal 🔑 — ${biz}`,
+      html: `<p>Hi ${first},</p>
+<p>You're officially on the books — and your <b>private client portal</b> is live. It's your window into everything we do for ${biz}: watch your website get built stage by stage, see your SEO score, your uptime monitoring, and every piece of content we publish for you.</p>
+<p style="margin:24px 0;"><a href="${url}" style="background:#0B1D33;color:#ffffff;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:bold;">Open My Portal &rarr;</a></p>
+<p>This link is your personal key — no password needed. Bookmark it; it updates in real time. You can also message us directly from inside it any time.</p>
+<p>Talk soon,<br>The ConversionCo Team</p>`,
+      emailFrom: settings.email_from || undefined,
+    });
+    await logEvent(db, client.id, 'portal_invited', `Portal login auto-sent to ${client.email} 🔑`);
+    return true;
+  } catch { return false; }
+}
+
 // ---------------- Stripe billing ----------------
 function getBilling(client) { try { return JSON.parse(client.billing || '{}'); } catch { return {}; } }
 
@@ -1106,6 +1129,8 @@ async function pollBilling(env) {
           if (st.paid) {
             billing.paid_at = new Date().toISOString();
             await logEvent(db, client.id, 'invoice_paid', `Invoice PAID — ${PRICES[billing.invoice_tier || 'standard'].display} 🎉💰`);
+            const settingsP = await getSettings(db);
+            await sendPortalEmail(env, db, client, settingsP);
           }
           changed++;
         }
@@ -1138,6 +1163,8 @@ app.post('/api/clients/:id/billing-bypass', async (c) => {
   } else {
     billing.invoice_status = 'paid'; billing.invoice_bypass = true; billing.paid_at = new Date().toISOString();
     await logEvent(db, id, 'invoice_paid', 'Invoice marked PAID manually (bypass — paid outside Stripe) 🔓💰');
+    const settingsB = await getSettings(db);
+    await sendPortalEmail(c.env, db, client, settingsB);
   }
   await touchClient(db, id, { billing: JSON.stringify(billing) });
   return c.json({ ok: true });
@@ -1243,6 +1270,7 @@ app.get('/api/clients/:id/links', async (c) => {
   return c.json({
     portal: `${BASE_URL}/portal/${id}/${await portalToken(c.env, 'portal', id)}`,
     pitch: `${BASE_URL}/pitch/${id}/${await portalToken(c.env, 'pitch', id)}`,
+    agreement: `${BASE_URL}/agreement/${id}/${await portalToken(c.env, 'agr', id)}`,
   });
 });
 
