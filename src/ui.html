@@ -54,6 +54,7 @@
   .themesw { background:#fff; border:1px solid #e2e8f0; border-radius:10px; padding:8px 10px; cursor:pointer; display:flex; flex-direction:column; align-items:center; transition:all .15s; }
   .themesw:hover { border-color:#94a3b8; transform:translateY(-1px); box-shadow:0 2px 8px rgba(0,0,0,.08); }
   .themesw:disabled { opacity:.5; cursor:wait; }
+  .themesw.sel { border-color:#059669; box-shadow:0 0 0 2px rgba(5,150,105,.2); }
   /* drawer */
   #overlay { position: fixed; inset: 0; background: rgba(7,27,51,.45); display: none; z-index: 30; }
   #drawer { position: fixed; top: 0; right: -560px; width: min(560px, 100vw); height: 100vh; background: #fff; z-index: 31; transition: right .25s ease; overflow-y: auto; box-shadow: -12px 0 40px rgba(0,0,0,.2); }
@@ -261,17 +262,17 @@ function openDrawer(id) {
         <button class="btn btn-red" onclick="delClient(${c.id})">Remove</button>
       </div>
       ${c.preview_url ? `<div class="kv"><b>Preview site</b><a href="${esc(c.preview_url)}" target="_blank">${esc(c.preview_url)}</a></div>` : ''}
-      ${c.preview_url ? `<div>
-        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Theme — one click restyles the whole site</label>
+      <div>
+        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Theme ${c.preview_url ? '— one click restyles the live preview' : '— picked now, applied automatically when the site is built'}</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap;">
           ${THEMES.map(t => `
-            <button class="themesw" onclick="applyTheme(${c.id}, '${t.key}', this)" title="Apply ${t.label}">
+            <button class="themesw${c.theme === t.key ? ' sel' : ''}" onclick="applyTheme(${c.id}, '${t.key}', this)" title="Apply ${t.label}">
               <span style="display:flex;gap:3px;margin-bottom:4px;">${t.dots.map(d => `<span style="width:14px;height:14px;border-radius:50%;background:${d};border:1px solid rgba(0,0,0,.15);"></span>`).join('')}</span>
-              <span style="font-size:11px;color:#475569;">${t.label}</span>
+              <span style="font-size:11px;color:#475569;">${t.label}${c.theme === t.key ? ' ✓' : ''}</span>
             </button>`).join('')}
         </div>
-        <p style="font-size:11px;color:#94a3b8;margin-top:6px;">Colors update on the preview within a few seconds — refresh the preview tab after applying.</p>
-      </div>` : ''}
+        <p style="font-size:11px;color:#94a3b8;margin-top:6px;">${c.preview_url ? 'Colors update within a few seconds — refresh the preview tab after applying.' : 'The generator reads this choice the moment the build starts.'}</p>
+      </div>
       ${c.live_url ? `<div class="kv"><b>Live site</b><a href="${esc(c.live_url)}" target="_blank">${esc(c.live_url)}</a></div>` : ''}
       ${intakeBlock('Intake 1 — Client details', c.intake1_data)}
       ${intakeBlock('Intake 2 — Website vision', c.intake2_data)}
@@ -303,7 +304,7 @@ async function applyTheme(id, theme, btn) {
   const r = await api(`/api/clients/${id}/theme`, { method:'POST', body: JSON.stringify({ theme }) });
   btn.disabled = false;
   if (r.error) return toast('⚠ ' + r.error);
-  toast(`Theme "${r.label}" applied 🎨 — refresh the preview tab`);
+  toast(r.applied ? `Theme "${r.label}" applied 🎨 — refresh the preview tab` : `Theme "${r.label}" saved 🎨 — the site will be built in this theme`);
   refresh();
 }
 async function resendIntake1(email, btn) { btn.disabled = true; const r = await api('/api/clients', { method:'POST', body: JSON.stringify({ email }) }); btn.disabled = false; if (r.error) return toast('⚠ ' + r.error); toast('Intake 1 sent ✓'); closeDrawer(); refresh(); }

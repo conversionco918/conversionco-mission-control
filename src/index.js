@@ -36,6 +36,8 @@ let schemaReady = false;
 async function ensureSchema(db) {
   if (schemaReady) return;
   await db.batch(SCHEMA_SQL.map((s) => db.prepare(s)));
+  // additive migrations (safe to fail if the column already exists)
+  try { await db.prepare(`ALTER TABLE clients ADD COLUMN theme TEXT DEFAULT ''`).run(); } catch {}
   schemaReady = true;
 }
 
@@ -542,7 +544,7 @@ app.patch('/api/clients/:id', async (c) => {
   const id = Number(c.req.param('id'));
   const body = await c.req.json();
   const allowed = {};
-  for (const k of ['stage', 'notes', 'name', 'phone', 'business_name', 'preview_url', 'live_url']) {
+  for (const k of ['stage', 'notes', 'name', 'phone', 'business_name', 'preview_url', 'live_url', 'theme']) {
     if (k in body) allowed[k] = body[k];
   }
   if (!Object.keys(allowed).length) return c.json({ error: 'nothing to update' }, 400);
@@ -568,10 +570,15 @@ app.post('/api/clients/:id/theme', async (c) => {
   const db = c.env.DB;
   const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
   if (!client) return c.json({ error: 'client not found' }, 404);
+  // always remember the choice — the site generator uses it at build time
+  await touchClient(db, id, { theme });
   const metas = (await db.prepare(`SELECT slug, content FROM site_files WHERE path='site-meta.json'`).all()).results || [];
   let slug = null;
   for (const m of metas) { try { if (JSON.parse(m.content).client_id === id) { slug = m.slug; break; } } catch {} }
-  if (!slug) return c.json({ error: 'no generated site found for this client yet' }, 404);
+  if (!slug) {
+    await logEvent(db, id, 'theme_changed', `Theme preselected: ${t.label} 🎨 (will style the site at build time)`);
+    return c.json({ ok: true, saved: true, applied: false, theme, label: t.label });
+  }
   const cssRow = await db.prepare(`SELECT content FROM site_files WHERE slug=? AND path='site.css'`).bind(slug).first();
   if (!cssRow) return c.json({ error: 'site.css not found' }, 404);
   let css = cssRow.content;
@@ -594,7 +601,7 @@ app.post('/api/clients/:id/theme', async (c) => {
   if (!putRes.ok) return c.json({ error: `GitHub commit failed: ${putRes.status}` }, 502);
   await db.prepare(`UPDATE site_files SET content=?, updated_at=datetime('now') WHERE slug=? AND path='site.css'`).bind(css, slug).run();
   await logEvent(db, id, 'theme_changed', `Theme set to ${t.label} 🎨`);
-  return c.json({ ok: true, slug, theme, label: t.label });
+  return c.json({ ok: true, saved: true, applied: true, slug, theme, label: t.label });
 });
 
 // ---------------- API: settings & GHL utilities ----------------
