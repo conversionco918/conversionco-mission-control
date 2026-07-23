@@ -1212,8 +1212,10 @@ async function sendPortalEmail(env, db, client, settings) {
 }
 
 // Best-effort SMS alongside key emails — clients can't miss the notification.
-// Silently skips if the contact has no phone or no SMS number is configured in GHL.
+// DISABLED per Tiffany (7/23): flip SMS_ENABLED to true to turn texts back on.
+const SMS_ENABLED = false;
 async function trySMS(ghl, db, clientId, contactId, message) {
+  if (!SMS_ENABLED) return false;
   try {
     await ghl.sendSMS({ contactId, message });
     await logEvent(db, clientId, 'sms_sent', `📱 Text sent: "${message.slice(0, 70)}…"`);
