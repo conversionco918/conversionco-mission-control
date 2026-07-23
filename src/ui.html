@@ -285,6 +285,14 @@ function openDrawer(id) {
             </button>`).join('')}
         </div>
         <p style="font-size:11px;color:#94a3b8;margin-top:6px;">${c.preview_url ? 'Colors update within a few seconds — refresh the preview tab after applying.' : 'The generator reads this choice the moment the build starts.'}</p>
+        <div style="margin-top:12px;">
+          <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:5px;">…or describe the vibe in your own words</label>
+          <div style="display:flex;gap:8px;">
+            <input id="vibeInput" type="text" placeholder="e.g. moody and romantic · beachy but high-end · clean energizing spa" value="${esc(c.vibe || '')}" style="flex:1;padding:10px 12px;border:1.5px solid #e2e8f0;border-radius:8px;font-size:13px;">
+            <button class="btn btn-primary" onclick="applyVibe(${c.id}, this)">Apply vibe</button>
+          </div>
+          <p style="font-size:11px;color:#94a3b8;margin-top:6px;">Colors change instantly. The words also save as this client's vibe brief — fonts, photo mood, and copy tone follow it at the next build or tweak round.</p>
+        </div>
       </div>
       ${c.live_url ? `<div class="kv"><b>Live site</b><a href="${esc(c.live_url)}" target="_blank">${esc(c.live_url)}</a></div>` : ''}
       ${intakeBlock('Intake 1 — Client details', c.intake1_data)}
@@ -339,6 +347,16 @@ async function uploadLogo(id, input) {
   if (r.error) return toast('⚠ ' + r.error);
   toast(r.applied ? 'Logo uploaded — live on their site 🖼' : 'Logo saved — will be used when the site is built 🖼');
   refresh(); openDrawer(id);
+}
+async function applyVibe(id, btn) {
+  const v = document.getElementById('vibeInput').value.trim();
+  if (!v) return toast('Type a feeling first — e.g. "moody and romantic"');
+  btn.disabled = true;
+  const r = await api(`/api/clients/${id}/vibe`, { method:'POST', body: JSON.stringify({ vibe: v }) });
+  btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error);
+  toast(r.applied ? `Vibe applied: ${r.label} 🎨 — refresh the preview` : `Vibe saved: ${r.label} 🎨 — used at build time`);
+  refresh();
 }
 const LAUNCH_ITEMS = [
   { k:'domain',    t:'Domain connected',              d:'Client domain pointed at the site in Cloudflare' },

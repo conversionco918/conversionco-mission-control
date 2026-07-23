@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { GHL } from './ghl.js';
 import { DEFAULT_TEMPLATES, BOOKING_TEMPLATES, DEFAULT_SETTINGS, renderTemplate } from './emails.js';
 import { THEMES } from './themes.js';
+import { vibeToTokens } from './vibe.js';
 import dashboardHtml from './ui.html';
 import loginHtml from './login.html';
 
@@ -40,6 +41,7 @@ async function ensureSchema(db) {
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN theme TEXT DEFAULT ''`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN tier TEXT DEFAULT 'standard'`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN launch_checklist TEXT DEFAULT ''`).run(); } catch {}
+  try { await db.prepare(`ALTER TABLE clients ADD COLUMN vibe TEXT DEFAULT ''`).run(); } catch {}
   schemaReady = true;
 }
 
@@ -546,7 +548,7 @@ app.patch('/api/clients/:id', async (c) => {
   const id = Number(c.req.param('id'));
   const body = await c.req.json();
   const allowed = {};
-  for (const k of ['stage', 'notes', 'name', 'phone', 'business_name', 'preview_url', 'live_url', 'theme', 'tier', 'launch_checklist']) {
+  for (const k of ['stage', 'notes', 'name', 'phone', 'business_name', 'preview_url', 'live_url', 'theme', 'tier', 'launch_checklist', 'vibe']) {
     if (k in body) allowed[k] = body[k];
   }
   if (!Object.keys(allowed).length) return c.json({ error: 'nothing to update' }, 400);
@@ -560,6 +562,47 @@ app.delete('/api/clients/:id', async (c) => {
   await c.env.DB.prepare('DELETE FROM clients WHERE id = ?').bind(id).run();
   await logEvent(c.env.DB, id, 'client_deleted');
   return c.json({ ok: true });
+});
+
+// Free-text vibe → derived palette. Saves the brief; restyles the site if built.
+app.post('/api/clients/:id/vibe', async (c) => {
+  const id = Number(c.req.param('id'));
+  const { vibe } = await c.req.json();
+  if (!vibe || !String(vibe).trim()) return c.json({ error: 'describe the vibe first' }, 400);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  const { label, tokens } = vibeToTokens(vibe);
+  await touchClient(db, id, { vibe: String(vibe).slice(0, 400), theme: '' });
+  const metas = (await db.prepare(`SELECT slug, content FROM site_files WHERE path='site-meta.json'`).all()).results || [];
+  let slug = null;
+  for (const m of metas) { try { if (JSON.parse(m.content).client_id === id) { slug = m.slug; break; } } catch {} }
+  if (!slug) {
+    await logEvent(db, id, 'vibe_set', `Vibe brief saved: "${String(vibe).slice(0, 80)}" → ${label} 🎨 (applies at build)`);
+    return c.json({ ok: true, applied: false, label });
+  }
+  const cssRow = await db.prepare(`SELECT content FROM site_files WHERE slug=? AND path='site.css'`).bind(slug).first();
+  if (!cssRow) return c.json({ error: 'site.css not found' }, 404);
+  let css = cssRow.content;
+  for (const [k, v] of Object.entries(tokens)) {
+    css = css.replace(new RegExp('(' + k.replace(/-/g, '\\-') + '\\s*:\\s*)#[0-9A-Fa-f]{3,8}'), '$1' + v);
+  }
+  if (!c.env.GITHUB_TOKEN) return c.json({ error: 'GITHUB_TOKEN not set' }, 500);
+  const settings = await getSettings(db);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  const path = `sites/${slug}/site.css`;
+  const ghHeaders = { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+  const getRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, { headers: ghHeaders });
+  const existing = getRes.ok ? await getRes.json() : null;
+  const b64 = btoa(unescape(encodeURIComponent(css)));
+  const putRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+    method: 'PUT', headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: `Vibe: "${String(vibe).slice(0, 50)}" → ${slug}`, content: b64, ...(existing?.sha ? { sha: existing.sha } : {}) }),
+  });
+  if (!putRes.ok) return c.json({ error: `GitHub commit failed: ${putRes.status}` }, 502);
+  await db.prepare(`UPDATE site_files SET content=?, updated_at=datetime('now') WHERE slug=? AND path='site.css'`).bind(css, slug).run();
+  await logEvent(db, id, 'vibe_set', `Vibe applied: "${String(vibe).slice(0, 60)}" → ${label} 🎨`);
+  return c.json({ ok: true, applied: true, label });
 });
 
 // Client logo: upload (stores master copy; also pushes into the client's site if built)
