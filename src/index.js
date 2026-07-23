@@ -3,6 +3,7 @@ import { GHL } from './ghl.js';
 import { DEFAULT_TEMPLATES, BOOKING_TEMPLATES, DEFAULT_SETTINGS, renderTemplate } from './emails.js';
 import { THEMES } from './themes.js';
 import { vibeToTokens } from './vibe.js';
+import { PRICES, ensureCustomer, sendInvoice, invoiceStatus, hostingCheckout, checkoutStatus } from './stripe.js';
 import dashboardHtml from './ui.html';
 import loginHtml from './login.html';
 
@@ -42,6 +43,7 @@ async function ensureSchema(db) {
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN tier TEXT DEFAULT 'standard'`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN launch_checklist TEXT DEFAULT ''`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN vibe TEXT DEFAULT ''`).run(); } catch {}
+  try { await db.prepare(`ALTER TABLE clients ADD COLUMN billing TEXT DEFAULT ''`).run(); } catch {}
   schemaReady = true;
 }
 
@@ -564,6 +566,89 @@ app.delete('/api/clients/:id', async (c) => {
   return c.json({ ok: true });
 });
 
+// ---------------- Stripe billing ----------------
+function getBilling(client) { try { return JSON.parse(client.billing || '{}'); } catch { return {}; } }
+
+app.post('/api/clients/:id/invoice', async (c) => {
+  if (!c.env.STRIPE_SECRET_KEY) return c.json({ error: 'Add the STRIPE_SECRET_KEY secret to the worker first (Cloudflare → worker → Settings → Variables)' }, 400);
+  const id = Number(c.req.param('id'));
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  const tierKey = (client.tier === 'premium') ? 'premium' : 'standard';
+  try {
+    const cust = await ensureCustomer(c.env.STRIPE_SECRET_KEY, client.email, client.name || client.business_name || '');
+    const inv = await sendInvoice(c.env.STRIPE_SECRET_KEY, cust.id, tierKey, client.business_name || '');
+    const billing = getBilling(client);
+    billing.customer_id = cust.id;
+    billing.invoice_id = inv.id; billing.invoice_status = inv.status; billing.invoice_url = inv.url; billing.invoice_tier = tierKey;
+    await touchClient(db, id, { billing: JSON.stringify(billing) });
+    await logEvent(db, id, 'invoice_sent', `Stripe invoice sent — ${PRICES[tierKey].display} (${PRICES[tierKey].label}) 💳`);
+    return c.json({ ok: true, url: inv.url, display: PRICES[tierKey].display });
+  } catch (e) {
+    return c.json({ error: 'Stripe: ' + e.message }, 502);
+  }
+});
+
+app.post('/api/clients/:id/hosting', async (c) => {
+  if (!c.env.STRIPE_SECRET_KEY) return c.json({ error: 'Add the STRIPE_SECRET_KEY secret to the worker first' }, 400);
+  const id = Number(c.req.param('id'));
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  try {
+    const cust = await ensureCustomer(c.env.STRIPE_SECRET_KEY, client.email, client.name || client.business_name || '');
+    const ret = client.live_url || client.preview_url || 'https://conversionco918.com';
+    const sess = await hostingCheckout(c.env.STRIPE_SECRET_KEY, cust.id, client.business_name || '', ret);
+    const billing = getBilling(client);
+    billing.customer_id = cust.id;
+    billing.sub_session_id = sess.id; billing.sub_link = sess.url; billing.sub_status = 'pending';
+    await touchClient(db, id, { billing: JSON.stringify(billing) });
+    await logEvent(db, id, 'hosting_link', 'Hosting & security $49/mo — checkout link created 🔒');
+    return c.json({ ok: true, url: sess.url });
+  } catch (e) {
+    return c.json({ error: 'Stripe: ' + e.message }, 502);
+  }
+});
+
+async function pollBilling(env) {
+  if (!env.STRIPE_SECRET_KEY) return 0;
+  const db = env.DB;
+  const clients = (await db.prepare(`SELECT * FROM clients WHERE billing LIKE '%"invoice_status":"open"%' OR billing LIKE '%"sub_status":"pending"%'`).all()).results || [];
+  let changed = 0;
+  for (const client of clients) {
+    const billing = getBilling(client);
+    try {
+      if (billing.invoice_id && billing.invoice_status === 'open') {
+        const st = await invoiceStatus(env.STRIPE_SECRET_KEY, billing.invoice_id);
+        if (st.status !== billing.invoice_status) {
+          billing.invoice_status = st.status;
+          if (st.paid) {
+            billing.paid_at = new Date().toISOString();
+            await logEvent(db, client.id, 'invoice_paid', `Invoice PAID — ${PRICES[billing.invoice_tier || 'standard'].display} 🎉💰`);
+          }
+          changed++;
+        }
+      }
+      if (billing.sub_session_id && billing.sub_status === 'pending') {
+        const st = await checkoutStatus(env.STRIPE_SECRET_KEY, billing.sub_session_id);
+        if (st.complete) {
+          billing.sub_status = 'active'; billing.subscription_id = st.subscription;
+          await logEvent(db, client.id, 'hosting_active', 'Hosting & security $49/mo ACTIVE 🔒✅');
+          changed++;
+        }
+      }
+      if (changed) await touchClient(db, client.id, { billing: JSON.stringify(billing) });
+    } catch { /* keep polling others */ }
+  }
+  return changed;
+}
+
+app.post('/api/billing/poll', async (c) => {
+  const n = await pollBilling(c.env);
+  return c.json({ ok: true, changed: n });
+});
+
 // Free-text vibe → derived palette. Saves the brief; restyles the site if built.
 app.post('/api/clients/:id/vibe', async (c) => {
   const id = Number(c.req.param('id'));
@@ -1000,6 +1085,9 @@ export default {
     ));
     ctx.waitUntil(autoPublish(env, settings).catch((e) =>
       logEvent(env.DB, null, 'error', `Auto-publish failed: ${e.message}`)
+    ));
+    ctx.waitUntil(pollBilling(env).catch((e) =>
+      logEvent(env.DB, null, 'error', `Billing poll failed: ${e.message}`)
     ));
   },
 };

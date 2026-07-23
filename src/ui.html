@@ -276,6 +276,33 @@ function openDrawer(id) {
         </div>
       </div>
       <div>
+        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Billing — Stripe</label>
+        ${(() => {
+          const b = getBillingUI(c);
+          const price = c.tier === 'premium' ? '$649' : '$499';
+          let inv = '';
+          if (!b.invoice_id) {
+            inv = `<button class="btn btn-green" onclick="sendStripeInvoice(${c.id}, this)">💳 Send invoice — ${price}</button>`;
+          } else {
+            const chip = b.invoice_status === 'paid'
+              ? '<span class="chip" style="background:#ecfdf5;color:#059669">PAID ✓</span>'
+              : `<span class="chip" style="background:#fef9c3;color:#a16207">Invoice ${esc(b.invoice_status || 'open')}</span>`;
+            inv = `${chip} <a href="${esc(b.invoice_url || '#')}" target="_blank" style="font-size:12.5px;">view invoice</a>`;
+          }
+          let host = '';
+          if (b.sub_status === 'active') {
+            host = `<div style="margin-top:10px;"><span class="chip" style="background:#ecfdf5;color:#059669">🔒 Hosting & security $49/mo ACTIVE</span></div>`;
+          } else if (b.sub_link) {
+            host = `<div style="margin-top:10px;"><span class="chip" style="background:#fef9c3;color:#a16207">Hosting link sent — awaiting signup</span> <button class="btn btn-ghost" style="padding:6px 10px;font-size:12px" onclick="copyText('${esc(b.sub_link)}')">Copy link</button></div>`;
+          } else if (c.stage === 'preview_ready' || c.stage === 'live') {
+            host = `<div style="margin-top:10px;"><button class="btn btn-primary" onclick="startHosting(${c.id}, this)">🔒 Start $49/mo hosting & security</button><p style="font-size:11px;color:#94a3b8;margin-top:4px;">Your end-of-process confirm — creates a Stripe signup link to send the client.</p></div>`;
+          } else {
+            host = `<p style="font-size:11px;color:#94a3b8;margin-top:8px;">$49/mo hosting starts at the end — the button appears when the site is ready.</p>`;
+          }
+          return `<div>${inv}</div>${host}`;
+        })()}
+      </div>
+      <div>
         <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Theme ${c.preview_url ? '— one click restyles the live preview' : '— picked now, applied automatically when the site is built'}</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap;">
           ${THEMES.map(t => `
@@ -348,6 +375,27 @@ async function uploadLogo(id, input) {
   toast(r.applied ? 'Logo uploaded — live on their site 🖼' : 'Logo saved — will be used when the site is built 🖼');
   refresh(); openDrawer(id);
 }
+function getBillingUI(c){ try { return JSON.parse(c.billing||'{}'); } catch { return {}; } }
+async function sendStripeInvoice(id, btn) {
+  if (!confirm('Send the Stripe invoice to this client now?')) return;
+  btn.disabled = true;
+  const r = await api(`/api/clients/${id}/invoice`, { method:'POST', body: '{}' });
+  btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error);
+  toast(`Invoice sent — ${r.display} 💳 (Stripe emails the client; link also on the card)`);
+  refresh(); setTimeout(() => openDrawer(id), 400);
+}
+async function startHosting(id, btn) {
+  if (!confirm('Create the $49/mo hosting & security signup link for this client?')) return;
+  btn.disabled = true;
+  const r = await api(`/api/clients/${id}/hosting`, { method:'POST', body: '{}' });
+  btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error);
+  copyText(r.url);
+  toast('Hosting signup link created & copied 🔒 — text or email it to the client');
+  refresh(); setTimeout(() => openDrawer(id), 400);
+}
+function copyText(t){ navigator.clipboard?.writeText(t).catch(()=>{}); }
 async function applyVibe(id, btn) {
   const v = document.getElementById('vibeInput').value.trim();
   if (!v) return toast('Type a feeling first — e.g. "moody and romantic"');
