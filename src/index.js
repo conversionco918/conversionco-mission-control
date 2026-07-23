@@ -555,7 +555,17 @@ app.get('/api/email-status/:key', async (c) => {
         const list = msgs.messages?.messages || msgs.messages || [];
         for (const m of list) {
           if (String(m.messageType || m.type || '').toLowerCase().includes('email') || m.type === 3) {
-            out.push({ dateAdded: m.dateAdded, status: m.status, source: m.source, direction: m.direction, meta: m.meta?.email || undefined, id: m.id });
+            const entry = { dateAdded: m.dateAdded, status: m.status, source: m.source, direction: m.direction, meta: m.meta?.email || undefined, id: m.id };
+            const mids = m.meta?.email?.messageIds || [];
+            entry.detail = [];
+            for (const mid of mids.slice(0, 3)) {
+              try {
+                const d = await ghl.req('GET', `/conversations/messages/email/${mid}`);
+                const e2 = d.emailMessage || d;
+                entry.detail.push({ status: e2.status, subject: e2.subject, from: e2.from, to: e2.to, error: e2.error || e2.failureReason || undefined, dateAdded: e2.dateAdded });
+              } catch (e) { entry.detail.push({ detailError: String(e.message).slice(0, 200) }); }
+            }
+            out.push(entry);
           }
         }
       } catch (e) { out.push({ convError: String(e.message).slice(0, 200) }); }
