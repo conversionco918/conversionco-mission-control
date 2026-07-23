@@ -47,6 +47,10 @@ async function ensureSchema(db) {
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN launch_checklist TEXT DEFAULT ''`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN vibe TEXT DEFAULT ''`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN billing TEXT DEFAULT ''`).run(); } catch {}
+  try { await db.prepare(`CREATE TABLE IF NOT EXISTS agreements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER NOT NULL, version TEXT NOT NULL,
+    package TEXT DEFAULT '', signed_name TEXT NOT NULL, signed_at TEXT NOT NULL DEFAULT (datetime('now')),
+    user_agent TEXT DEFAULT '')`).run(); } catch {}
   try { await db.prepare(`CREATE TABLE IF NOT EXISTS revisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER NOT NULL, request TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending', note TEXT DEFAULT '',
@@ -525,6 +529,116 @@ app.get('/api/revision-done/:key', async (c) => {
 // Self-hosted intake forms (mobile-bulletproof — no funnel builder in the path)
 app.get('/form/1', (c) => c.html(form1Html));
 app.get('/form/2', (c) => c.html(form2Html));
+
+// ---------------- service agreement (sent before payment, e-signed) ----------------
+const AGREEMENT_VERSION = 'v1-2026-07-23';
+function agreementTerms(biz, pkgLabel, pkgPrice) {
+  return [
+    ['1. What we are building', `ConversionCo will design, write, and build the ${pkgLabel} for ${biz}: a custom, mobile-first website with full search-engine setup as described in your proposal. Your one-time project fee is ${pkgPrice}, due before the build begins.`],
+    ['2. Website Care Plan — $49/month', `Keeping your website live with us is covered by the Website Care Plan: hosting, security, daily uptime monitoring, performance reports, and ongoing platform updates (Premium plans also include weekly published content). It is month-to-month, starts only when your site is ready and you confirm, and you may cancel any time — cancellation takes effect at the end of the current billing period.`],
+    ['3. Payment & refunds', `The build starts after your project fee is paid in full. Because our build process begins immediately and produces custom work, the fee is non-refundable once your build has started — with one exception in your favor: if we fail to deliver a preview of your website within 14 days of payment, you may request a full refund.`],
+    ['4. Revisions', `Your project includes two full rounds of revisions before launch, plus reasonable adjustments during your first 30 days live. After that, changes are handled through your Care Plan (reasonable monthly volume) or quoted separately for larger redesigns. This keeps every project fair — for you and for our other clients.`],
+    ['5. What you own', `Your domain name is yours — registered for your business, and transferable to your direct control on request at any time. Your content is yours — your logo, photos, story, and business information. And once your project fee is paid in full, the finished website code (the HTML, CSS, JavaScript, and images that make up your site) is yours as well.`],
+    ['6. What remains ours', `The ConversionCo platform is licensed to you while you are a client, and is never transferred: our client portal and dashboards, our automated build, content, and reporting systems, our monitoring tools, and our internal processes. These power your service; they are not part of the website deliverable.`],
+    ['7. If you ever leave', `You can leave whenever you want — no lock-in. On cancellation we provide a complete export of your website code and assist in pointing your domain wherever you direct. What ends with the service: hosting, the client portal, monitoring, reports, and future content or updates. Your website files are yours to host anywhere.`],
+    ['8. Your content & your practice', `You confirm that materials you provide (photos, logo, reviews, text) are yours to use. You remain solely responsible for the clinical and legal operation of your practice, including licensure, protocols, and advertising compliance. We build health-content-compliant websites and may decline content that violates Google or health-advertising policies — that protection benefits us both.`],
+    ['9. Portfolio', `We may display the finished website in the ConversionCo portfolio and marketing materials. If you prefer we do not, tell us in writing and we will remove it.`],
+    ['10. Reasonable limits', `We target excellent uptime and monitor your site daily, but no provider can guarantee against third-party outages. Each party's total liability under this agreement is capped at the fees paid in the six months prior to a claim, and neither party is liable for indirect or consequential damages.`],
+    ['11. Non-payment', `If a Care Plan payment is more than 15 days late, we may pause the website until the account is current — we will always reach out first.`],
+    ['12. The basics', `ConversionCo is an independent contractor. This is the entire agreement between us, governed by Oklahoma law; changes must be in writing (email counts). If any part is unenforceable, the rest stands.`],
+  ];
+}
+app.get('/agreement/:id/:token', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'agr', id)) return c.text('not found', 404);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.text('not found', 404);
+  const signed = await db.prepare('SELECT * FROM agreements WHERE client_id = ? ORDER BY id DESC LIMIT 1').bind(id).first();
+  const biz = client.business_name || client.name || 'your business';
+  const pkgLabel = client.tier === 'premium' ? 'Premium Website + SEO Engine' : 'Standard Website Package';
+  const pkgPrice = client.tier === 'premium' ? '$999' : '$649';
+  const terms = agreementTerms(biz, pkgLabel, pkgPrice);
+  const tok = c.req.param('token');
+  return c.html(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex"><title>Service Agreement — ${biz} × ConversionCo</title>
+<style>
+  *{box-sizing:border-box;margin:0}body{font-family:-apple-system,'Segoe UI',sans-serif;background:linear-gradient(170deg,#0C1A30,#0F2847);color:#1A2433;line-height:1.65;padding:30px 14px 60px}
+  .card{max-width:680px;margin:0 auto;background:#fff;border-radius:16px;padding:30px 26px;box-shadow:0 20px 60px rgba(0,0,0,.35)}
+  .eyebrow{color:#C9A254;font-size:11px;letter-spacing:.24em;font-weight:700;text-align:center}
+  h1{font-size:24px;text-align:center;margin:8px 0 4px;color:#0C1A30}
+  .sub{text-align:center;color:#667;font-size:13.5px;margin-bottom:24px}
+  h2{font-size:15px;color:#0C1A30;margin:20px 0 6px}
+  p{font-size:14px;color:#3A4557}
+  .sig{border-top:2px solid #EEF1F5;margin-top:28px;padding-top:22px}
+  label{display:flex;gap:10px;font-size:14px;align-items:flex-start;margin-bottom:14px;cursor:pointer}
+  input[type=text]{width:100%;padding:13px 14px;border:1.5px solid #D6DCE5;border-radius:10px;font-size:16px;margin-bottom:14px;font-family:inherit}
+  button{width:100%;padding:15px;border:0;border-radius:10px;background:#C9A254;color:#0C1A30;font-size:16px;font-weight:700;cursor:pointer}
+  .ok{background:#ECFDF5;border:1px solid #A7F3D0;color:#047857;border-radius:12px;padding:18px;text-align:center;font-weight:600}
+  .meta{font-size:11.5px;color:#99A3B0;text-align:center;margin-top:18px}
+</style></head><body>
+<div class="card">
+  <div class="eyebrow">CONVERSION CO</div>
+  <h1>Website Service Agreement</h1>
+  <p class="sub">Between <b>ConversionCo</b> and <b>${biz}</b> · ${pkgLabel} · ${pkgPrice} + $49/mo Care Plan at launch</p>
+  ${terms.map(([h, t]) => `<h2>${h}</h2><p>${t}</p>`).join('')}
+  <div class="sig">
+  ${signed ? `<div class="ok">✓ Signed by ${signed.signed_name} on ${signed.signed_at} UTC</div>` : `
+    <form id="agr">
+      <label><input type="checkbox" id="agree" required style="margin-top:3px"> I have read this agreement and I agree to its terms on behalf of ${biz}.</label>
+      <input type="text" id="signName" required placeholder="Type your full legal name to sign">
+      <button type="submit">Sign Agreement ✍️</button>
+      <p id="agrOk" style="display:none" class="ok">✓ Signed — thank you! Your invoice is on its way.</p>
+    </form>`}
+  </div>
+  <p class="meta">Agreement ${AGREEMENT_VERSION} · A signed copy is emailed to both parties and kept on file.</p>
+</div>
+${signed ? '' : `<script>
+document.getElementById('agr').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const n = document.getElementById('signName').value.trim();
+  if (!document.getElementById('agree').checked || !n) return;
+  await fetch('/agreement-sign/${id}/${tok}', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: n }) });
+  e.target.querySelector('button').style.display = 'none';
+  document.getElementById('agrOk').style.display = 'block';
+});
+</script>`}
+</body></html>`);
+});
+app.post('/agreement-sign/:id/:token', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'agr', id)) return c.text('nope', 403);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'not found' }, 404);
+  let f = {}; try { f = await c.req.json(); } catch {}
+  const name = String(f.name || '').slice(0, 120).trim();
+  if (!name) return c.json({ error: 'name required' }, 400);
+  const pkg = client.tier === 'premium' ? 'Premium $999' : 'Standard $649';
+  await db.prepare('INSERT INTO agreements (client_id, version, package, signed_name, user_agent) VALUES (?, ?, ?, ?, ?)')
+    .bind(id, AGREEMENT_VERSION, pkg, name, (c.req.header('User-Agent') || '').slice(0, 200)).run();
+  await logEvent(db, id, 'agreement_signed', `✍️ Agreement signed by ${name} (${pkg})`);
+  const settings = await getSettings(db);
+  if (c.env.GHL_TOKEN && settings.ghl_location_id) {
+    const url = `${BASE_URL}/agreement/${id}/${await portalToken(c.env, 'agr', id)}`;
+    try {
+      const ghl = ghlFor(c.env, settings);
+      // copy to client
+      const contact = await ghl.upsertContact({ email: client.email, name: client.name || '' });
+      await ghl.sendEmail({ contactId: contact.id || contact.contactId,
+        subject: `Your signed agreement with ConversionCo ✍️`,
+        html: `<p>Hi ${(client.name || '').split(' ')[0] || 'there'},</p><p>Thanks — your service agreement is signed and on file. You can view it any time here:</p><p><a href="${url}">View your signed agreement</a></p><p>Next up: your invoice. Once that's settled, the build begins.</p><p>Talk soon,<br>The ConversionCo Team</p>`,
+        emailFrom: settings.email_from || undefined });
+      // copy to Tiffany
+      const me = await ghl.upsertContact({ email: settings.notify_email, name: 'ConversionCo Notifications' });
+      await ghl.sendEmail({ contactId: me.id || me.contactId,
+        subject: `✍️ ${client.business_name || client.name || client.email} signed the agreement`,
+        html: `<p><b>${name}</b> signed (${pkg}).</p><p><a href="${url}">View agreement</a> · <a href="${BASE_URL}">Open Mission Control</a> — time to send the invoice.</p>`,
+        emailFrom: settings.email_from || undefined });
+    } catch {}
+  }
+  return c.json({ ok: true });
+});
 
 // ---------------- public: client portal, pitch pages, lead capture ----------------
 async function portalToken(env, kind, id) {
@@ -1085,6 +1199,38 @@ app.post('/api/clients/:id/portal-invite', async (c) => {
   } catch (e) {
     return c.json({ error: 'Email failed: ' + e.message }, 502);
   }
+});
+
+app.post('/api/clients/:id/agreement-invite', async (c) => {
+  const id = Number(c.req.param('id'));
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client || !client.email) return c.json({ error: 'client/email missing' }, 400);
+  const settings = await getSettings(db);
+  if (!c.env.GHL_TOKEN || !settings.ghl_location_id) return c.json({ error: 'GHL not configured' }, 500);
+  const url = `${BASE_URL}/agreement/${id}/${await portalToken(c.env, 'agr', id)}`;
+  const biz = client.business_name || client.name || 'your business';
+  try {
+    const ghl = ghlFor(c.env, settings);
+    const contact = await ghl.upsertContact({ email: client.email, name: client.name || '' });
+    await ghl.sendEmail({ contactId: contact.id || contact.contactId,
+      subject: `One quick signature before we begin — ${biz} × ConversionCo`,
+      html: `<p>Hi ${(client.name || '').split(' ')[0] || 'there'},</p>
+<p>We're excited to build this with you! Before your invoice, here's our simple service agreement — plain English, takes two minutes to read, and it protects both of us. The short version: <b>your domain and your website are yours</b>, and we spell out exactly what our service covers.</p>
+<p style="margin:24px 0;"><a href="${url}" style="background:#0B1D33;color:#fff;padding:14px 26px;border-radius:8px;text-decoration:none;font-weight:bold;">Read &amp; Sign the Agreement &rarr;</a></p>
+<p>Your invoice follows right after you sign. Questions? Just reply.</p>
+<p>Talk soon,<br>The ConversionCo Team</p>`,
+      emailFrom: settings.email_from || undefined });
+    let billing = {}; try { billing = JSON.parse(client.billing || '{}'); } catch {}
+    billing.agr_sent = new Date().toISOString();
+    await touchClient(db, id, { billing: JSON.stringify(billing) });
+    await logEvent(db, id, 'agreement_sent', `📄 Agreement sent to ${client.email}`);
+    return c.json({ ok: true, url });
+  } catch (e) { return c.json({ error: 'Email failed: ' + e.message }, 502); }
+});
+app.get('/api/clients/:id/agreement', async (c) => {
+  const row = await c.env.DB.prepare('SELECT * FROM agreements WHERE client_id = ? ORDER BY id DESC LIMIT 1').bind(Number(c.req.param('id'))).first();
+  return c.json({ signed: row || null });
 });
 
 app.get('/api/clients/:id/leads', async (c) => {

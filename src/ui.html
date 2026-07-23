@@ -277,6 +277,7 @@ function openDrawer(id) {
       </div>
       <div>
         <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Billing — Stripe</label>
+        <div id="agrBox" style="margin-bottom:10px;"></div>
         ${(() => {
           const b = getBillingUI(c);
           const price = c.tier === 'premium' ? '$999' : '$649';
@@ -391,6 +392,18 @@ function openDrawer(id) {
       </div>
     </div>`;
   document.getElementById('drawer').classList.add('open');
+  api(`/api/clients/${id}/agreement`).then((r) => {
+    const box = document.getElementById('agrBox');
+    if (!box) return;
+    const b = getBillingUI(STATE.clients.find(x=>x.id===id) || {});
+    if (r.signed) {
+      box.innerHTML = `<span class="chip" style="background:#ecfdf5;color:#059669">✍️ Agreement signed — ${esc(r.signed.signed_name)} · ${esc(r.signed.signed_at)} UTC</span>`;
+    } else {
+      box.innerHTML = `<button class="btn btn-ghost" onclick="sendAgreement(${id}, this)">📄 Email agreement to sign</button>
+        <span class="chip" style="background:${b.agr_sent ? '#fef9c3' : '#f1f5f9'};color:${b.agr_sent ? '#a16207' : '#64748b'};margin-left:6px">${b.agr_sent ? 'sent — awaiting signature' : 'not sent'}</span>
+        <p style="font-size:11px;color:#94a3b8;margin-top:5px;">Real-agency order: agreement → signed → invoice → paid → build.</p>`;
+    }
+  });
   api(`/api/clients/${id}/revisions`).then((r) => {
     const el = document.getElementById('revList');
     if (!el || !r.revisions || !r.revisions.length) return;
@@ -487,6 +500,15 @@ async function queueRevision(id, btn) {
   if (r.error) return toast('⚠ ' + r.error);
   document.getElementById('revInput').value = '';
   toast('Revision queued ✏️ — it applies automatically within the hour');
+  refresh(); setTimeout(() => openDrawer(id), 400);
+}
+async function sendAgreement(id, btn) {
+  if (!confirm('Email the service agreement to this client for signature?')) return;
+  btn.disabled = true;
+  const r = await api(`/api/clients/${id}/agreement-invite`, { method:'POST', body: '{}' });
+  btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error);
+  toast('Agreement sent 📄 — you\'ll get an email the moment they sign');
   refresh(); setTimeout(() => openDrawer(id), 400);
 }
 async function sendPortalInvite(id, btn) {
