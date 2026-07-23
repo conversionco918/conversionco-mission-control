@@ -287,6 +287,16 @@ app.get('/debug/:key', async (c) => {
     sites_repo: settings.sites_repo,
     repoDiag,
     events: events.map((e) => ({ t: e.type, d: (e.detail || '').slice(0, 160), at: e.created_at })),
+    uptime: await (async () => {
+      const rows = (await c.env.DB.prepare(`SELECT key, value FROM settings WHERE key LIKE 'uptime_%'`).all()).results || [];
+      const out = {};
+      for (const r of rows) { try { out[r.key] = JSON.parse(r.value); } catch {} }
+      return out;
+    })(),
+    tiers: await (async () => {
+      const rows = (await c.env.DB.prepare('SELECT id, email, business_name, tier, stage FROM clients').all()).results || [];
+      return rows;
+    })(),
   });
 });
 
@@ -1094,10 +1104,69 @@ async function pollForms(env, settings) {
   return { processed };
 }
 
+
+// ---------------- daily uptime monitoring (runs on the daily cron) ----------------
+async function dailyUptime(env) {
+  const db = env.DB;
+  const settings = await getSettings(db);
+  const clients = (await db.prepare(`SELECT * FROM clients WHERE preview_url != '' OR live_url != ''`).all()).results || [];
+  const results = [];
+  for (const client of clients) {
+    let up = false, how = '';
+    if (client.live_url) {
+      try {
+        const r = await fetch(client.live_url, { method: 'GET', redirect: 'follow', cf: { cacheTtl: 0 } });
+        up = r.ok; how = `live domain HTTP ${r.status}`;
+      } catch (e) { up = false; how = `live domain unreachable (${String(e.message).slice(0, 60)})`; }
+    } else {
+      // preview-hosted: the worker itself serves it — verify the site files are intact in D1
+      const metas = (await db.prepare(`SELECT slug, content FROM site_files WHERE path='site-meta.json'`).all()).results || [];
+      let slug = null;
+      for (const m of metas) { try { if (JSON.parse(m.content).client_id === client.id) { slug = m.slug; break; } } catch {} }
+      if (slug) {
+        const idx = await db.prepare(`SELECT length(content) AS n FROM site_files WHERE slug=? AND path='index.html'`).bind(slug).first();
+        up = !!(idx && idx.n > 500); how = up ? 'preview serving from storage' : 'site files missing/corrupt';
+      } else { up = true; how = 'no site yet (skipped)'; }
+    }
+    // rolling stats per client
+    const key = `uptime_${client.id}`;
+    let st = {}; try { st = JSON.parse(settings[key] || '{}'); } catch {}
+    st.total = (st.total || 0) + 1;
+    if (!up) st.fails = (st.fails || 0) + 1;
+    st.last = up ? 'up' : 'down'; st.how = how; st.at = new Date().toISOString();
+    await setSetting(db, key, JSON.stringify(st));
+    results.push({ id: client.id, name: client.business_name || client.name || client.email, up, how });
+    if (!up) {
+      await logEvent(db, client.id, 'site_down', `⛔ SITE CHECK FAILED — ${how}`);
+      if (settings.notify_email && settings.ghl_location_id && env.GHL_TOKEN) {
+        try {
+          const ghl = new GHL(env.GHL_TOKEN, settings.ghl_location_id);
+          const contact = await ghl.upsertContact({ email: settings.notify_email, name: 'ConversionCo Notifications' });
+          await ghl.sendEmail({
+            contactId: contact.id || contact.contactId,
+            subject: `⛔ Site check failed: ${client.business_name || client.name || client.email}`,
+            html: `<p><b>${client.business_name || client.name || client.email}</b> failed today's automated site check.</p><p>${how}</p><p><a href="${BASE_URL}">Open Mission Control</a></p>`,
+            emailFrom: settings.email_from || undefined,
+          });
+        } catch { /* alert email best-effort */ }
+      }
+    }
+  }
+  const downs = results.filter((r) => !r.up).length;
+  await logEvent(db, null, 'uptime_check', `Daily site check: ${results.length - downs}/${results.length} up ✅${downs ? ` — ${downs} DOWN ⛔` : ''}`);
+  return results;
+}
+
 export default {
   fetch: app.fetch,
   async scheduled(event, env, ctx) {
     await ensureSchema(env.DB);
+    if (event.cron === '0 12 * * *') {
+      ctx.waitUntil(dailyUptime(env).catch((e) =>
+        logEvent(env.DB, null, 'error', `Uptime check failed: ${e.message}`)
+      ));
+      return;
+    }
     const settings = await getSettings(env.DB);
     ctx.waitUntil(pollForms(env, settings).catch((e) =>
       logEvent(env.DB, null, 'error', `Poll failed: ${e.message}`)
