@@ -119,8 +119,14 @@
   .bcol { background: #eaeff5; border-radius: 14px; padding: 10px; width: 230px; flex: 0 0 230px; }
   .bcol h4 { font-size: 11.5px; text-transform: uppercase; letter-spacing: .6px; color: #475569; padding: 4px 6px 10px; display: flex; justify-content: space-between; }
   .bcol h4 span { background: #fff; border-radius: 99px; padding: 0 8px; font-size: 11px; }
-  .bcard { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; cursor: pointer; box-shadow: 0 1px 2px rgba(0,0,0,.05); }
+  .bcard { position: relative; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; cursor: pointer; box-shadow: 0 1px 2px rgba(0,0,0,.05); }
   .bcard:hover { border-color: #94a3b8; }
+  .peek { position: absolute; top: 7px; right: 7px; background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 2px 8px; font-size: 13px; cursor: pointer; opacity: .5; transition: opacity .15s; }
+  .peek:hover { opacity: 1; background: #f1f5f9; }
+  .accessbox { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 14px; }
+  .accessbox .alinks { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 11px; font-size: 12.5px; }
+  .accessbox .alinks a { color: #475569; text-decoration: none; border-bottom: 1px dotted #cbd5e1; }
+  .accessbox .alinks a:hover { color: #0B1D33; }
   .bcard b { font-size: 13.5px; display: block; }
   .bcard .em { font-size: 11.5px; color: var(--muted); word-break: break-all; }
   .bcard .tier { font-size: 10.5px; font-weight: 700; color: #7c3aed; }
@@ -355,6 +361,7 @@ function renderBoard() {
   el.innerHTML = BOARD_COLS.map(k => `
     <div class="bcol"><h4>${k} <span>${byCol[k].length}</span></h4>
       ${byCol[k].map(c => `<div class="bcard" onclick="openDrawer(${c.id})">
+        <button class="peek" title="Open their portal — admin view" onclick="event.stopPropagation();openLink(${c.id}, 'portal', this)">👁</button>
         <b>${dot(c)}${esc(c.business_name || c.name || c.email)}</b>
         <span class="em">${esc(c.email)}</span>
         ${c.tier === 'premium' ? '<span class="tier">★ PREMIUM</span>' : ''}
@@ -373,7 +380,7 @@ function renderClients() {
       <td>${dot(c)}<b>${esc(c.name || c.email)}</b>${c.name ? `<br><span style="color:var(--muted);font-size:12px;margin-left:16px;">${esc(c.email)}</span>` : ''}</td>
       <td><span class="chip" style="background:${st.bg};color:${st.fg}">${st.label}</span>${buildBar(c)}</td>
       <td style="color:var(--muted);font-size:13px">${ago(c.updated_at)}</td>
-      <td>${c.stage === 'intake1_done' ? `<button class="btn btn-green" onclick="event.stopPropagation();sendIntake2(${c.id}, this)">Approve → Intake 2</button>` : ''}</td>
+      <td><button class="peek" style="position:static" title="Open their portal — admin view" onclick="event.stopPropagation();openLink(${c.id}, 'portal', this)">👁</button> ${c.stage === 'intake1_done' ? `<button class="btn btn-green" onclick="event.stopPropagation();sendIntake2(${c.id}, this)">Approve → Intake 2</button>` : ''}</td>
     </tr>`;
   }).join('');
 }
@@ -552,22 +559,20 @@ function openDrawer(id) {
       ${c.live_url ? `<div class="kv"><b>Live site</b><a href="${esc(c.live_url)}" target="_blank">${esc(c.live_url)}</a></div>` : ''}
       ${intakeBlock('Intake 1 — Client details', c.intake1_data)}
       ${intakeBlock('Intake 2 — Website vision', c.intake2_data)}
-      <div>
-        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">👁 View as the client (admin access)</label>
+      <div class="accessbox">
+        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:8px;">Client access</label>
         <div class="actions">
           <button class="btn btn-primary" onclick="openLink(${c.id}, 'portal', this)">👁 Open their portal</button>
-          <button class="btn btn-ghost" onclick="openLink(${c.id}, 'pitch', this)">Open pitch page</button>
-          <button class="btn btn-ghost" onclick="openLink(${c.id}, 'agreement', this)">Open agreement</button>
-          <button class="btn btn-ghost" onclick="openLink(${c.id}, 'gbp', this)">Open GBP walkthrough</button>
-        </div>
-        <p style="font-size:11px;color:#94a3b8;margin-top:6px;">Opens exactly what the client sees — same links, same live data. Great before a call.</p>
-        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin:14px 0 6px;">Share links</label>
-        <div class="actions">
-          <button class="btn btn-green" onclick="sendPortalInvite(${c.id}, this)">📧 Email portal login to client</button>
+          <button class="btn btn-green" onclick="sendPortalInvite(${c.id}, this)">📧 Email portal login</button>
           <button class="btn btn-ghost" onclick="copyLink(${c.id}, 'portal', this)">🔗 Copy portal link</button>
-          <button class="btn btn-ghost" onclick="copyLink(${c.id}, 'pitch', this)">✨ Copy pitch page link</button>
         </div>
-        <p style="font-size:11px;color:#94a3b8;margin-top:6px;">Portal = their live dashboard (send after purchase). Pitch = personalized proposal page (send before/during the pricing call).</p>
+        <div class="alinks">
+          <a href="#" onclick="event.preventDefault();openLink(${c.id}, 'pitch', this)">Pitch page ↗</a>
+          <a href="#" onclick="event.preventDefault();openLink(${c.id}, 'agreement', this)">Agreement ↗</a>
+          <a href="#" onclick="event.preventDefault();openLink(${c.id}, 'gbp', this)">GBP walkthrough ↗</a>
+          <a href="#" onclick="event.preventDefault();copyLink(${c.id}, 'pitch', this)">Copy pitch link</a>
+        </div>
+        <p style="font-size:11px;color:#94a3b8;margin-top:9px;">Everything opens exactly what the client sees — same links, same live data.</p>
       </div>
       <div>
         <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Request any revision</label>
