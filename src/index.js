@@ -9,7 +9,7 @@ import { PRICES, ensureCustomer, sendInvoice, invoiceStatus, hostingCheckout, ch
 function depositPaid(b) { return b.dep_status === 'paid' || b.invoice_status === 'paid'; }
 function finalPaid(b) { return b.fin_status === 'paid' || b.invoice_status === 'paid'; }
 import { computeScore } from './score.js';
-import { gscConfigured, gscAddProperty, gscVerifyViaCloudflareDns, gscQueryStats, gscSubmitSitemap, gscGetDnsToken, gscRequestVerify } from './google.js';
+import { gscConfigured, gscAddProperty, gscVerifyViaCloudflareDns, gscQueryStats, gscSubmitSitemap, gscGetDnsToken, gscRequestVerify, gscListProperties } from './google.js';
 import dashboardHtml from './ui.html';
 import form1Html from './form1.html';
 import form2Html from './form2.html';
@@ -2651,6 +2651,14 @@ async function gscPullAll(env, settings) {
     let st = {}; try { st = JSON.parse(settings[stKey] || '{}'); } catch {}
     try {
       if (st.property !== domain) { await gscAddProperty(env, domain); st.property = domain; st.verified = ''; st.checklist_ticked = false; }
+      if (!st.verified) {
+        // a domain may already be verified outside the auto path (manual TXT / gsc-enroll)
+        try {
+          const props = await gscListProperties(env);
+          const mine = props.find((p) => p.site === `sc-domain:${domain}` && p.permission && p.permission !== 'siteUnverifiedUser');
+          if (mine) st.verified = 'manual';
+        } catch { /* fall through to auto-verify */ }
+      }
       if (!st.verified) {
         try { st.verify_attempts = (st.verify_attempts || 0) + 1; await gscVerifyViaCloudflareDns(env, domain); st.verified = new Date().toISOString(); }
         catch (e) {
