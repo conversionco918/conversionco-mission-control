@@ -2855,14 +2855,14 @@ app.get('/api/clients/:id/score', async (c) => {
 });
 
 // 🛠 BUILDER HEARTBEAT — "is the machine coming for my queued builds?"
-// The auto-builder scheduled task fires every 2 hours at :23 UTC (0,2,4…22).
+// The auto-builder scheduled task fires EVERY HOUR at :23 UTC.
 app.get('/api/builder-status', async (c) => {
   const db = c.env.DB;
   const now = new Date();
   let next = null;
-  for (let add = 0; add <= 26 && !next; add++) {
+  for (let add = 0; add <= 2 && !next; add++) {
     const cand = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours() + add, 23, 0));
-    if (cand > now && cand.getUTCHours() % 2 === 0) next = cand;
+    if (cand > now) next = cand;
   }
   const lastOf = async (t) => (await db.prepare('SELECT created_at FROM events WHERE type = ? ORDER BY id DESC LIMIT 1').bind(t).first())?.created_at || null;
   const waiting = [];
