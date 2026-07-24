@@ -2125,6 +2125,19 @@ app.get('/t/:id/p.gif', async (c) => {
   return c.body(GIF, 200, gifHeaders);
 });
 
+// Keyed: Cloudflare token health — can it list zones? (read-only, mutates nothing)
+app.get('/api/cf-check/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  if (!c.env.CLOUDFLARE_API_TOKEN) return c.json({ ok: false, error: 'no token set' });
+  try {
+    const res = await fetch('https://api.cloudflare.com/client/v4/zones?per_page=50', {
+      headers: { Authorization: `Bearer ${c.env.CLOUDFLARE_API_TOKEN}` } });
+    const data = await res.json();
+    if (!data.success) return c.json({ ok: false, canListZones: false, error: JSON.stringify(data.errors || []).slice(0, 200) });
+    return c.json({ ok: true, canListZones: true, zones: (data.result || []).map((z) => ({ name: z.name, status: z.status })) });
+  } catch (e) { return c.json({ ok: false, error: String(e.message).slice(0, 150) }); }
+});
+
 // Keyed: run the nightly backup on demand (verification / before risky changes)
 app.get('/api/backup-now/:key', async (c) => {
   if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
