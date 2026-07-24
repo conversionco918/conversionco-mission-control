@@ -611,6 +611,36 @@ app.get('/api/build-progress/:key', async (c) => {
   return c.json({ ok: true, ...prog });
 });
 
+// Keyed: resend the agreement invite (same email the card button sends)
+app.get('/api/send-agreement/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const id = Number(c.req.query('id'));
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client || !client.email) return c.json({ ok: false, error: 'client/email missing' });
+  const settings = await getSettings(db);
+  if (!c.env.GHL_TOKEN || !settings.ghl_location_id) return c.json({ ok: false, error: 'GHL not configured' });
+  const url = `${BASE_URL}/agreement/${id}/${await portalToken(c.env, 'agr', id)}`;
+  const biz = client.business_name || client.name || 'your business';
+  try {
+    const ghl = ghlFor(c.env, settings);
+    const contact = await ghl.upsertContact({ email: client.email, name: client.name || '' });
+    await ghl.sendEmail({ contactId: contact.id || contact.contactId,
+      subject: `One quick signature before we begin — ${biz}`,
+      html: `<p>Hi ${(client.name || '').split(' ')[0] || 'there'},</p>
+<p>We're excited to build this with you. Before your invoice, here's our service agreement — plain English, about two minutes to read, and it protects both of us. The short version: your domain and your website are yours, and it spells out exactly what our service covers:</p>
+<p><a href="${url}">${url}</a></p>
+<p>Your invoice follows right after you sign. Questions about anything in it? Just reply — happy to walk you through.</p>
+<p>Talk soon,<br>The ConversionCo Team</p>`,
+      emailFrom: settings.email_from || undefined });
+    let billing = {}; try { billing = JSON.parse(client.billing || '{}'); } catch {}
+    billing.agr_sent = new Date().toISOString();
+    await touchClient(db, id, { billing: JSON.stringify(billing) });
+    await logEvent(db, id, 'agreement_sent', `📄 Agreement re-sent to ${client.email}`);
+    return c.json({ ok: true });
+  } catch (e) { return c.json({ ok: false, error: String(e.message || e).slice(0, 200) }); }
+});
+
 // Keyed: clear stored email-template overrides so the code defaults (personal style) apply
 app.get('/api/reset-templates/:key', async (c) => {
   if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
@@ -796,8 +826,9 @@ app.get('/portal/:id/:token', async (c) => {
   const revsN = (await db.prepare(`SELECT COUNT(*) AS n FROM revisions WHERE client_id = ? AND status = 'done'`).bind(id).first())?.n || 0;
   const FRIENDLY = { auto_published: '🚀 Website updated & republished', revision_done: '✅ A requested change was completed',
     theme_changed: '🎨 Fresh look applied to your site', logo_uploaded: '🖼 Your logo was added', photo_uploaded: '📷 New photo added to your site',
-    lead_received: '🔥 New lead captured from your website', preview_ready: '👀 A new version was published', hosting_active: '🛡 Hosting & security activated' };
-  const evRows = (await db.prepare(`SELECT type, created_at FROM events WHERE client_id = ? AND type IN ('auto_published','revision_done','theme_changed','logo_uploaded','photo_uploaded','lead_received','preview_ready','hosting_active') ORDER BY id DESC LIMIT 8`).bind(id).all()).results || [];
+    lead_received: '🔥 New lead captured from your website', preview_ready: '👀 A new version was published', hosting_active: '🛡 Hosting & security activated',
+    build_started: '⚙️ Your website build is underway', invoice_paid: '💳 Payment received — thank you!' };
+  const evRows = (await db.prepare(`SELECT type, created_at FROM events WHERE client_id = ? AND type IN ('auto_published','revision_done','theme_changed','logo_uploaded','photo_uploaded','lead_received','preview_ready','hosting_active','build_started','invoice_paid') ORDER BY id DESC LIMIT 8`).bind(id).all()).results || [];
   // reports list from GitHub (best effort)
   let reports = [];
   if (slug && c.env.GITHUB_TOKEN) {
@@ -1004,7 +1035,8 @@ app.get('/pitch/:id/:token', async (c) => {
     <div class="p"><h3>Standard</h3><div class="pr">$649</div><ul><li>6-page custom website</li><li>Glowing IV drip menu</li><li>Booking built in</li><li>Full SEO foundation</li><li>Monthly performance report</li></ul></div>
     <div class="p best"><h3>Premium</h3><div class="pr">$999</div><ul><li>Everything in Standard</li><li>A landing page for every drip</li><li>City pages for local Google</li><li>Weekly SEO blog — written for you</li><li>Weekly performance report</li></ul></div>
   </div>
-  <p class="sub" style="margin-top:26px">+ $49/month hosting &amp; security — daily uptime checks, monitoring, and updates. Starts only when your site is live.</p></div>
+  <p class="sub" style="margin-top:26px"><b>Simple, fair payments:</b> 50% to begin, 50% only when your finished website is delivered — you never pay in full for something you haven't seen.</p>
+  <p class="sub" style="margin-top:10px">+ $49/month hosting &amp; security — daily uptime checks, monitoring, and updates. Starts only when your site is live.</p></div>
   <div class="cta"><h2 style="color:inherit">Ready when you are, ${(client.name || 'friend').split(' ')[0]}.</h2>
   <p style="opacity:.75">Grab a time and we'll walk through it together.</p>
   ${settings.booking_link ? `<a class="btn" href="${settings.booking_link}">Book your call</a>` : ''}</div>
