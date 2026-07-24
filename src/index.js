@@ -438,7 +438,8 @@ app.get('/debug/:key', async (c) => {
     clientLeads: await (async () => {
       // recent lead messages + sources per client — feeds the FAQ-that-learns and
       // lead-source sections of the report engines
-      const rows = (await c.env.DB.prepare(`SELECT client_id, name, message, source, created_at FROM leads WHERE created_at > datetime('now','-35 days') ORDER BY id DESC LIMIT 200`).all()).results || [];
+      // excludes the client's own portal messages — those are not visitor leads
+      const rows = (await c.env.DB.prepare(`SELECT client_id, name, message, source, created_at FROM leads WHERE created_at > datetime('now','-35 days') AND slug != 'portal-message' ORDER BY id DESC LIMIT 200`).all()).results || [];
       const out = {};
       for (const l of rows) {
         if (!l.client_id) continue;
@@ -450,9 +451,10 @@ app.get('/debug/:key', async (c) => {
       const rows = (await c.env.DB.prepare('SELECT id FROM clients').all()).results || [];
       const out = {};
       for (const r of rows) {
-        const l = (await c.env.DB.prepare('SELECT COUNT(*) AS n FROM leads WHERE client_id = ?').bind(r.id).first())?.n || 0;
+        // leads NEVER include the client's own portal messages (true-data law)
+        const l = (await c.env.DB.prepare(`SELECT COUNT(*) AS n FROM leads WHERE client_id = ? AND slug != 'portal-message'`).bind(r.id).first())?.n || 0;
         const v = (await c.env.DB.prepare(`SELECT COUNT(*) AS n FROM revisions WHERE client_id = ? AND status='done'`).bind(r.id).first())?.n || 0;
-        const bk = (await c.env.DB.prepare(`SELECT COUNT(*) AS n FROM leads WHERE client_id = ? AND status='booked'`).bind(r.id).first())?.n || 0;
+        const bk = (await c.env.DB.prepare(`SELECT COUNT(*) AS n FROM leads WHERE client_id = ? AND status='booked' AND slug != 'portal-message'`).bind(r.id).first())?.n || 0;
         out[r.id] = { leads: l, revisionsDone: v, booked: bk };
       }
       return out;
