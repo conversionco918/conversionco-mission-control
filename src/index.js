@@ -66,7 +66,12 @@ async function ensureSchema(db) {
     name TEXT DEFAULT '', email TEXT DEFAULT '', phone TEXT DEFAULT '', message TEXT DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now')))`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE leads ADD COLUMN source TEXT DEFAULT ''`).run(); } catch {}
+  try { await db.prepare(`ALTER TABLE leads ADD COLUMN status TEXT DEFAULT ''`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN competitors TEXT DEFAULT ''`).run(); } catch {}
+  // first-party visitor counting: one row per site/day/page (HTML views only, bots skipped)
+  try { await db.prepare(`CREATE TABLE IF NOT EXISTS hits (
+    slug TEXT NOT NULL, day TEXT NOT NULL, path TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (slug, day, path))`).run(); } catch {}
   schemaReady = true;
 }
 
@@ -258,6 +263,21 @@ app.get('/preview/:slug/*', async (c) => {
       || await c.env.DB.prepare('SELECT * FROM site_files WHERE slug = ? AND path = ?').bind(slug, path + '.html').first();
   }
   if (!row) return c.text('Not found', 404);
+  // 📊 first-party visitor counting — real page views only: HTML documents, not bots,
+  // not the portal's own mini-preview iframe, not assets
+  try {
+    const ua = c.req.header('User-Agent') || '';
+    const isHtml = String(row.content_type || '').includes('text/html');
+    const isBot = /bot|crawl|spider|slurp|headless|preview|monitor|lighthouse|pingdom/i.test(ua) || !ua;
+    const isFrame = (c.req.header('Sec-Fetch-Dest') || '') === 'iframe';
+    if (isHtml && !isBot && !isFrame) {
+      const day = new Date().toISOString().slice(0, 10);
+      c.executionCtx.waitUntil(c.env.DB.prepare(
+        `INSERT INTO hits (slug, day, path, n) VALUES (?, ?, ?, 1)
+         ON CONFLICT(slug, day, path) DO UPDATE SET n = n + 1`
+      ).bind(slug, day, path).run().catch(() => {}));
+    }
+  } catch { /* counting must never break serving */ }
   const body = row.is_base64 ? Uint8Array.from(atob(row.content), (ch) => ch.charCodeAt(0)) : row.content;
   return new Response(body, { headers: { 'Content-Type': row.content_type, 'Cache-Control': 'no-cache' } });
 });
@@ -371,7 +391,8 @@ app.get('/debug/:key', async (c) => {
       for (const r of rows) {
         const l = (await c.env.DB.prepare('SELECT COUNT(*) AS n FROM leads WHERE client_id = ?').bind(r.id).first())?.n || 0;
         const v = (await c.env.DB.prepare(`SELECT COUNT(*) AS n FROM revisions WHERE client_id = ? AND status='done'`).bind(r.id).first())?.n || 0;
-        out[r.id] = { leads: l, revisionsDone: v };
+        const bk = (await c.env.DB.prepare(`SELECT COUNT(*) AS n FROM leads WHERE client_id = ? AND status='booked'`).bind(r.id).first())?.n || 0;
+        out[r.id] = { leads: l, revisionsDone: v, booked: bk };
       }
       return out;
     })(),
@@ -380,6 +401,27 @@ app.get('/debug/:key', async (c) => {
       const settings2 = await getSettings(c.env.DB);
       const out = {};
       for (const cl of rows) { try { const sc = await computeScore(c.env.DB, cl, settings2); if (sc) out[cl.id] = sc; } catch {} }
+      return out;
+    })(),
+    visits: await (async () => {
+      // First-party visitor counts from the hits table (bot-filtered, iframe-
+      // excluded). Per slug: this week, last 28 days, and the top page. Report
+      // engines use this for the "Visitors this week" glance tile — real numbers.
+      const out = {};
+      try {
+        const rows = (await c.env.DB.prepare(`SELECT slug, day, path, n FROM hits WHERE day > date('now','-28 days')`).all()).results || [];
+        for (const h of rows) {
+          const o = (out[h.slug] = out[h.slug] || { week: 0, month: 0, pages: {} });
+          o.month += h.n;
+          if (h.day > new Date(Date.now() - 7 * 864e5).toISOString().slice(0, 10)) o.week += h.n;
+          o.pages[h.path] = (o.pages[h.path] || 0) + h.n;
+        }
+        for (const s of Object.keys(out)) {
+          const top = Object.entries(out[s].pages).filter(([p]) => p !== 'index.html' && p !== '').sort((a, b) => b[1] - a[1])[0];
+          out[s].top = top ? top[0] : '';
+          delete out[s].pages;
+        }
+      } catch {}
       return out;
     })(),
     gsc: await (async () => {
@@ -1044,6 +1086,36 @@ app.get('/portal/:id/:token', async (c) => {
   // 30-day before/after — only when real history spans 25+ days
   const histSpanDays = hist.length >= 2 ? Math.round((Date.parse(hist[hist.length - 1].d) - Date.parse(hist[0].d)) / 86400000) : 0;
   let gscFirst = null; try { gscFirst = JSON.parse(settings[`gsc_first_${id}`] || 'null'); } catch {}
+  // first-party visitor counts (our-hosted sites)
+  let visits = null;
+  if (slug) {
+    const v7 = await db.prepare(`SELECT SUM(n) AS n FROM hits WHERE slug = ? AND day > date('now','-7 days')`).bind(slug).first();
+    const v28 = await db.prepare(`SELECT SUM(n) AS n FROM hits WHERE slug = ? AND day > date('now','-28 days')`).bind(slug).first();
+    const topP = await db.prepare(`SELECT path, SUM(n) AS n FROM hits WHERE slug = ? AND day > date('now','-28 days') AND path != 'index.html' GROUP BY path ORDER BY n DESC LIMIT 1`).bind(slug).first();
+    if (v28 && Number(v28.n) > 0) visits = { w: Number(v7?.n || 0), m: Number(v28.n), top: topP ? String(topP.path).replace('.html', '').replace(/-/g, ' ') : null };
+  }
+  // lead inbox + client-confirmed bookings (real revenue)
+  const leadRows = (await db.prepare(`SELECT id AS lid, name, email, phone, message, source, status, created_at FROM leads WHERE client_id = ? ORDER BY id DESC LIMIT 12`).bind(id).all()).results || [];
+  const bookedN = Number((await db.prepare(`SELECT COUNT(*) AS n FROM leads WHERE client_id = ? AND status = 'booked'`).bind(id).first())?.n || 0);
+  let avgPrice = 0;
+  if (slug) {
+    try {
+      const meta = JSON.parse((await db.prepare(`SELECT content FROM site_files WHERE slug = ? AND path = 'site-meta.json'`).bind(slug).first())?.content || '{}');
+      const prices = (Array.isArray(meta.menu) ? meta.menu : []).map((x) => {
+        const raw = typeof x === 'string' ? x : (x && (x.price ?? x[1])) ?? '';
+        return Number(String(raw).replace(/[^0-9.]/g, ''));
+      }).filter((p) => p > 10 && p < 5000);
+      if (prices.length) avgPrice = Math.round(prices.reduce((a, b) => a + b, 0) / prices.length);
+    } catch {}
+  }
+  // review pulse — engines record it into ranks.json weekly (honest approximations)
+  const reviews = (ranks && ranks.reviews && ranks.reviews.you) ? ranks.reviews : null;
+  // photo library
+  const photoSlots = new Set(((await db.prepare(`SELECT path FROM site_files WHERE slug = ? AND path LIKE 'photo-%'`).bind(`_assets-${id}`).all()).results || []).map((r) => Number(String(r.path).replace('photo-', '')) || 0));
+  // share-a-win image data
+  const shareData = certRow
+    ? { biz, title: 'PAGE ONE OF GOOGLE', sub: certKw ? `"${certKw}"` : '', date: `Verified ${String(certRow.created_at).slice(0, 10)}` }
+    : (winRow ? { biz, title: winRow.type === 'first_lead_celebrated' ? 'FIRST LEAD, IN THE BOOKS' : 'A WIN WORTH SHARING', sub: '', date: String(winRow.created_at).slice(0, 10) } : null);
   const tiles = [];
   if (hasGsc) {
     tiles.push(`<div class="tile"><div class="v" data-cnt="${Number(gsc.totals?.imp || 0)}">${Number(gsc.totals?.imp || 0).toLocaleString()}<small>×</small></div><div class="l">Times shown on Google</div></div>`);
@@ -1051,7 +1123,9 @@ app.get('/portal/:id/:token', async (c) => {
     const best = Math.min(...gsc.queries.map((q) => q.pos).filter((p) => p > 0));
     if (isFinite(best)) tiles.push(`<div class="tile"><div class="v">#${best}</div><div class="l">Best Google spot</div></div>`);
   }
+  if (visits) tiles.push(`<div class="tile"><div class="v" data-cnt="${visits.w > 0 ? visits.w : visits.m}">${(visits.w > 0 ? visits.w : visits.m).toLocaleString()}</div><div class="l">Visitors ${visits.w > 0 ? 'this week' : 'this month'}</div>${visits.top ? `<div class="d">most viewed: ${escq(visits.top)}</div>` : ''}</div>`);
   if (leadsN > 0) tiles.push(`<div class="tile"><div class="v" data-cnt="${leadsN}">${leadsN}</div><div class="l">People who reached out</div></div>`);
+  if (bookedN > 0) tiles.push(`<div class="tile"><div class="v" data-cnt="${bookedN}">${bookedN}</div><div class="l">Bookings from your website</div>${avgPrice ? `<div class="d up">~$${(bookedN * avgPrice).toLocaleString()} at your prices</div>` : ''}</div>`);
   if (score) tiles.push(`<div class="tile"><div class="v" data-cnt="${score.total}">${score.total}<small>/100</small></div><div class="l">Website score</div></div>`);
   if (!score && up && up.total >= 3 && upPct !== null) tiles.push(`<div class="tile"><div class="v" data-cnt="${upPct}">${upPct}%</div><div class="l">Uptime, checked daily</div></div>`);
   const FRIENDLY2 = { auto_published: 'Website updated & republished', revision_done: 'A requested change was completed',
@@ -1138,7 +1212,7 @@ app.get('/portal/:id/:token', async (c) => {
   <p style="font-family:'Cormorant Garamond',serif;font-style:italic;font-size:17px;color:var(--muted);margin-top:14px">${escq(welcomeLine)}</p>
   <p class="sinceline" id="sinceLine"></p>
 
-  <div class="winbanner" id="winBanner">${winRow ? (winRow.type === 'page1_celebrated' ? '🎉 You are on Page 1 of Google. Take a moment — this is what the work was for.' : '🎉 Your first lead came in through your website. The machine is working.') : ''}</div>
+  <div class="winbanner" id="winBanner">${winRow ? (winRow.type === 'page1_celebrated' ? '🎉 You are on Page 1 of Google. Take a moment — this is what the work was for.' : '🎉 Your first lead came in through your website. It’s working.') : ''}${shareData ? `<div><button class="cbtn" onclick="shareWin()" style="margin-top:12px">Share this win 📤</button></div>` : ''}</div>
 
   ${client.stage === 'live'
     ? `<div class="livebar"><span class="livepill"><i></i>Live on the web</span>${siteUrl ? `<a class="btn" href="${siteUrl}" target="_blank">View your website →</a>` : ''}</div>`
@@ -1189,9 +1263,42 @@ app.get('/portal/:id/:token', async (c) => {
     ${score && score.pages.blogPosts > 0 ? `<div class="check"><span class="tick">✓</span><span>${score.pages.blogPosts} article${score.pages.blogPosts === 1 ? '' : 's'} written and published for you.</span></div>` : ''}
   </div></div>
 
-  ${leadsN > 0 ? `<div class="card c-cust"><span class="eyebrow">Customers</span><h2>People who reached out</h2>
-    <div style="display:flex;align-items:baseline;gap:14px"><div style="font-family:'Cormorant Garamond',serif;font-size:52px;line-height:1">${leadsN}</div>
-    <p style="color:var(--muted);font-size:14px;max-width:360px">people have contacted you through your website — each one lands in your inbox the moment it happens.</p></div></div>` : ''}
+  ${leadRows.length ? `<div class="card c-cust"><span class="eyebrow">Customers</span><h2>Your inbox</h2>
+    <div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:4px">
+      <div style="font-family:'Cormorant Garamond',serif;font-size:52px;line-height:1" data-cnt="${leadsN}">${leadsN}</div>
+      <p style="color:var(--muted);font-size:14px;max-width:400px">people have reached out through your website${bookedN ? ` — <b style="color:var(--good);font-weight:500">${bookedN} booked ✓</b>${avgPrice ? ` <span style="color:var(--faint)">(~$${(bookedN * avgPrice).toLocaleString()} at your average price)</span>` : ''}` : ''}.</p>
+    </div>
+    ${leadRows.map((L) => `<div class="grow" data-lead="${L.lid}">
+      <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:baseline">
+        <b style="font-weight:500">${escq(L.name || 'Someone')}</b>
+        <span class="note" style="margin:0">${String(L.created_at).slice(0, 10)}${L.source ? ` · via ${escq(L.source)}` : ''}</span>
+      </div>
+      ${L.message ? `<p style="font-size:13.5px;color:var(--muted);margin-top:3px">"${escq(String(L.message).slice(0, 180))}"</p>` : ''}
+      <div style="display:flex;gap:12px;margin-top:8px;flex-wrap:wrap;align-items:center">
+        ${L.phone ? `<a href="tel:${escq(L.phone)}" style="font-size:13px;color:var(--brand);text-decoration:none;font-weight:500">📞 Call</a>` : ''}
+        ${L.email ? `<a href="mailto:${escq(L.email)}" style="font-size:13px;color:var(--brand);text-decoration:none;font-weight:500">✉️ Email</a>` : ''}
+        <span style="margin-left:auto;font-size:12px;color:var(--faint)">Did they book?</span>
+        <button class="cbtn bk ${L.status === 'booked' ? 'on' : ''}" onclick="markLead(${L.lid}, 'booked', this)" style="padding:4px 12px;font-size:12px">Booked ✓</button>
+        <button class="cbtn bk ${L.status === 'no' ? 'on' : ''}" onclick="markLead(${L.lid}, 'no', this)" style="padding:4px 12px;font-size:12px">No</button>
+      </div>
+    </div>`).join('')}
+  </div>` : ''}
+
+  ${reviews ? `<div class="card" style="--sec:#BE123C"><span class="eyebrow">Reviews</span><h2>Your review pulse</h2>
+    <div style="display:flex;gap:20px;align-items:baseline;flex-wrap:wrap">
+      <div style="font-family:'Cormorant Garamond',serif;font-size:52px;line-height:1">${Number(reviews.you.count) || 0}</div>
+      <div style="color:var(--muted);font-size:14px">Google reviews${reviews.you.rating ? ` · ${escq(String(reviews.you.rating))}★` : ''}${(reviews.you.prev_count != null && Number(reviews.you.count) > Number(reviews.you.prev_count)) ? ` · <b style="color:var(--good);font-weight:500">up ${Number(reviews.you.count) - Number(reviews.you.prev_count)} since last check</b>` : ''}</div>
+    </div>
+    ${reviews.rivals ? `<p class="note" style="margin-top:10px">The neighbors: ${Object.entries(reviews.rivals).map(([n, r]) => `${escq(n)} ~${Number((r && r.count) != null ? r.count : r) || '?'}`).join(' · ')}</p>` : ''}
+  </div>` : ''}
+
+  ${(slug && (photoSlots.size > 0)) ? `<div class="card c-blog"><span class="eyebrow">Your Photos</span><h2>Your photo library</h2>
+    <p class="note" style="margin:0 0 12px">The photos we keep on file for your website. Send a new one in the box below — tick "add to my website" and we place it for you.</p>
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:10px">
+    ${[1, 2, 3, 4, 5, 6].map((n) => photoSlots.has(n)
+      ? `<img src="/portal-photo-view/${id}/${tok}/${n}" style="width:100%;aspect-ratio:1;object-fit:cover;border-radius:10px;border:1px solid var(--line)" alt="Your photo ${n}" loading="lazy">`
+      : `<div style="aspect-ratio:1;border:1.5px dashed var(--line);border-radius:10px;display:flex;align-items:center;justify-content:center;color:var(--faint);font-size:22px">·</div>`).join('')}
+    </div></div>` : ''}
 
   ${reports.length ? `<div class="card c-rep"><span class="eyebrow">Reports</span><h2>Your latest report</h2>
     <p style="color:var(--muted);font-size:13.5px;margin-bottom:12px">The full story — where you stand on Google, what we handled, and what it's worth.</p>
@@ -1210,7 +1317,8 @@ app.get('/portal/:id/:token', async (c) => {
     ${agrRow ? `<p style="color:var(--muted);font-size:14px">Your agreement — signed by ${escq(agrRow.signed_name)} on ${String(agrRow.signed_at).slice(0, 10)}, kept right here for your records.</p>
     <a class="btn" style="margin-top:10px" href="/agreement/${id}/${agrTok}" target="_blank">View your signed agreement →</a>` : ''}
     ${certRow ? `<p style="color:var(--muted);font-size:14px;margin-top:${agrRow ? '18px' : '0'}">Your Page One certificate — earned ${String(certRow.created_at).slice(0, 10)}${certKw ? ` for the search "${escq(certKw)}"` : ''}. Print it, frame it — you earned it.</p>
-    <a class="btn" style="margin-top:10px;background:#A16207" href="/portal/${id}/${tok}/certificate" target="_blank">Your Page One certificate →</a>` : ''}
+    <a class="btn" style="margin-top:10px;background:#A16207" href="/portal/${id}/${tok}/certificate" target="_blank">Your Page One certificate →</a>
+    <button class="cbtn" onclick="shareWin()" style="margin-left:8px">Share it 📤</button>` : ''}
   </div>` : ''}
 
   ${(histSpanDays >= 25 && score && hist.length >= 2) ? `<div class="card c-score"><span class="eyebrow">Then &amp; Now</span><h2>Your first ${histSpanDays} days</h2>
@@ -1254,6 +1362,42 @@ app.get('/portal/:id/:token', async (c) => {
 window.CCWIN = ${winRow ? JSON.stringify({ t: winRow.type, at: winRow.created_at }) : 'null'};
 window.CCEV = ${JSON.stringify(evRows.map((e) => ({ t: e.type, at: e.created_at })))};
 window.CCIMP = ${hasGsc ? Number(gsc.totals?.imp || 0) : 'null'};
+window.CCSHARE = ${shareData ? JSON.stringify(shareData) : 'null'};
+window.BRAND = '${accent}';
+// mark a lead booked / not — powers the real-revenue tracking
+async function markLead(lid, status, btn) {
+  try {
+    await fetch('/portal-lead/${id}/${tok}', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lead: lid, status: status }) });
+    var row = btn.closest('[data-lead]');
+    row.querySelectorAll('.bk').forEach(function (b) { b.classList.remove('on'); });
+    btn.classList.add('on');
+  } catch (e) {}
+}
+// share-a-win: draw a branded square, download it
+function ccWrap(x, t, cx, y, maxw, lh) {
+  var words = String(t).split(' '); var line = ''; var yy = y;
+  words.forEach(function (w) { var test = line ? line + ' ' + w : w; if (x.measureText(test).width > maxw && line) { x.fillText(line, cx, yy); yy += lh; line = w; } else line = test; });
+  x.fillText(line, cx, yy); return yy;
+}
+async function shareWin() {
+  if (!window.CCSHARE) return;
+  try { await document.fonts.load('500 88px "Cormorant Garamond"'); await document.fonts.load('italic 40px "Cormorant Garamond"'); } catch (e) {}
+  var cv = document.createElement('canvas'); cv.width = 1080; cv.height = 1080;
+  var x = cv.getContext('2d');
+  x.fillStyle = '#FBFAF7'; x.fillRect(0, 0, 1080, 1080);
+  x.strokeStyle = BRAND; x.lineWidth = 6; x.strokeRect(42, 42, 996, 996);
+  x.lineWidth = 1.5; x.strokeRect(60, 60, 960, 960);
+  x.textAlign = 'center';
+  x.fillStyle = BRAND; x.font = '54px "Cormorant Garamond", serif'; x.fillText('✦', 540, 190);
+  x.fillStyle = '#8A99A8'; x.font = '400 26px Karla, sans-serif'; x.fillText('A  W I N  W O R T H  F R A M I N G', 540, 262);
+  x.fillStyle = '#16202B'; x.font = '500 84px "Cormorant Garamond", serif';
+  var yEnd = ccWrap(x, CCSHARE.biz, 540, 400, 880, 92);
+  x.fillStyle = BRAND; x.font = '500 62px "Cormorant Garamond", serif';
+  yEnd = ccWrap(x, CCSHARE.title, 540, yEnd + 130, 880, 70);
+  if (CCSHARE.sub) { x.fillStyle = '#5B6B7B'; x.font = 'italic 42px "Cormorant Garamond", serif'; ccWrap(x, CCSHARE.sub, 540, yEnd + 90, 860, 50); }
+  x.fillStyle = '#8A99A8'; x.font = '400 23px Karla, sans-serif'; x.fillText(CCSHARE.date, 540, 952);
+  cv.toBlob(function (b) { var a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'my-win.png'; a.click(); });
+}
 // numbers that move (respecting reduced-motion)
 (function () {
   var noMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -1528,6 +1672,36 @@ app.post('/portal-photo/:id/:token', async (c) => {
     } catch {}
   }
   return c.json({ ok: true, slot, queued });
+});
+
+// Portal "did they book?" — the client confirms real revenue with one tap
+app.post('/portal-lead/:id/:token', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'portal', id)) return c.text('nope', 403);
+  const db = c.env.DB;
+  let f = {}; try { f = await c.req.json(); } catch {}
+  const lid = Number(f.lead || 0);
+  if (!lid) return c.json({ error: 'no lead' }, 400);
+  const raw = String(f.status || '');
+  const status = raw === 'booked' ? 'booked' : raw === 'no' ? 'no' : '';
+  const res = await db.prepare('UPDATE leads SET status = ? WHERE id = ? AND client_id = ?').bind(status, lid, id).run();
+  if (!res.meta || res.meta.changes === 0) return c.json({ error: 'not found' }, 404);
+  if (status === 'booked') {
+    await logEvent(db, id, 'lead_booked', `💰 Client marked a lead as BOOKED (lead #${lid})`);
+  }
+  return c.json({ ok: true, status });
+});
+
+// Portal photo library viewer — serves the client's own uploaded photos
+app.get('/portal-photo-view/:id/:token/:n', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'portal', id)) return c.text('nope', 403);
+  const n = Math.min(6, Math.max(1, Number(c.req.param('n')) || 1));
+  const row = await c.env.DB.prepare('SELECT content, content_type FROM site_files WHERE slug = ? AND path = ?')
+    .bind(`_assets-${id}`, `photo-${n}`).first();
+  if (!row) return c.text('no photo', 404);
+  return c.body(Uint8Array.from(atob(row.content), (ch) => ch.charCodeAt(0)), 200,
+    { 'Content-Type': row.content_type || 'image/jpeg', 'Cache-Control': 'private, max-age=600' });
 });
 
 // 📜 Page One certificate — print-ready, earned only (real page1_celebrated event)
