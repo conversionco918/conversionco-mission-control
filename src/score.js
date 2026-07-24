@@ -85,16 +85,24 @@ export async function computeScore(db, client, settings) {
   const growth = Math.round(20 * done.length / LAUNCH_KEYS.length);
   for (const k of LAUNCH_KEYS) if (!cl[k]) tips.push({ pts: 2.5, t: LAUNCH_LABELS[k] });
 
-  const total = Math.min(100, tech + content + local + reliability + growth);
+  // ---- REALISTIC REBALANCE (7/24, Tiffany): what happens off-site on Google is the
+  // biggest part of ranking reality, so it's the biggest part of the score. A beautiful
+  // pre-launch site tops out in the low-to-mid 40s; the climb to 80+ happens through
+  // launch, Google profile, citations, reviews, and a proven uptime streak.
+  const techS = Math.round(tech * 0.75);        // /15
+  const contentS = Math.round(content * 0.8);   // /20
+  const localS = Math.round(local * 0.75);      // /15
+  const growthS = Math.round(35 * done.length / LAUNCH_KEYS.length); // /35 — the big lever
+  const total = Math.min(100, techS + contentS + localS + reliability + growthS);
   tips.sort((a, b) => b.pts - a.pts);
   return {
     total,
     breakdown: {
-      technical: { score: tech, max: 20 },
-      content: { score: content, max: 25 },
-      local: { score: local, max: 20 },
+      technical: { score: techS, max: 15 },
+      content: { score: contentS, max: 20 },
+      local: { score: localS, max: 15 },
       reliability: { score: reliability, max: 15, uptimePct: upPct },
-      offsite: { score: growth, max: 20, done: done.length, of: LAUNCH_KEYS.length },
+      offsite: { score: growthS, max: 35, done: done.length, of: LAUNCH_KEYS.length },
     },
     pages: { total: html.length, drips: dripPages, cities: cityPages, blogPosts },
     topTips: tips.slice(0, 3).map((x) => `${x.t} (+${x.pts} pts)`),
