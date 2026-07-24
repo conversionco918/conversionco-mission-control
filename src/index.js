@@ -9,6 +9,7 @@ import { PRICES, ensureCustomer, sendInvoice, invoiceStatus, hostingCheckout, ch
 function depositPaid(b) { return b.dep_status === 'paid' || b.invoice_status === 'paid'; }
 function finalPaid(b) { return b.fin_status === 'paid' || b.invoice_status === 'paid'; }
 import { computeScore } from './score.js';
+import { gscConfigured, gscAddProperty, gscVerifyViaCloudflareDns, gscQueryStats, gscSubmitSitemap } from './google.js';
 import dashboardHtml from './ui.html';
 import form1Html from './form1.html';
 import form2Html from './form2.html';
@@ -378,6 +379,14 @@ app.get('/debug/:key', async (c) => {
       const settings2 = await getSettings(c.env.DB);
       const out = {};
       for (const cl of rows) { try { const sc = await computeScore(c.env.DB, cl, settings2); if (sc) out[cl.id] = sc; } catch {} }
+      return out;
+    })(),
+    gsc: await (async () => {
+      // Google Search Console: configured flag + per-client state and the latest
+      // exact-numbers snapshot (gsc_data_<id>) — report engines PREFER this data.
+      const rows = (await c.env.DB.prepare(`SELECT key, value FROM settings WHERE key LIKE 'gsc\\_%' ESCAPE '\\'`).all()).results || [];
+      const out = { configured: gscConfigured(c.env) };
+      for (const r of rows) { try { out[r.key] = JSON.parse(r.value); } catch {} }
       return out;
     })(),
   });
@@ -1006,6 +1015,25 @@ app.get('/portal/:id/:token', async (c) => {
       ${evRows.length ? evRows.map((e) => `<div>${FRIENDLY[e.type] || e.type}<time>${e.created_at} UTC</time></div>`).join('') : '<p style="color:#8EA3BC;font-size:13.5px">Activity appears here as we work.</p>'}
     </div></div>
   </div>
+
+  ${(() => { let g = null; try { g = JSON.parse(settings[`gsc_data_${id}`] || 'null'); } catch {}
+    if (!g || !Array.isArray(g.queries) || !g.queries.length) return '';
+    const esc = (s) => String(s).replace(/[<>&]/g, '');
+    const delta = (q) => q.prev == null || q.prev === q.pos ? ''
+      : q.pos < q.prev ? ` <span style="color:#34D399;font-size:12px;font-weight:700">▲ up from #${q.prev}</span>`
+      : ` <span style="color:#8EA3BC;font-size:12px">was #${q.prev}</span>`;
+    return `<div class="card"><h2>Google's own numbers 📊</h2>
+    <p style="color:#8EA3BC;font-size:12.5px;margin-bottom:12px">Straight from Google Search Console — your exact position for searches people actually typed, last 28 days · updated ${String(g.checked_at).slice(0, 10)}.</p>
+    <div class="grid4" style="margin-bottom:14px">
+      <div class="stat"><div class="v">${Number(g.totals?.imp || 0).toLocaleString()}</div><div class="l">Times you appeared on Google</div></div>
+      <div class="stat"><div class="v">${Number(g.totals?.clicks || 0).toLocaleString()}</div><div class="l">Clicks to your website</div></div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:9px">
+    ${g.queries.map((q) => `<div style="border-bottom:1px dashed rgba(142,163,188,.25);padding-bottom:7px;">
+      <div style="font-size:13px;color:#8EA3BC;">when someone searches "${esc(q.q)}"</div>
+      <div style="font-size:15px;margin-top:1px;"><b style="color:#C9A254">you're #${q.pos} on Google</b>${delta(q)} <span style="color:#5C7794;font-size:12px">· seen ${q.imp}× · ${q.clicks} click${q.clicks === 1 ? '' : 's'}</span></div>
+    </div>`).join('')}
+    </div></div>`; })()}
 
   <div class="card"><h2>What page of Google you're on 🔎</h2>
     ${ranks && Array.isArray(ranks.keywords) && ranks.keywords.length ? `
@@ -2551,6 +2579,66 @@ ${needsHtml}
   } catch (e) { await logEvent(db, null, 'error', `Owner digest failed: ${e.message}`); }
 }
 
+// Google Search Console autopilot (Sundays inside the noon cron). Dormant until
+// the GOOGLE_* secrets exist — Tiffany's one-time errand. After that, ZERO
+// per-client setup: one ConversionCo Google account owns ONE console, and every
+// client's live domain becomes its own property inside it automatically:
+//   1. property created (sc-domain:) the first Sunday the client has a live domain
+//   2. auto-verified via a DNS TXT record when the domain is a Cloudflare zone
+//      (flagged once in the feed if it isn't, for a one-time manual verify)
+//   3. sitemap submitted + the gsc/sitemap launch-checklist boxes tick themselves
+//   4. exact positions / impressions / clicks pulled weekly with week-over-week
+//      deltas → settings gsc_data_<id> → portal card + report engines
+async function gscPullAll(env, settings) {
+  if (!gscConfigured(env)) return;
+  const db = env.DB;
+  const clients = (await db.prepare(`SELECT * FROM clients WHERE live_url != '' AND stage != 'archived'`).all()).results || [];
+  for (const cl of clients) {
+    let domain = '';
+    try { domain = new URL(cl.live_url).hostname.replace(/^www\./, ''); } catch {}
+    if (!domain || domain.endsWith('workers.dev') || domain.endsWith('conversionco918.com')) continue;
+    const stKey = `gsc_${cl.id}`;
+    let st = {}; try { st = JSON.parse(settings[stKey] || '{}'); } catch {}
+    try {
+      if (st.property !== domain) { await gscAddProperty(env, domain); st.property = domain; st.verified = ''; st.checklist_ticked = false; }
+      if (!st.verified) {
+        try { st.verify_attempts = (st.verify_attempts || 0) + 1; await gscVerifyViaCloudflareDns(env, domain); st.verified = new Date().toISOString(); }
+        catch (e) {
+          if (st.verify_attempts === 3 && !st.manual_flagged) {
+            st.manual_flagged = true;
+            await logEvent(db, cl.id, 'gsc_manual_needed', `⚠️ Search Console can't auto-verify ${domain} (${String(e.message).slice(0, 100)}) — verify this one domain by hand in Search Console (DNS TXT), then everything runs itself forever.`);
+          }
+        }
+      }
+      if (st.verified && !st.checklist_ticked) {
+        let lc = {}; try { lc = JSON.parse(cl.launch_checklist || '{}'); } catch {}
+        try { await gscSubmitSitemap(env, domain); lc.sitemap = true; } catch { /* retried next Sunday via checklist_ticked staying false */ }
+        lc.gsc = true;
+        await touchClient(db, cl.id, { launch_checklist: JSON.stringify(lc) });
+        if (lc.sitemap) st.checklist_ticked = true;
+        await logEvent(db, cl.id, 'gsc_verified', `✅ Search Console live for ${domain} — property verified${lc.sitemap ? ' and sitemap submitted' : ''} automatically`);
+      }
+      // pull the numbers (Google only returns rows once the property is verified)
+      const stats = await gscQueryStats(env, domain, 28);
+      let prev = null; try { prev = JSON.parse(settings[`gsc_data_${cl.id}`] || 'null'); } catch {}
+      const prevPos = {}; for (const r of (prev && prev.queries) || []) prevPos[r.q] = r.pos;
+      const queries = stats.rows.map((r) => ({ ...r, prev: prevPos[r.q] ?? null }));
+      await setSetting(db, `gsc_data_${cl.id}`, JSON.stringify({
+        domain, checked_at: new Date().toISOString(), window: stats.window, queries, totals: stats.totals,
+      }));
+      st.last_pull = new Date().toISOString(); st.last_error = ''; st.err_logged = '';
+      if (queries.length) await logEvent(db, cl.id, 'gsc_pulled', `📈 Google's own numbers in for ${domain} — ${queries.length} searches tracked, seen ${stats.totals.imp}×, ${stats.totals.clicks} clicks (28 days)`);
+    } catch (e) {
+      st.last_error = String(e.message).slice(0, 160);
+      if (st.err_logged !== st.last_error) { // log state changes only — keep the feed clean
+        st.err_logged = st.last_error;
+        await logEvent(db, cl.id, 'gsc_error', `Search Console pull failed for ${domain}: ${st.last_error}`);
+      }
+    }
+    await setSetting(db, stKey, JSON.stringify(st));
+  }
+}
+
 export default {
   fetch: app.fetch,
   async scheduled(event, env, ctx) {
@@ -2562,6 +2650,13 @@ export default {
       if (new Date(event.scheduledTime || Date.now()).getUTCDay() === 1) {
         ctx.waitUntil(weeklyOwnerDigest(env).catch((e) =>
           logEvent(env.DB, null, 'error', `Owner digest failed: ${e.message}`)
+        ));
+      }
+      if (new Date(event.scheduledTime || Date.now()).getUTCDay() === 0) {
+        // Sunday: pull Google Search Console for every live client — the exact
+        // positions land in settings the day before the Monday weekly reports run
+        ctx.waitUntil(getSettings(env.DB).then((s) => gscPullAll(env, s)).catch((e) =>
+          logEvent(env.DB, null, 'error', `GSC pull failed: ${e.message}`)
         ));
       }
       return;
