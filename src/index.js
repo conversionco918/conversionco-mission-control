@@ -999,129 +999,151 @@ app.get('/portal/:id/:token', async (c) => {
   const plan = isPremium
     ? ['Custom luxury website — every page designed for you', 'A landing page for every drip (Google loves depth)', 'City pages for local search domination', 'A new SEO article written & published every week', 'Weekly performance report with your SEO Score', 'Daily uptime & security monitoring', 'Review funnel — happy clients routed to Google']
     : ['Custom luxury website — every page designed for you', 'Full search-engine foundation (schema, sitemap, local targeting)', 'Monthly performance report with your SEO Score', 'Daily uptime & security monitoring', 'Booking built into every page'];
+  // ---- Portal v2 (7/24): light, professional, report-matched design. Real data only,
+  // human voice, no fluff. Section color system mirrors the client reports.
+  const escq = (s) => String(s || '').replace(/[<>&]/g, '');
+  const ladder = (pos, prev) => {
+    const w = pos ? Math.max(6, Math.round(101 - Math.min(100, pos))) : 0;
+    const gh = (prev && prev !== pos) ? `<div class="ghost" style="left:${Math.max(2, Math.min(97, Math.round(101 - Math.min(100, prev))))}%"></div>` : '';
+    return `<div class="ladder"><div class="goal"></div>${pos ? `<div class="lfill" style="width:${w}%"></div>` : ''}${gh}</div><div class="lscale"><span>#100</span><span>Page 1 🏁</span></div>`;
+  };
+  const moveTxt = (pos, prev) => (!prev || prev === pos) ? '' : (pos < prev ? ` <span class="up">▲ up from #${prev}</span>` : ` <span class="mut">was #${prev}</span>`);
+  let gsc = null; try { gsc = JSON.parse(settings[`gsc_data_${id}`] || 'null'); } catch {}
+  const hasGsc = gsc && Array.isArray(gsc.queries) && gsc.queries.length > 0;
+  let hist = []; try { hist = JSON.parse(settings[`scorehist_${id}`] || '[]'); } catch {}
+  const tiles = [];
+  if (hasGsc) {
+    tiles.push(`<div class="tile"><div class="v">${Number(gsc.totals?.imp || 0).toLocaleString()}<small>×</small></div><div class="l">Times shown on Google</div></div>`);
+    tiles.push(`<div class="tile"><div class="v">${Number(gsc.totals?.clicks || 0).toLocaleString()}</div><div class="l">Clicks to your website</div></div>`);
+    const best = Math.min(...gsc.queries.map((q) => q.pos).filter((p) => p > 0));
+    if (isFinite(best)) tiles.push(`<div class="tile"><div class="v">#${best}</div><div class="l">Best Google spot</div></div>`);
+  }
+  if (leadsN > 0) tiles.push(`<div class="tile"><div class="v">${leadsN}</div><div class="l">People who reached out</div></div>`);
+  if (score) tiles.push(`<div class="tile"><div class="v">${score.total}<small>/100</small></div><div class="l">Website score</div></div>`);
+  if (!score && up && up.total >= 3 && upPct !== null) tiles.push(`<div class="tile"><div class="v">${upPct}%</div><div class="l">Uptime, checked daily</div></div>`);
+  const FRIENDLY2 = { auto_published: 'Website updated & republished', revision_done: 'A requested change was completed',
+    theme_changed: 'Fresh look applied to your site', logo_uploaded: 'Your logo was added', photo_uploaded: 'New photo added to your site',
+    lead_received: 'New lead from your website', preview_ready: 'A new version was published', hosting_active: 'Hosting & security activated',
+    build_started: 'Your website build is underway', invoice_paid: 'Payment received — thank you', launched: 'Your website went live',
+    page1_celebrated: 'You reached Page 1 of Google', first_lead_celebrated: 'Your first lead arrived' };
   return c.html(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex"><title>${biz} — Client Portal | ConversionCo</title>
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500&family=Karla:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
-  *{box-sizing:border-box;margin:0}body{font-family:-apple-system,'Segoe UI',sans-serif;background:#0B1D33;color:#EDF2F7;line-height:1.6}
-  .wrap{max-width:780px;margin:0 auto;padding:40px 20px 80px}
-  .head{display:flex;align-items:center;gap:14px;margin-bottom:6px}
-  .head img{height:44px;max-width:130px;object-fit:contain;background:#fff;border-radius:10px;padding:4px}
-  h1{font-size:26px}.sub{color:#8EA3BC;font-size:13px;margin-bottom:30px}
-  .card{background:#10263F;border:1px solid #1E3A5C;border-radius:16px;padding:24px;margin-bottom:18px}
-  .card h2{font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:#C9A254;margin-bottom:16px}
-  .steps{display:flex;flex-direction:column;gap:10px}
-  .step{display:flex;gap:12px;align-items:center;font-size:15px}
-  .dot{width:26px;height:26px;border-radius:50%;display:grid;place-items:center;font-size:13px;flex:0 0 26px;background:#1E3A5C;color:#8EA3BC}
-  .done .dot{background:#059669;color:#fff}.now .dot{background:#C9A254;color:#0B1D33}
-  .now{font-weight:600}.pend{color:#5C7794}
-  .scorebig{display:flex;gap:26px;align-items:center;flex-wrap:wrap}
-  .num{font-size:64px;font-weight:700;color:#C9A254;line-height:1}.num small{font-size:20px;color:#8EA3BC}
-  .bars{flex:1;min-width:240px;display:flex;flex-direction:column;gap:8px}
-  .bar{display:flex;align-items:center;gap:10px;font-size:12px}
-  .bar span{width:74px;color:#8EA3BC;text-transform:capitalize}.bar b{width:44px;text-align:right;font-size:11.5px}
-  .tr{flex:1;height:8px;background:#1E3A5C;border-radius:99px;overflow:hidden}.fl{height:100%;background:linear-gradient(90deg,#C9A254,#DDBE7A);border-radius:99px}
-  .grid4{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
-  .stat{background:#0C2036;border:1px solid #1E3A5C;border-radius:12px;padding:16px;text-align:center}
-  .stat .v{font-size:26px;font-weight:700}.stat .l{font-size:11px;color:#8EA3BC;letter-spacing:.05em;text-transform:uppercase;margin-top:4px}
-  ul.plan{list-style:none;display:flex;flex-direction:column;gap:9px;font-size:14.5px}
-  ul.plan li::before{content:"✓  ";color:#059669;font-weight:700}
-  .chipA{display:inline-block;background:#059669;color:#fff;font-size:11px;letter-spacing:.08em;padding:4px 12px;border-radius:99px;font-weight:700}
-  ul.blog{list-style:none;display:flex;flex-direction:column;gap:8px}ul.blog a, .replist a{color:#DDBE7A;text-decoration:none;font-size:14.5px}
-  .feed{display:flex;flex-direction:column;gap:9px;font-size:14px}.feed time{color:#5C7794;font-size:11.5px;display:block}
-  .btn{display:inline-block;background:#C9A254;color:#0B1D33;font-weight:700;padding:14px 26px;border-radius:10px;text-decoration:none;border:0;font-size:15px;cursor:pointer}
-  textarea{width:100%;background:#0C2036;border:1px solid #1E3A5C;border-radius:10px;color:#EDF2F7;padding:14px;font-family:inherit;font-size:14.5px;margin-bottom:12px}
-  .foot{text-align:center;color:#5C7794;font-size:12px;margin-top:30px}.foot a{color:#8EA3BC}
-  .two{display:grid;grid-template-columns:1fr;gap:0}@media(min-width:720px){.two{grid-template-columns:1fr 1fr;gap:18px}}
+  *{box-sizing:border-box;margin:0}
+  :root{--ink:#16202B;--muted:#5B6B7B;--faint:#8A99A8;--paper:#FBFAF7;--card:#FFFFFF;--line:#E7E3DA;--good:#1B7F4B;--navy:#0B1D33;--gold:#A16207}
+  body{background:var(--paper);color:var(--ink);font-family:'Karla',-apple-system,sans-serif;font-weight:300;line-height:1.6;font-size:15.5px}
+  .wrap{max-width:700px;margin:0 auto;padding:34px 18px 70px}
+  .head{display:flex;align-items:center;gap:14px}
+  .head img{height:44px;max-width:130px;object-fit:contain;background:#fff;border:1px solid var(--line);border-radius:10px;padding:4px}
+  .head .mono{width:46px;height:46px;border-radius:50%;border:1.5px solid var(--navy);display:flex;align-items:center;justify-content:center;font-family:'Cormorant Garamond',serif;font-size:20px;color:var(--navy)}
+  h1{font-family:'Cormorant Garamond',Georgia,serif;font-weight:500;font-size:clamp(24px,5.5vw,32px);color:var(--navy);line-height:1.1}
+  .sub{color:var(--muted);font-size:12.5px;letter-spacing:.05em;margin-top:3px}
+  .card{background:var(--card);border:1px solid var(--line);border-top:3px solid var(--sec,var(--navy));border-radius:18px;padding:22px 20px;margin:14px 0}
+  .c-goog{--sec:#2F7E76}.c-cust{--sec:#1B7F4B}.c-score{--sec:#7C3AED}.c-health{--sec:#0E8A8A}.c-rep{--sec:#A16207}.c-blog{--sec:#C2410C}.c-act{--sec:#475569}.c-msg{--sec:#0B1D33}
+  .eyebrow{font-size:11px;letter-spacing:.22em;text-transform:uppercase;color:var(--sec,var(--gold));font-weight:500}
+  h2{font-family:'Cormorant Garamond',Georgia,serif;font-weight:400;font-size:21px;margin:5px 0 12px;color:var(--ink)}
+  .livebar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:18px 0 4px}
+  .livepill{display:inline-flex;align-items:center;gap:7px;background:#E7F5EC;color:var(--good);font-weight:500;font-size:13px;padding:7px 14px;border-radius:99px}
+  .livepill i{width:8px;height:8px;border-radius:50%;background:var(--good);display:inline-block}
+  .btn{display:inline-block;background:var(--navy);color:#fff;font-weight:500;padding:11px 22px;border-radius:10px;text-decoration:none;border:0;font-size:14px;cursor:pointer}
+  .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}
+  .tile{background:var(--paper);border:1px solid var(--line);border-radius:16px;padding:16px 12px 13px;text-align:center}
+  .tile .v{font-family:'Cormorant Garamond',serif;font-size:36px;line-height:1;color:var(--ink)}
+  .tile .v small{font-size:15px;color:var(--muted)}
+  .tile .l{font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-top:6px}
+  .grow{padding:14px 0;border-bottom:1px dashed var(--line)} .grow:last-of-type{border-bottom:0;padding-bottom:4px}
+  .grow .kw{font-size:13px;color:var(--muted)} .grow .kw b{color:var(--ink);font-weight:500}
+  .ladder{position:relative;height:16px;background:var(--line);border-radius:99px;margin:9px 0 4px}
+  .lfill{position:absolute;left:0;top:0;height:100%;border-radius:99px 5px 5px 99px;background:var(--sec,#2F7E76);min-width:8px}
+  .ghost{position:absolute;top:-4px;width:2px;height:24px;background:var(--faint);border-radius:2px}
+  .goal{position:absolute;right:0;top:0;height:100%;width:10%;border-radius:0 99px 99px 0;background:var(--sec,#2F7E76);opacity:.14}
+  .lscale{display:flex;justify-content:space-between;font-size:10.5px;color:var(--faint)}
+  .pos{font-size:15px;margin-top:5px} .pos b{font-weight:500;color:var(--sec,#2F7E76);font-family:'Cormorant Garamond',serif;font-size:20px}
+  .up{color:var(--good);font-size:12.5px;font-weight:500} .mut{color:var(--faint);font-size:12.5px}
+  .note{font-size:12px;color:var(--faint);margin-top:10px}
+  .steps{display:flex;flex-direction:column;gap:9px}
+  .step{display:flex;gap:11px;align-items:center;font-size:14.5px}
+  .dot{width:24px;height:24px;border-radius:50%;display:grid;place-items:center;font-size:12px;flex:0 0 24px;background:var(--line);color:var(--muted)}
+  .done .dot{background:#E7F5EC;color:var(--good)} .now .dot{background:var(--navy);color:#fff}
+  .now{font-weight:500} .pend{color:var(--faint)}
+  .checks{display:grid;gap:9px} .check{display:flex;gap:10px;align-items:flex-start;font-size:14.5px}
+  .check .tick{color:var(--good);font-weight:600;flex:0 0 auto}
+  ul.list{list-style:none;display:grid;gap:8px} ul.list a{color:var(--ink);text-decoration:none;font-size:14.5px;border-bottom:1px solid var(--line);padding-bottom:7px;display:block}
+  ul.list a:hover{color:var(--sec,var(--navy))}
+  .feed{display:grid;gap:9px;font-size:14px} .feed time{color:var(--faint);font-size:11.5px;display:block}
+  textarea{width:100%;background:var(--paper);border:1px solid var(--line);border-radius:10px;color:var(--ink);padding:13px;font-family:inherit;font-size:14.5px;margin-bottom:12px}
+  .foot{text-align:center;color:var(--faint);font-size:12px;margin-top:26px} .foot a{color:var(--muted)}
 </style></head><body><div class="wrap">
-  <div class="head">${slug ? `<img src="/preview/${slug}/img/logo.png" onerror="this.remove()">` : ''}<div><h1>${biz}</h1></div></div>
-  <p class="sub">Your private client portal · ConversionCo ${isPremium ? '· <b style="color:#C9A254">★ Premium</b>' : ''}</p>
+  <div class="head">${slug ? `<img src="/preview/${slug}/img/logo.png" onerror="this.outerHTML='<div class=mono>${escq(biz).slice(0, 1)}</div>'">` : `<div class="mono">${escq(biz).slice(0, 1)}</div>`}
+    <div><h1>${biz}</h1><div class="sub">Private client portal · prepared by your ConversionCo team${isPremium ? ' · Premium' : ''}</div></div></div>
 
-  <div class="card"><h2>Where your project stands</h2><div class="steps">
+  ${client.stage === 'live'
+    ? `<div class="livebar"><span class="livepill"><i></i>Live on the web</span>${siteUrl ? `<a class="btn" href="${siteUrl}" target="_blank">View your website →</a>` : ''}</div>`
+    : `<div class="card"><span class="eyebrow">Your Project</span><h2>Where things stand</h2><div class="steps">
     ${PORTAL_STAGES.map(([k, label], i) => `<div class="step ${i < doneIdx ? 'done' : i === doneIdx ? 'now' : 'pend'}"><span class="dot">${i < doneIdx ? '✓' : i === doneIdx ? '●' : i + 1}</span>${label}</div>`).join('')}
-  </div>${siteUrl ? `<a class="btn" href="${siteUrl}" target="_blank" style="margin-top:18px">View your website →</a>` : ''}</div>
+  </div>${siteUrl ? `<a class="btn" href="${siteUrl}" target="_blank" style="margin-top:16px">View your website →</a>` : ''}</div>`}
 
-  ${score ? `<div class="card"><h2>Your SEO Score</h2><div class="scorebig"><div class="num">${score.total}<small>/100</small></div><div class="bars">${bars}</div></div>
-  <p style="color:#8EA3BC;font-size:12.5px;margin-top:14px">A real audit of your website's search-readiness — technical health, content depth, local signals, reliability, and off-site presence. It climbs as we work.</p></div>` : ''}
+  ${tiles.length ? `<div class="card"><span class="eyebrow">At a Glance</span><h2>Your numbers right now</h2><div class="tiles">${tiles.join('')}</div></div>` : ''}
 
-  <div class="card"><h2>Your investment at work</h2><div class="grid4">
-    <div class="stat"><div class="v">${up && up.total ? up.total : '—'}</div><div class="l">Security checks run</div></div>
-    <div class="stat"><div class="v">${upPct === null ? '—' : upPct + '%'}</div><div class="l">Uptime</div></div>
-    <div class="stat"><div class="v">${score ? score.pages.total : '—'}</div><div class="l">Pages built &amp; maintained</div></div>
-    <div class="stat"><div class="v">${score ? score.pages.blogPosts : 0}</div><div class="l">Articles written for you</div></div>
-    <div class="stat"><div class="v">${revsN}</div><div class="l">Changes completed</div></div>
-    <div class="stat"><div class="v">${leadsN}</div><div class="l">Leads captured</div></div>
+  <div class="card c-goog"><span class="eyebrow">Google</span><h2>Where you stand on Google</h2>
+    ${hasGsc ? `<p class="note" style="margin:0 0 6px">Straight from Google's own records — your exact position for searches people typed in the last 28 days · updated ${String(gsc.checked_at).slice(0, 10)}.</p>
+      ${gsc.queries.map((q) => `<div class="grow"><div class="kw">when someone searches <b>"${escq(q.q)}"</b></div>${ladder(q.pos, q.prev)}<div class="pos">you're <b>#${q.pos}</b> on Google${moveTxt(q.pos, q.prev)}</div></div>`).join('')}` : ''}
+    ${ranks && Array.isArray(ranks.keywords) && ranks.keywords.length ? `
+      ${hasGsc ? '<p class="note" style="margin:12px 0 0">And in the searches we run ourselves in your market:</p>' : `<p class="note" style="margin:0 0 6px">We run these exact searches every week${ranks.checked_at ? ` · last checked ${String(ranks.checked_at).slice(0, 10)}` : ''}.</p>`}
+      ${ranks.keywords.map((k) => `<div class="grow"><div class="kw">when someone searches <b>"${escq(k.kw)}"</b></div>${ladder(k.you || 0, null)}
+        <div class="pos">${k.you ? `you're <b>Page 1, #${k.you}</b>` : (k.pending ? 'your spot is waiting — tracking starts at launch' : `not on Page 1 yet — that's the target`)}</div>
+        ${k.competitors ? `<div class="note" style="margin-top:4px">${Object.entries(k.competitors).map(([n, p]) => `${escq(n)}: ${p ? `Page 1, #${p}` : 'not on Page 1'}`).join(' · ')}</div>` : ''}</div>`).join('')}` : ''}
+    ${!hasGsc && !(ranks && ranks.keywords && ranks.keywords.length) ? (client.live_url
+      ? `<p style="color:var(--muted);font-size:14px">Your website is registered with Google and the measuring has begun — your first exact positions appear here within days, and we re-check them every Sunday.</p><div class="ladder"><div class="goal"></div></div><div class="lscale"><span>#100</span><span>Page 1 🏁</span></div>`
+      : `<p style="color:var(--muted);font-size:14px">The day your website goes live, we start tracking exactly where you appear on Google — every week, right here.</p>`) : ''}
+  </div>
+
+  ${score ? `<div class="card c-score"><span class="eyebrow">Your Website</span><h2>Website score: ${score.total}/100</h2>
+    <div style="display:flex;gap:20px;align-items:center;flex-wrap:wrap">
+      <svg width="118" height="118" viewBox="0 0 120 120" role="img" aria-label="Score ${score.total} of 100">
+        <circle cx="60" cy="60" r="52" fill="none" stroke="var(--line)" stroke-width="9"/>
+        <circle cx="60" cy="60" r="52" fill="none" stroke="#7C3AED" stroke-width="9" stroke-linecap="round" stroke-dasharray="${(326.7 * score.total / 100).toFixed(1)} 326.7" transform="rotate(-90 60 60)"/>
+        <text x="60" y="57" text-anchor="middle" style="font:400 30px 'Cormorant Garamond';fill:var(--ink)">${score.total}</text>
+        <text x="60" y="76" text-anchor="middle" style="font:400 10px 'Karla';fill:var(--muted)">out of 100</text>
+      </svg>
+      <p style="flex:1;min-width:220px;color:var(--muted);font-size:13.5px">A real audit of your website's search-readiness. The biggest points come from your presence on Google — profile, listings, reviews — so it climbs as that work lands.</p>
+    </div>
+    ${hist.length >= 2 ? (() => { const w = 560, h = 60, mn = Math.min(...hist.map(p => p.s)) - 3, mx = Math.max(...hist.map(p => p.s)) + 3;
+      const pts = hist.map((p, i) => `${(i / (hist.length - 1) * w).toFixed(1)},${(h - (p.s - mn) / Math.max(1, mx - mn) * h).toFixed(1)}`).join(' ');
+      return `<svg viewBox="0 0 ${w} ${h + 8}" style="width:100%;height:auto;margin-top:14px"><polyline points="${pts}" fill="none" stroke="#7C3AED" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="${w}" cy="${(h - (hist[hist.length - 1].s - mn) / Math.max(1, mx - mn) * h).toFixed(1)}" r="3.5" fill="#7C3AED"/></svg><div class="note">your score since we started — ${hist[0].s} → ${hist[hist.length - 1].s}</div>`; })() : ''}
+  </div>` : ''}
+
+  <div class="card c-health"><span class="eyebrow">Health</span><h2>Healthy, safe, and working</h2><div class="checks">
+    ${up && up.total ? `<div class="check"><span class="tick">✓</span><span>Looked in on every day — ${up.total} check${up.total === 1 ? '' : 's'} so far${upPct !== null ? `, ${upPct}% clean` : ''}${up.last === 'up' ? ', all clear today' : ''}.</span></div>` : `<div class="check"><span class="tick">✓</span><span>Daily care is switched on — we look in on your website every single day.</span></div>`}
+    ${settings[`gsc_${id}`] && (JSON.parse(settings[`gsc_${id}`] || '{}').verified) ? `<div class="check"><span class="tick">✓</span><span>Registered with Google — your site map is in Google's hands, so it knows every page you have.</span></div>` : ''}
+    ${billing.sub_status === 'active' ? `<div class="check"><span class="tick">✓</span><span>Hosting &amp; security active — your website is protected around the clock.</span></div>` : ''}
+    ${revsN > 0 ? `<div class="check"><span class="tick">✓</span><span>${revsN} change${revsN === 1 ? '' : 's'} completed for you since day one.</span></div>` : ''}
+    ${score && score.pages.blogPosts > 0 ? `<div class="check"><span class="tick">✓</span><span>${score.pages.blogPosts} article${score.pages.blogPosts === 1 ? '' : 's'} written and published for you.</span></div>` : ''}
   </div></div>
 
-  <div class="two">
-    <div class="card"><h2>Your plan${billing.sub_status === 'active' ? ' <span class="chipA">🛡 PROTECTED</span>' : ''}</h2>
-      <ul class="plan">${plan.map((p) => `<li>${p}</li>`).join('')}</ul>
-    </div>
-    <div class="card"><h2>Recent activity</h2><div class="feed">
-      ${evRows.length ? evRows.map((e) => `<div>${FRIENDLY[e.type] || e.type}<time>${e.created_at} UTC</time></div>`).join('') : '<p style="color:#8EA3BC;font-size:13.5px">Activity appears here as we work.</p>'}
-    </div></div>
-  </div>
+  ${leadsN > 0 ? `<div class="card c-cust"><span class="eyebrow">Customers</span><h2>People who reached out</h2>
+    <div style="display:flex;align-items:baseline;gap:14px"><div style="font-family:'Cormorant Garamond',serif;font-size:52px;line-height:1">${leadsN}</div>
+    <p style="color:var(--muted);font-size:14px;max-width:360px">people have contacted you through your website — each one lands in your inbox the moment it happens.</p></div></div>` : ''}
 
-  ${(() => { let g = null; try { g = JSON.parse(settings[`gsc_data_${id}`] || 'null'); } catch {}
-    if (!g || !Array.isArray(g.queries) || !g.queries.length) return '';
-    const esc = (s) => String(s).replace(/[<>&]/g, '');
-    const delta = (q) => q.prev == null || q.prev === q.pos ? ''
-      : q.pos < q.prev ? ` <span style="color:#34D399;font-size:12px;font-weight:700">▲ up from #${q.prev}</span>`
-      : ` <span style="color:#8EA3BC;font-size:12px">was #${q.prev}</span>`;
-    return `<div class="card"><h2>Google's own numbers 📊</h2>
-    <p style="color:#8EA3BC;font-size:12.5px;margin-bottom:12px">Straight from Google Search Console — your exact position for searches people actually typed, last 28 days · updated ${String(g.checked_at).slice(0, 10)}.</p>
-    <div class="grid4" style="margin-bottom:14px">
-      <div class="stat"><div class="v">${Number(g.totals?.imp || 0).toLocaleString()}</div><div class="l">Times you appeared on Google</div></div>
-      <div class="stat"><div class="v">${Number(g.totals?.clicks || 0).toLocaleString()}</div><div class="l">Clicks to your website</div></div>
-    </div>
-    <div style="display:flex;flex-direction:column;gap:9px">
-    ${g.queries.map((q) => `<div style="border-bottom:1px dashed rgba(142,163,188,.25);padding-bottom:7px;">
-      <div style="font-size:13px;color:#8EA3BC;">when someone searches "${esc(q.q)}"</div>
-      <div style="font-size:15px;margin-top:1px;"><b style="color:#C9A254">you're #${q.pos} on Google</b>${delta(q)} <span style="color:#5C7794;font-size:12px">· seen ${q.imp}× · ${q.clicks} click${q.clicks === 1 ? '' : 's'}</span></div>
-    </div>`).join('')}
-    </div></div>`; })()}
+  ${reports.length ? `<div class="card c-rep"><span class="eyebrow">Reports</span><h2>Your reports</h2><ul class="list">
+    ${reports.map((r) => `<li><a href="/portal/${id}/${tok}/report/${r}" target="_blank">${r.replace('.html', '')} →</a></li>`).join('')}
+  </ul></div>` : ''}
 
-  <div class="card"><h2>What page of Google you're on 🔎</h2>
-    ${ranks && Array.isArray(ranks.keywords) && ranks.keywords.length ? `
-    <p style="color:#8EA3BC;font-size:12.5px;margin-bottom:10px">We run these exact searches every week${ranks.checked_at ? ` · last checked ${String(ranks.checked_at).slice(0, 10)}` : ''}. Positions can vary a little by searcher location — the trend is what matters.</p>
-    <div style="display:flex;flex-direction:column;gap:10px">
-    ${ranks.keywords.map((k) => {
-      const spot = (p) => p ? `Page 1, #${p}` : 'not on Page 1 yet';
-      return `<div style="border-bottom:1px dashed rgba(142,163,188,.25);padding-bottom:8px;">
-      <div style="font-size:13px;color:#8EA3BC;">when someone searches "${String(k.kw || '').replace(/[<>&]/g, '')}"</div>
-      <div style="font-size:15px;margin-top:2px;"><b style="color:#C9A254">You: ${k.you ? '📍 ' + spot(k.you) : (k.pending ? 'your spot is waiting — tracking starts at launch' : "not on Page 1 yet — that's the target")}</b></div>
-      ${k.competitors ? `<div style="font-size:13px;color:#8EA3BC;margin-top:2px;">${Object.entries(k.competitors).map(([n, p]) => `${String(n).replace(/[<>&]/g, '')}: ${spot(p)}`).join(' · ')}</div>` : ''}
-    </div>`; }).join('')}
-    </div>`
-    : (client.live_url
-      ? `<p style="color:#8EA3BC;font-size:13.5px">Your first Google position check runs this week — from then on, this card shows exactly what page of Google you're on for your key searches, updated weekly.</p>`
-      : `<p style="color:#8EA3BC;font-size:13.5px">Your site is pre-launch. The day your domain goes live, we start checking <b style="color:#C9A254">what page of Google you're on</b> — every week, right here, next to your local competitors. Page 1 is the goal.</p>`)}
-  </div>
+  ${blogs.length ? `<div class="card c-blog"><span class="eyebrow">Published For You</span><h2>Fresh on your website</h2><ul class="list">${blogs.map((b) => `<li><a href="/preview/${slug}/${b.path}" target="_blank">${b.path.replace('blog-', '').replace('.html', '').replace(/-/g, ' ')} →</a></li>`).join('')}</ul></div>` : ''}
 
-  ${(() => { let hist = []; try { hist = JSON.parse(settings[`scorehist_${id}`] || '[]'); } catch {} if (hist.length < 2) return '';
-    const w = 560, h = 90, min = Math.min(...hist.map(p => p.s)) - 4, max = Math.max(...hist.map(p => p.s)) + 4;
-    const pts = hist.map((p, i) => `${(i / (hist.length - 1) * w).toFixed(1)},${(h - (p.s - min) / Math.max(1, max - min) * h).toFixed(1)}`).join(' ');
-    const last = hist[hist.length - 1].s, firstS = hist[0].s;
-    return `<div class="card"><h2>Your climb 📈</h2>
-      <p style="color:#8EA3BC;font-size:12.5px;margin-bottom:10px">Your website score over time — started at ${firstS}, now ${last}.</p>
-      <svg viewBox="0 0 ${w} ${h + 10}" style="width:100%;height:auto" role="img" aria-label="Score trend from ${firstS} to ${last}">
-        <polyline points="${pts}" fill="none" stroke="#C9A254" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
-        <circle cx="${w}" cy="${(h - (last - min) / Math.max(1, max - min) * h).toFixed(1)}" r="5" fill="#C9A254"/>
-      </svg></div>`; })()}
-
-  ${reports.length ? `<div class="card"><h2>Your performance reports</h2><div class="replist" style="display:flex;flex-direction:column;gap:8px">
-    ${reports.map((r) => `<a href="/portal/${id}/${tok}/report/${r}" target="_blank">📊 ${r.replace('.html', '')}</a>`).join('')}
+  ${evRows.length ? `<div class="card c-act"><span class="eyebrow">Activity</span><h2>Recently, from your team</h2><div class="feed">
+    ${evRows.map((e) => `<div>${FRIENDLY2[e.type] || e.type}<time>${String(e.created_at).slice(0, 10)}</time></div>`).join('')}
   </div></div>` : ''}
 
-  ${blogs.length ? `<div class="card"><h2>Recently published for you</h2><ul class="blog">${blogs.map((b) => `<li><a href="/preview/${slug}/${b.path}" target="_blank">→ ${b.path.replace('blog-', '').replace('.html', '').replace(/-/g, ' ')}</a></li>`).join('')}</ul></div>` : ''}
-
-  <div class="card"><h2>Message us</h2>
-    <p style="color:#8EA3BC;font-size:13.5px;margin-bottom:12px">Questions, change requests, ideas — send them straight to your ConversionCo team. A human replies, usually same day.</p>
+  <div class="card c-msg"><span class="eyebrow">Talk To Us</span><h2>Send us a note</h2>
+    <p style="color:var(--muted);font-size:13.5px;margin-bottom:12px">Questions, changes, ideas — a real person reads every message and replies, usually the same day.</p>
     <form id="msgForm"><textarea name="message" rows="3" required placeholder="Type your message…"></textarea>
     <button class="btn" type="submit">Send message</button>
-    <p id="msgOk" style="display:none;color:#34D399;font-weight:600;margin-top:10px">Sent! We'll get back to you shortly. 💛</p></form>
+    <p id="msgOk" style="display:none;color:var(--good);font-weight:500;margin-top:10px">Sent — we'll get back to you shortly.</p></form>
   </div>
 
-  <p class="foot">Website care by <a href="https://conversionco918.com">ConversionCo</a> · This portal updates in real time</p>
+  <p class="foot">Website care by <a href="https://conversionco918.com">ConversionCo</a></p>
 </div>
 <script>
 document.getElementById('msgForm').addEventListener('submit', async (e) => {
