@@ -44,21 +44,30 @@ export async function ensureCustomer(key, email, name) {
   return stripeReq(key, 'POST', '/customers', { email, ...(name ? { name } : {}) });
 }
 
-export async function sendInvoice(key, customerId, tierKey, businessName) {
+export function halfDisplay(tierKey) {
   const p = PRICES[tierKey] || PRICES.standard;
+  return `$${(p.amount / 2 / 100).toFixed(2).replace(/\.00$/, '')}`;
+}
+
+// half: 'deposit' (50% to start the build) | 'final' (50% on delivery) | undefined (full, legacy)
+export async function sendInvoice(key, customerId, tierKey, businessName, half) {
+  const p = PRICES[tierKey] || PRICES.standard;
+  const amount = half ? Math.round(p.amount / 2) : p.amount;
+  const suffix = half === 'deposit' ? ' — 50% deposit (build begins on payment)'
+    : half === 'final' ? ' — final 50% balance (your website is ready)' : '';
   // draft invoice first, then attach the item to it, then finalize + send
   const invoice = await stripeReq(key, 'POST', '/invoices', {
     customer: customerId,
     collection_method: 'send_invoice',
     days_until_due: 7,
-    description: `ConversionCo — ${p.label}${businessName ? ` for ${businessName}` : ''}`,
+    description: `ConversionCo — ${p.label}${suffix}${businessName ? ` for ${businessName}` : ''}`,
   });
   await stripeReq(key, 'POST', '/invoiceitems', {
     customer: customerId,
     invoice: invoice.id,
-    amount: p.amount,
+    amount,
     currency: 'usd',
-    description: `${p.label}${businessName ? ` — ${businessName}` : ''}`,
+    description: `${p.label}${suffix}${businessName ? ` — ${businessName}` : ''}`,
   });
   const finalized = await stripeReq(key, 'POST', `/invoices/${invoice.id}/finalize`, {});
   let sent = finalized;

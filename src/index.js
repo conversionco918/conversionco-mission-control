@@ -3,7 +3,11 @@ import { GHL } from './ghl.js';
 import { DEFAULT_TEMPLATES, BOOKING_TEMPLATES, DEFAULT_SETTINGS, renderTemplate } from './emails.js';
 import { THEMES } from './themes.js';
 import { vibeToTokens } from './vibe.js';
-import { PRICES, ensureCustomer, sendInvoice, invoiceStatus, hostingCheckout, checkoutStatus } from './stripe.js';
+import { PRICES, ensureCustomer, sendInvoice, invoiceStatus, hostingCheckout, checkoutStatus, halfDisplay } from './stripe.js';
+
+// 50/50 billing helpers (legacy full invoices from before the split still count)
+function depositPaid(b) { return b.dep_status === 'paid' || b.invoice_status === 'paid'; }
+function finalPaid(b) { return b.fin_status === 'paid' || b.invoice_status === 'paid'; }
 import { computeScore } from './score.js';
 import dashboardHtml from './ui.html';
 import form1Html from './form1.html';
@@ -315,7 +319,7 @@ app.get('/debug/:key', async (c) => {
       return rows.map((r) => {
         let b = {}; try { b = JSON.parse(r.billing || '{}'); } catch {}
         return { id: r.id, email: r.email, business_name: r.business_name, tier: r.tier, stage: r.stage,
-          paid: b.invoice_status === 'paid', hosting: b.sub_status === 'active' };
+          paid: depositPaid(b), paidInFull: finalPaid(b), hosting: b.sub_status === 'active' };
       });
     })(),
     revisionQueue: await (async () => {
@@ -328,7 +332,7 @@ app.get('/debug/:key', async (c) => {
         let b = {}; try { b = JSON.parse(r.billing || '{}'); } catch {}
         return { id: r.id, email: r.email, name: r.name, business_name: r.business_name,
           tier: r.tier || 'standard', theme: r.theme || '', vibe: r.vibe || '',
-          paid: b.invoice_status === 'paid',
+          paid: depositPaid(b),
           intake1: r.intake1_data || '', intake2: r.intake2_data || '' };
       });
     })(),
@@ -576,6 +580,19 @@ app.get('/api/email-status/:key', async (c) => {
   } catch (e) { return c.json({ ok: false, error: String(e.message || e).slice(0, 300) }); }
 });
 
+// Keyed: the auto-builder calls this the moment it starts building a client's site,
+// so Mission Control shows "⚙ Building site…" live instead of jumping straight to preview.
+app.get('/api/build-started/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const id = Number(c.req.query('id'));
+  if (!id) return c.json({ ok: false, error: '?id= required' });
+  const client = await c.env.DB.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ ok: false, error: 'client not found' });
+  await touchClient(c.env.DB, id, { stage: 'generating' });
+  await logEvent(c.env.DB, id, 'build_started', `⚙ Build started for ${client.business_name || client.name || client.email} — site is being generated now`);
+  return c.json({ ok: true });
+});
+
 // Keyed: clear stored email-template overrides so the code defaults (personal style) apply
 app.get('/api/reset-templates/:key', async (c) => {
   if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
@@ -621,12 +638,12 @@ app.get('/form/1', (c) => c.html(form1Html));
 app.get('/form/2', (c) => c.html(form2Html));
 
 // ---------------- service agreement (sent before payment, e-signed) ----------------
-const AGREEMENT_VERSION = 'v1-2026-07-23';
+const AGREEMENT_VERSION = 'v2-2026-07-23-split';
 function agreementTerms(biz, pkgLabel, pkgPrice) {
   return [
-    ['1. What we are building', `ConversionCo will design, write, and build the ${pkgLabel} for ${biz}: a custom, mobile-first website with full search-engine setup as described in your proposal. Your one-time project fee is ${pkgPrice}, due before the build begins.`],
+    ['1. What we are building', `ConversionCo will design, write, and build the ${pkgLabel} for ${biz}: a custom, mobile-first website with full search-engine setup as described in your proposal. Your one-time project fee is ${pkgPrice}, paid in two equal halves: 50% as a deposit before the build begins, and the remaining 50% when your finished website preview is delivered to you.`],
     ['2. Website Care Plan — $49/month', `Keeping your website live with us is covered by the Website Care Plan: hosting, security, daily uptime monitoring, performance reports, and ongoing platform updates (Premium plans also include weekly published content). It is month-to-month, starts only when your site is ready and you confirm, and you may cancel any time — cancellation takes effect at the end of the current billing period.`],
-    ['3. Payment & refunds', `The build starts after your project fee is paid in full. Because our build process begins immediately and produces custom work, the fee is non-refundable once your build has started — with one exception in your favor: if we fail to deliver a preview of your website within 14 days of payment, you may request a full refund.`],
+    ['3. Payment & refunds', `The build starts once your 50% deposit is received. Because our build process begins immediately and produces custom work, the deposit is non-refundable once your build has started — with one exception in your favor: if we fail to deliver a preview of your website within 14 days of your deposit, you may request a full refund of it. The remaining 50% is invoiced when your website preview is delivered, and is due within 7 days. Your website goes live on your domain once the balance is paid.`],
     ['4. Revisions', `Your project includes two full rounds of revisions before launch, plus reasonable adjustments during your first 30 days live. After that, changes are handled through your Care Plan (reasonable monthly volume) or quoted separately for larger redesigns. This keeps every project fair — for you and for our other clients.`],
     ['5. What you own', `Your domain name is yours — registered for your business, and transferable to your direct control on request at any time. Your content is yours — your logo, photos, story, and business information. And once your project fee is paid in full, the finished website code (the HTML, CSS, JavaScript, and images that make up your site) is yours as well.`],
     ['6. What remains ours', `The ConversionCo platform is licensed to you while you are a client, and is never transferred: our client portal and dashboards, our automated build, content, and reporting systems, our monitoring tools, and our internal processes. These power your service; they are not part of the website deliverable.`],
@@ -1047,9 +1064,15 @@ async function computeOverview(db, clients, settings) {
     const label = cl.business_name || cl.name || cl.email;
     let b = {}; try { b = JSON.parse(cl.billing || '{}'); } catch {}
     const tierKey = b.invoice_tier || (cl.tier === 'premium' ? 'premium' : 'standard');
-    const amt = PRICES[tierKey].amount / 100;
-    if (b.invoice_status === 'paid') collected += amt;
-    else if (b.invoice_status === 'open') { outstanding += amt; needs.push({ id: cl.id, sev: 2, kind: 'invoice', msg: `💳 ${label} — invoice outstanding (${PRICES[tierKey].display})` }); }
+    const amt = PRICES[tierKey].amount / 100, half = amt / 2;
+    if (b.invoice_status === 'paid') collected += amt; // legacy full invoice
+    else {
+      if (b.dep_status === 'paid') collected += half;
+      else if (b.dep_status === 'open') { outstanding += half; needs.push({ id: cl.id, sev: 2, kind: 'invoice', msg: `💳 ${label} — 50% deposit outstanding (${halfDisplay(tierKey)})` }); }
+      if (b.fin_status === 'paid') collected += half;
+      else if (b.fin_status === 'open') { outstanding += half; needs.push({ id: cl.id, sev: 2, kind: 'invoice', msg: `💳 ${label} — final balance outstanding (${halfDisplay(tierKey)})` }); }
+    }
+    if (b.invoice_status === 'open') { outstanding += amt; needs.push({ id: cl.id, sev: 2, kind: 'invoice', msg: `💳 ${label} — invoice outstanding (${PRICES[tierKey].display})` }); }
     if (b.sub_status === 'active') hostingCount++;
 
     let why = [], dot = 'green';
@@ -1060,10 +1083,10 @@ async function computeOverview(db, clients, settings) {
       const days = Math.floor((Date.now() - Date.parse(b.agr_sent)) / dayMs);
       if (days >= 2) { if (dot === 'green') dot = 'yellow'; why.push('agreement unsigned'); needs.push({ id: cl.id, sev: 2, kind: 'agreement', msg: `📄 ${label} — agreement unsigned for ${days} day${days === 1 ? '' : 's'} (nudge them)` }); }
     }
-    if (b.invoice_status === 'open' && dot === 'green') { dot = 'yellow'; why.push('invoice open'); }
-    if (b.invoice_status === 'paid' && !cl.intake2_data && !['generating', 'preview_ready', 'live'].includes(cl.stage)) {
-      if (dot === 'green') dot = 'yellow'; why.push('paid — needs Intake 2');
-      if (cl.stage !== 'intake2_sent') needs.push({ id: cl.id, sev: 2, kind: 'intake2', msg: `🚀 ${label} — PAID and ready: send Intake 2 to start their build` });
+    if ((b.invoice_status === 'open' || b.dep_status === 'open' || b.fin_status === 'open') && dot === 'green') { dot = 'yellow'; why.push('invoice open'); }
+    if (depositPaid(b) && !cl.intake2_data && !['generating', 'preview_ready', 'live'].includes(cl.stage)) {
+      if (dot === 'green') dot = 'yellow'; why.push('deposit paid — needs Intake 2');
+      if (cl.stage !== 'intake2_sent') needs.push({ id: cl.id, sev: 2, kind: 'intake2', msg: `🚀 ${label} — deposit PAID and ready: send Intake 2 to start their build` });
     }
     if (cl.stage === 'intake1_done') needs.push({ id: cl.id, sev: 3, kind: 'call', msg: `📞 ${label} — Intake 1 done, book/hold the pricing call` });
     health[cl.id] = { dot, why: why.join(' · ') || 'all good' };
@@ -1236,15 +1259,20 @@ app.post('/api/clients/:id/invoice', async (c) => {
   const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
   if (!client) return c.json({ error: 'client not found' }, 404);
   const tierKey = (client.tier === 'premium') ? 'premium' : 'standard';
+  let which = 'deposit';
+  try { which = (await c.req.json())?.which || 'deposit'; } catch {}
+  if (which !== 'final') which = 'deposit';
   try {
     const cust = await ensureCustomer(c.env.STRIPE_SECRET_KEY, client.email, client.name || client.business_name || '');
-    const inv = await sendInvoice(c.env.STRIPE_SECRET_KEY, cust.id, tierKey, client.business_name || '');
+    const inv = await sendInvoice(c.env.STRIPE_SECRET_KEY, cust.id, tierKey, client.business_name || '', which);
     const billing = getBilling(client);
-    billing.customer_id = cust.id;
-    billing.invoice_id = inv.id; billing.invoice_status = inv.status; billing.invoice_url = inv.url; billing.invoice_tier = tierKey;
+    billing.customer_id = cust.id; billing.invoice_tier = tierKey;
+    if (which === 'deposit') { billing.dep_id = inv.id; billing.dep_status = inv.status; billing.dep_url = inv.url; }
+    else { billing.fin_id = inv.id; billing.fin_status = inv.status; billing.fin_url = inv.url; }
     await touchClient(db, id, { billing: JSON.stringify(billing) });
-    await logEvent(db, id, 'invoice_sent', `Stripe invoice sent — ${PRICES[tierKey].display} (${PRICES[tierKey].label}) 💳`);
-    return c.json({ ok: true, url: inv.url, display: PRICES[tierKey].display });
+    const halfLabel = which === 'deposit' ? '50% deposit' : 'final 50% balance';
+    await logEvent(db, id, 'invoice_sent', `Stripe invoice sent — ${halfDisplay(tierKey)} ${halfLabel} (${PRICES[tierKey].label}) 💳`);
+    return c.json({ ok: true, url: inv.url, display: halfDisplay(tierKey), which });
   } catch (e) {
     return c.json({ error: 'Stripe: ' + e.message }, 502);
   }
@@ -1274,22 +1302,51 @@ app.post('/api/clients/:id/hosting', async (c) => {
 async function pollBilling(env) {
   if (!env.STRIPE_SECRET_KEY) return 0;
   const db = env.DB;
-  const clients = (await db.prepare(`SELECT * FROM clients WHERE billing LIKE '%"invoice_status":"open"%' OR billing LIKE '%"sub_status":"pending"%'`).all()).results || [];
+  const clients = (await db.prepare(`SELECT * FROM clients WHERE billing LIKE '%"invoice_status":"open"%' OR billing LIKE '%"dep_status":"open"%' OR billing LIKE '%"fin_status":"open"%' OR billing LIKE '%"sub_status":"pending"%'`).all()).results || [];
   let changed = 0;
   for (const client of clients) {
     const billing = getBilling(client);
+    let dirty = 0;
+    const tierKey = billing.invoice_tier || 'standard';
     try {
+      // legacy full invoice
       if (billing.invoice_id && billing.invoice_status === 'open') {
         const st = await invoiceStatus(env.STRIPE_SECRET_KEY, billing.invoice_id);
         if (st.status !== billing.invoice_status) {
           billing.invoice_status = st.status;
           if (st.paid) {
             billing.paid_at = new Date().toISOString();
-            await logEvent(db, client.id, 'invoice_paid', `Invoice PAID — ${PRICES[billing.invoice_tier || 'standard'].display} 🎉💰`);
+            await logEvent(db, client.id, 'invoice_paid', `Invoice PAID — ${PRICES[tierKey].display} 🎉💰`);
             const settingsP = await getSettings(db);
             await sendPortalEmail(env, db, client, settingsP);
           }
-          changed++;
+          dirty++;
+        }
+      }
+      // 50% deposit — payment unlocks the build + portal
+      if (billing.dep_id && billing.dep_status === 'open') {
+        const st = await invoiceStatus(env.STRIPE_SECRET_KEY, billing.dep_id);
+        if (st.status !== billing.dep_status) {
+          billing.dep_status = st.status;
+          if (st.paid) {
+            billing.dep_paid_at = new Date().toISOString();
+            await logEvent(db, client.id, 'invoice_paid', `50% deposit PAID (${halfDisplay(tierKey)}) — build unlocked 🎉💰`);
+            const settingsP = await getSettings(db);
+            await sendPortalEmail(env, db, client, settingsP);
+          }
+          dirty++;
+        }
+      }
+      // final 50% balance
+      if (billing.fin_id && billing.fin_status === 'open') {
+        const st = await invoiceStatus(env.STRIPE_SECRET_KEY, billing.fin_id);
+        if (st.status !== billing.fin_status) {
+          billing.fin_status = st.status;
+          if (st.paid) {
+            billing.fin_paid_at = new Date().toISOString();
+            await logEvent(db, client.id, 'invoice_paid', `Final balance PAID (${halfDisplay(tierKey)}) — project paid in full 💰✅`);
+          }
+          dirty++;
         }
       }
       if (billing.sub_session_id && billing.sub_status === 'pending') {
@@ -1297,10 +1354,10 @@ async function pollBilling(env) {
         if (st.complete) {
           billing.sub_status = 'active'; billing.subscription_id = st.subscription;
           await logEvent(db, client.id, 'hosting_active', 'Hosting & security $49/mo ACTIVE 🔒✅');
-          changed++;
+          dirty++;
         }
       }
-      if (changed) await touchClient(db, client.id, { billing: JSON.stringify(billing) });
+      if (dirty) { changed += dirty; await touchClient(db, client.id, { billing: JSON.stringify(billing) }); }
     } catch { /* keep polling others */ }
   }
   return changed;
@@ -1317,9 +1374,12 @@ app.post('/api/clients/:id/billing-bypass', async (c) => {
   if (what === 'hosting') {
     billing.sub_status = 'active'; billing.sub_bypass = true;
     await logEvent(db, id, 'hosting_active', 'Hosting marked ACTIVE manually (bypass — handled outside Stripe) 🔓');
+  } else if (what === 'final') {
+    billing.fin_status = 'paid'; billing.fin_bypass = true; billing.fin_paid_at = new Date().toISOString();
+    await logEvent(db, id, 'invoice_paid', 'Final balance marked PAID manually (bypass — paid outside Stripe) 🔓💰');
   } else {
-    billing.invoice_status = 'paid'; billing.invoice_bypass = true; billing.paid_at = new Date().toISOString();
-    await logEvent(db, id, 'invoice_paid', 'Invoice marked PAID manually (bypass — paid outside Stripe) 🔓💰');
+    billing.dep_status = 'paid'; billing.dep_bypass = true; billing.dep_paid_at = new Date().toISOString();
+    await logEvent(db, id, 'invoice_paid', '50% deposit marked PAID manually (bypass — paid outside Stripe) 🔓💰 — build unlocked');
     const settingsB = await getSettings(db);
     await sendPortalEmail(c.env, db, client, settingsB);
   }
@@ -1767,6 +1827,19 @@ async function importSite(env, settings, slug, clientId, treeFiles) {
   if (clientId) {
     await touchClient(db, Number(clientId), { stage: 'preview_ready', preview_url: previewUrl });
     await logEvent(db, Number(clientId), 'preview_ready', previewUrl);
+    // 50/50 billing: the build is done — auto-send the final balance invoice
+    try {
+      const clientF = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(Number(clientId)).first();
+      const bF = getBilling(clientF);
+      if (env.STRIPE_SECRET_KEY && bF.dep_status === 'paid' && !bF.fin_id && !bF.fin_status && bF.invoice_status !== 'paid') {
+        const tierKeyF = bF.invoice_tier || (clientF.tier === 'premium' ? 'premium' : 'standard');
+        const custId = bF.customer_id || (await ensureCustomer(env.STRIPE_SECRET_KEY, clientF.email, clientF.name || clientF.business_name || '')).id;
+        const invF = await sendInvoice(env.STRIPE_SECRET_KEY, custId, tierKeyF, clientF.business_name || '', 'final');
+        bF.customer_id = custId; bF.fin_id = invF.id; bF.fin_status = invF.status; bF.fin_url = invF.url;
+        await touchClient(db, Number(clientId), { billing: JSON.stringify(bF) });
+        await logEvent(db, Number(clientId), 'invoice_sent', `Build done — final balance invoice auto-sent (${halfDisplay(tierKeyF)}) 💳`);
+      }
+    } catch (e) { await logEvent(db, Number(clientId), 'error', `Final invoice auto-send failed: ${e.message}`); }
     if (settings.notify_email && settings.ghl_location_id) {
       try {
         const ghl = new GHL(env.GHL_TOKEN, settings.ghl_location_id);

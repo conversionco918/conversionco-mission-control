@@ -298,8 +298,9 @@ function colFor(c) {
   if (c.stage === 'live') return 'Live';
   if (c.stage === 'preview_ready') return 'Preview';
   if (c.stage === 'generating') return 'Building';
-  if (b.invoice_status === 'paid') return (c.stage === 'intake2_sent' || c.stage === 'intake2_done') ? 'Building' : 'Paid';
-  if (b.invoice_status === 'open' || b.agr_sent) return 'Closing';
+  const depPaid = b.dep_status === 'paid' || b.invoice_status === 'paid';
+  if (depPaid) return (c.stage === 'intake2_sent' || c.stage === 'intake2_done') ? 'Building' : 'Paid';
+  if (b.invoice_status === 'open' || b.dep_status === 'open' || b.agr_sent) return 'Closing';
   if (c.stage === 'intake1_done' || c.stage === 'intake2_sent' || c.stage === 'intake2_done') return 'Call';
   if (c.stage === 'intake1_sent') return 'Intake 1';
   return 'New';
@@ -339,7 +340,7 @@ function renderFeed() {
   if (!STATE.events.length) { f.innerHTML = '<div class="empty">Activity will appear here.</div>'; return; }
   f.innerHTML = STATE.events.map(e => `<div class="item"><b>${esc(e.client_name || e.client_email || 'System')}</b> — ${esc(pretty(e.type))}${e.detail && e.type==='error' ? `<br><span style="color:var(--red);font-size:12px">${esc(e.detail)}</span>`:''}<time>${ago(e.created_at)}</time></div>`).join('');
 }
-function pretty(t){ return ({client_created:'added to pipeline', booking_email_sent:'booking link emailed 📅', intake1_sent:'Intake 1 email sent', intake1_done:'submitted Intake 1 🎉', intake2_sent:'Intake 2 email sent', intake2_done:'submitted Intake 2 🎉', stage_changed:'stage updated', error:'⚠ error', client_deleted:'removed', webhook_received:'webhook ping'})[t] || t; }
+function pretty(t){ return ({client_created:'added to pipeline', booking_email_sent:'booking link emailed 📅', intake1_sent:'Intake 1 email sent', intake1_done:'submitted Intake 1 🎉', intake2_sent:'Intake 2 email sent', intake2_done:'submitted Intake 2 🎉', stage_changed:'stage updated', error:'⚠ error', client_deleted:'removed', webhook_received:'webhook ping', build_started:'⚙ build started', preview_ready:'★ preview is ready', invoice_sent:'invoice sent 💳', invoice_paid:'payment received 💰', agreement_sent:'agreement sent 📄', agreement_signed:'agreement signed ✍️', portal_invited:'portal login sent 🔑', hosting_active:'hosting active 🔒', owner_digest:'weekly digest sent 📊', sms_sent:'text sent 📱', sms_skipped:'text skipped'})[t] || t; }
 
 async function addClient() {
   const email = document.getElementById('newEmail').value.trim();
@@ -400,15 +401,30 @@ function openDrawer(id) {
         <div id="agrBox" style="margin-bottom:10px;"></div>
         ${(() => {
           const b = getBillingUI(c);
-          const price = c.tier === 'premium' ? '$999' : '$649';
+          const full = c.tier === 'premium' ? '$999' : '$649';
+          const half = c.tier === 'premium' ? '$499.50' : '$324.50';
+          const legacyPaid = b.invoice_status === 'paid';
+          const chipFor = (st, lbl) => st === 'paid'
+            ? `<span class="chip" style="background:#ecfdf5;color:#059669">${lbl} PAID ✓</span>`
+            : `<span class="chip" style="background:#fef9c3;color:#a16207">${lbl} ${esc(st || 'open')}</span>`;
           let inv = '';
-          if (!b.invoice_id) {
-            inv = `<button class="btn btn-green" onclick="sendStripeInvoice(${c.id}, this)">💳 Send invoice — ${price}</button>`;
+          if (legacyPaid) {
+            inv = `<span class="chip" style="background:#ecfdf5;color:#059669">PAID IN FULL ✓ (${full})</span>`;
           } else {
-            const chip = b.invoice_status === 'paid'
-              ? '<span class="chip" style="background:#ecfdf5;color:#059669">PAID ✓</span>'
-              : `<span class="chip" style="background:#fef9c3;color:#a16207">Invoice ${esc(b.invoice_status || 'open')}</span>`;
-            inv = `${chip} <a href="${esc(b.invoice_url || '#')}" target="_blank" style="font-size:12.5px;">view invoice</a>`;
+            // deposit half
+            if (!b.dep_id && b.dep_status !== 'paid') {
+              inv += `<div><button class="btn btn-green" onclick="sendStripeInvoice(${c.id}, this, 'deposit')">💳 Send 50% deposit — ${half}</button><p style="font-size:11px;color:#94a3b8;margin-top:3px;">Deposit paid = build unlocked.</p></div>`;
+            } else {
+              inv += `<div>${chipFor(b.dep_status, 'Deposit')}${b.dep_url ? ` <a href="${esc(b.dep_url)}" target="_blank" style="font-size:12.5px;">view</a>` : ''}</div>`;
+            }
+            // final half — auto-sent when build finishes; manual button as backup once deposit is paid
+            if (b.fin_id || b.fin_status) {
+              inv += `<div style="margin-top:8px;">${chipFor(b.fin_status, 'Final balance')}${b.fin_url ? ` <a href="${esc(b.fin_url)}" target="_blank" style="font-size:12.5px;">view</a>` : ''}</div>`;
+            } else if (b.dep_status === 'paid') {
+              inv += `<div style="margin-top:8px;"><button class="btn btn-ghost" onclick="sendStripeInvoice(${c.id}, this, 'final')">💳 Send final balance — ${half}</button><p style="font-size:11px;color:#94a3b8;margin-top:3px;">Auto-sends when the build finishes — this is the manual backup.</p></div>`;
+            } else {
+              inv += `<p style="font-size:11px;color:#94a3b8;margin-top:6px;">Final ${half} auto-invoices when the build is done.</p>`;
+            }
           }
           let host = '';
           if (b.sub_status === 'active') {
@@ -420,7 +436,11 @@ function openDrawer(id) {
           } else {
             host = `<p style="font-size:11px;color:#94a3b8;margin-top:8px;">$49/mo hosting starts at the end — the button appears when the site is ready.</p>`;
           }
-          const bypass = `<p style="margin-top:10px;font-size:11px;color:#94a3b8;">Paid outside Stripe? ${b.invoice_status==='paid' ? '' : `<a href="#" onclick="billingBypass(${c.id},'invoice');return false;">mark invoice paid</a>`}${b.invoice_status!=='paid' && b.sub_status!=='active' ? ' · ' : ''}${b.sub_status==='active' ? '' : `<a href="#" onclick="billingBypass(${c.id},'hosting');return false;">mark hosting active</a>`}</p>`;
+          const links = [];
+          if (!legacyPaid && b.dep_status !== 'paid') links.push(`<a href="#" onclick="billingBypass(${c.id},'deposit');return false;">mark deposit paid</a>`);
+          if (!legacyPaid && b.dep_status === 'paid' && b.fin_status !== 'paid') links.push(`<a href="#" onclick="billingBypass(${c.id},'final');return false;">mark final paid</a>`);
+          if (b.sub_status !== 'active') links.push(`<a href="#" onclick="billingBypass(${c.id},'hosting');return false;">mark hosting active</a>`);
+          const bypass = links.length ? `<p style="margin-top:10px;font-size:11px;color:#94a3b8;">Paid outside Stripe? ${links.join(' · ')}</p>` : '';
           return `<div>${inv}</div>${host}${bypass}`;
         })()}
       </div>
@@ -521,7 +541,7 @@ function openDrawer(id) {
     } else {
       box.innerHTML = `<button class="btn btn-ghost" onclick="sendAgreement(${id}, this)">📄 Email agreement to sign</button>
         <span class="chip" style="background:${b.agr_sent ? '#fef9c3' : '#f1f5f9'};color:${b.agr_sent ? '#a16207' : '#64748b'};margin-left:6px">${b.agr_sent ? 'sent — awaiting signature' : 'not sent'}</span>
-        <p style="font-size:11px;color:#94a3b8;margin-top:5px;">Real-agency order: agreement → signed → invoice → paid → build.</p>`;
+        <p style="font-size:11px;color:#94a3b8;margin-top:5px;">Real-agency order: agreement → signed → 50% deposit → build → final 50% → live.</p>`;
     }
   });
   api(`/api/clients/${id}/revisions`).then((r) => {
@@ -591,13 +611,15 @@ async function uploadLogo(id, input) {
   refresh(); openDrawer(id);
 }
 function getBillingUI(c){ try { return JSON.parse(c.billing||'{}'); } catch { return {}; } }
-async function sendStripeInvoice(id, btn) {
-  if (!confirm('Send the Stripe invoice to this client now?')) return;
+async function sendStripeInvoice(id, btn, which) {
+  which = which || 'deposit';
+  const label = which === 'final' ? 'final 50% balance' : '50% deposit';
+  if (!confirm(`Send the ${label} Stripe invoice to this client now?`)) return;
   btn.disabled = true;
-  const r = await api(`/api/clients/${id}/invoice`, { method:'POST', body: '{}' });
+  const r = await api(`/api/clients/${id}/invoice`, { method:'POST', body: JSON.stringify({ which }) });
   btn.disabled = false;
   if (r.error) return toast('⚠ ' + r.error);
-  toast(`Invoice sent — ${r.display} 💳 (Stripe emails the client; link also on the card)`);
+  toast(`${label[0].toUpperCase() + label.slice(1)} invoice sent — ${r.display} 💳 (Stripe emails the client)`);
   refresh(); setTimeout(() => openDrawer(id), 400);
 }
 async function startHosting(id, btn) {
@@ -649,7 +671,10 @@ async function copyLink(id, kind, btn) {
   toast(kind === 'portal' ? 'Portal link copied 🔗 — send it to the client' : 'Pitch link copied ✨ — send before the call');
 }
 async function billingBypass(id, what) {
-  if (!confirm(what === 'hosting' ? 'Mark hosting & security as ACTIVE without Stripe? (bypass)' : 'Mark the invoice as PAID without Stripe? (bypass)')) return;
+  const q = what === 'hosting' ? 'Mark hosting & security as ACTIVE without Stripe? (bypass)'
+    : what === 'final' ? 'Mark the FINAL 50% balance as PAID without Stripe? (bypass)'
+    : 'Mark the 50% DEPOSIT as PAID without Stripe? (bypass — unlocks the build)';
+  if (!confirm(q)) return;
   const r = await api(`/api/clients/${id}/billing-bypass`, { method:'POST', body: JSON.stringify({ what }) });
   if (r.error) return toast('⚠ ' + r.error);
   toast('Bypassed ✓ — logged in the activity feed');
