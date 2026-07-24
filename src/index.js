@@ -1014,6 +1014,28 @@ app.get('/portal/:id/:token', async (c) => {
   let hist = []; try { hist = JSON.parse(settings[`scorehist_${id}`] || '[]'); } catch {}
   const agrRow = await db.prepare('SELECT * FROM agreements WHERE client_id = ? ORDER BY id DESC LIMIT 1').bind(id).first();
   const agrTok = agrRow ? await portalToken(c.env, 'agr', id) : '';
+  // their brand, not ours: accent from their site theme (or a per-client override)
+  const accent = settings[`portal_accent_${id}`] || (THEMES[client.theme] && THEMES[client.theme].tokens && THEMES[client.theme].tokens['--gold']) || '#2F7E76';
+  const firstName = (client.name || '').split(' ')[0] || '';
+  // living welcome line — drawn from their real latest event, fresh every visit
+  const WELCOME = { gsc_verified: 'Google is now measuring your website — your exact positions land here soon.',
+    launched: 'your website is live on the web and under our care.',
+    auto_published: 'a fresh update just went out on your website.',
+    revision_done: 'your latest change is done and live.',
+    lead_received: 'a new lead just came in through your website.',
+    invoice_paid: 'payment received — thank you. Everything below is current.',
+    page1_celebrated: 'you are on Page 1 of Google. Enjoy this page.',
+    first_lead_celebrated: 'your first lead came in through your website.',
+    preview_ready: 'a new version of your website is up.',
+    photo_uploaded: 'your new photo is in — thank you.' };
+  const welcomeLine = (evRows.length && WELCOME[evRows[0].type])
+    ? `${firstName ? firstName + ' — ' : ''}${WELCOME[evRows[0].type]}`
+    : `${firstName ? firstName + ', w' : 'W'}elcome back — everything on this page is live and current.`;
+  // your story with us — first occurrence of each real milestone
+  const MILES = { client_created: 'The day we met', agreement_signed: 'You made it official', build_started: 'We started building',
+    preview_ready: 'Your website took its first breath', launched: 'You went live on the web', gsc_verified: 'Google began measuring you',
+    page1_celebrated: 'You reached Page 1 of Google', first_lead_celebrated: 'Your first lead arrived' };
+  const storyRows = (await db.prepare(`SELECT type, MIN(created_at) AS at FROM events WHERE client_id = ? AND type IN ('client_created','agreement_signed','build_started','preview_ready','launched','gsc_verified','page1_celebrated','first_lead_celebrated') GROUP BY type ORDER BY at`).bind(id).all()).results || [];
   const tiles = [];
   if (hasGsc) {
     tiles.push(`<div class="tile"><div class="v">${Number(gsc.totals?.imp || 0).toLocaleString()}<small>×</small></div><div class="l">Times shown on Google</div></div>`);
@@ -1031,25 +1053,42 @@ app.get('/portal/:id/:token', async (c) => {
     page1_celebrated: 'You reached Page 1 of Google', first_lead_celebrated: 'Your first lead arrived' };
   return c.html(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex"><title>${biz} — Client Portal | ConversionCo</title>
+<meta name="theme-color" content="${accent}">
+<link rel="manifest" href="/portal-manifest/${id}/${tok}">
+<link rel="apple-touch-icon" href="/portal-logo/${id}/${tok}">
 <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500&family=Karla:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
   *{box-sizing:border-box;margin:0}
-  :root{--ink:#16202B;--muted:#5B6B7B;--faint:#8A99A8;--paper:#FBFAF7;--card:#FFFFFF;--line:#E7E3DA;--good:#1B7F4B;--navy:#0B1D33;--gold:#A16207}
+  :root{--ink:#16202B;--muted:#5B6B7B;--faint:#8A99A8;--paper:#FBFAF7;--card:#FFFFFF;--line:#E7E3DA;--good:#1B7F4B;--navy:#0B1D33;--gold:#A16207;--brand:${accent}}
   body{background:var(--paper);color:var(--ink);font-family:'Karla',-apple-system,sans-serif;font-weight:300;line-height:1.6;font-size:15.5px}
   .wrap{max-width:700px;margin:0 auto;padding:34px 18px 70px}
   .head{display:flex;align-items:center;gap:14px}
   .head img{height:44px;max-width:130px;object-fit:contain;background:#fff;border:1px solid var(--line);border-radius:10px;padding:4px}
-  .head .mono{width:46px;height:46px;border-radius:50%;border:1.5px solid var(--navy);display:flex;align-items:center;justify-content:center;font-family:'Cormorant Garamond',serif;font-size:20px;color:var(--navy)}
+  .head .mono{width:46px;height:46px;border-radius:50%;border:1.5px solid var(--brand);display:flex;align-items:center;justify-content:center;font-family:'Cormorant Garamond',serif;font-size:20px;color:var(--brand)}
   h1{font-family:'Cormorant Garamond',Georgia,serif;font-weight:500;font-size:clamp(24px,5.5vw,32px);color:var(--navy);line-height:1.1}
   .sub{color:var(--muted);font-size:12.5px;letter-spacing:.05em;margin-top:3px}
   .card{background:var(--card);border:1px solid var(--line);border-top:3px solid var(--sec,var(--navy));border-radius:18px;padding:22px 20px;margin:14px 0}
-  .c-goog{--sec:#2F7E76}.c-cust{--sec:#1B7F4B}.c-score{--sec:#7C3AED}.c-health{--sec:#0E8A8A}.c-rep{--sec:#A16207}.c-blog{--sec:#C2410C}.c-act{--sec:#475569}.c-msg{--sec:#0B1D33}.c-doc{--sec:#0B1D33}
+  .c-goog{--sec:var(--brand)}.c-cust{--sec:#1B7F4B}.c-score{--sec:#7C3AED}.c-health{--sec:#0E8A8A}.c-rep{--sec:#A16207}.c-blog{--sec:#C2410C}.c-act{--sec:#475569}.c-msg{--sec:#0B1D33}.c-doc{--sec:#0B1D33}.c-story{--sec:var(--brand)}
+  .story{position:relative;padding-left:22px;display:grid;gap:14px}
+  .story::before{content:"";position:absolute;left:5px;top:6px;bottom:6px;width:2px;background:var(--line);border-radius:2px}
+  .story .m{position:relative;font-size:14.5px}
+  .story .m::before{content:"";position:absolute;left:-22px;top:5px;width:12px;height:12px;border-radius:50%;background:var(--brand);border:2.5px solid var(--card);box-shadow:0 0 0 1.5px var(--brand)}
+  .story .m time{display:block;font-size:11.5px;color:var(--faint)}
+  .covers{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:12px}
+  .cover{display:block;text-decoration:none;background:var(--paper);border:1px solid var(--line);border-radius:12px;padding:18px 12px 14px;text-align:center;transition:border-color .15s}
+  .cover:hover{border-color:var(--brand)}
+  .cover .cm{font-family:'Cormorant Garamond',serif;font-size:19px;color:var(--ink);line-height:1.2}
+  .cover .cl{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--brand);margin-top:6px;font-weight:500}
+  .cover .bar{height:3px;border-radius:2px;background:var(--brand);width:34px;margin:0 auto 12px}
+  .cbtns{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+  .cbtn{background:var(--paper);border:1.5px solid var(--line);border-radius:99px;padding:8px 16px;font-size:13px;color:var(--ink);cursor:pointer;font-family:inherit}
+  .cbtn.on{border-color:var(--brand);color:var(--brand);font-weight:500}
   .eyebrow{font-size:11px;letter-spacing:.22em;text-transform:uppercase;color:var(--sec,var(--gold));font-weight:500}
   h2{font-family:'Cormorant Garamond',Georgia,serif;font-weight:400;font-size:21px;margin:5px 0 12px;color:var(--ink)}
   .livebar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:18px 0 4px}
   .livepill{display:inline-flex;align-items:center;gap:7px;background:#E7F5EC;color:var(--good);font-weight:500;font-size:13px;padding:7px 14px;border-radius:99px}
   .livepill i{width:8px;height:8px;border-radius:50%;background:var(--good);display:inline-block}
-  .btn{display:inline-block;background:var(--navy);color:#fff;font-weight:500;padding:11px 22px;border-radius:10px;text-decoration:none;border:0;font-size:14px;cursor:pointer}
+  .btn{display:inline-block;background:var(--brand);color:#fff;font-weight:500;padding:11px 22px;border-radius:10px;text-decoration:none;border:0;font-size:14px;cursor:pointer}
   .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}
   .tile{background:var(--paper);border:1px solid var(--line);border-radius:16px;padding:16px 12px 13px;text-align:center}
   .tile .v{font-family:'Cormorant Garamond',serif;font-size:36px;line-height:1;color:var(--ink)}
@@ -1078,8 +1117,9 @@ app.get('/portal/:id/:token', async (c) => {
   textarea{width:100%;background:var(--paper);border:1px solid var(--line);border-radius:10px;color:var(--ink);padding:13px;font-family:inherit;font-size:14.5px;margin-bottom:12px}
   .foot{text-align:center;color:var(--faint);font-size:12px;margin-top:26px} .foot a{color:var(--muted)}
 </style></head><body><div class="wrap">
-  <div class="head">${slug ? `<img src="/preview/${slug}/img/logo.png" onerror="this.outerHTML='<div class=mono>${escq(biz).slice(0, 1)}</div>'">` : `<div class="mono">${escq(biz).slice(0, 1)}</div>`}
+  <div class="head"><img src="/portal-logo/${id}/${tok}" onerror="this.outerHTML='<div class=mono>${escq(biz).slice(0, 1)}</div>'">
     <div><h1>${biz}</h1><div class="sub">Private client portal · prepared by your ConversionCo team${isPremium ? ' · Premium' : ''}</div></div></div>
+  <p style="font-family:'Cormorant Garamond',serif;font-style:italic;font-size:17px;color:var(--muted);margin-top:14px">${escq(welcomeLine)}</p>
 
   ${client.stage === 'live'
     ? `<div class="livebar"><span class="livepill"><i></i>Live on the web</span>${siteUrl ? `<a class="btn" href="${siteUrl}" target="_blank">View your website →</a>` : ''}</div>`
@@ -1132,10 +1172,15 @@ app.get('/portal/:id/:token', async (c) => {
   ${reports.length ? `<div class="card c-rep"><span class="eyebrow">Reports</span><h2>Your latest report</h2>
     <p style="color:var(--muted);font-size:13.5px;margin-bottom:12px">The full story — where you stand on Google, what we handled, and what it's worth.</p>
     <a class="btn" href="/portal/${id}/${tok}/report/${reports[0]}" target="_blank">Read your ${reports[0].replace('.html', '')} report →</a>
-    ${reports.length > 1 ? `<div style="margin-top:16px"><div class="note" style="margin:0 0 7px">Earlier reports</div><ul class="list">
-      ${reports.slice(1).map((r) => `<li><a href="/portal/${id}/${tok}/report/${r}" target="_blank">${r.replace('.html', '')} →</a></li>`).join('')}
-    </ul></div>` : ''}
+    ${reports.length > 1 ? `<div class="covers" style="margin-top:16px">
+      ${reports.slice(1).map((r) => `<a class="cover" href="/portal/${id}/${tok}/report/${r}" target="_blank"><div class="bar"></div><div class="cm">${r.replace('.html', '')}</div><div class="cl">Report</div></a>`).join('')}
+    </div>` : ''}
   </div>` : ''}
+
+  ${storyRows.length >= 2 ? `<div class="card c-story"><span class="eyebrow">Your Story With Us</span><h2>The journey so far</h2>
+    <div class="story">
+    ${storyRows.map((s) => `<div class="m">${MILES[s.type] || s.type}<time>${String(s.at).slice(0, 10)}</time></div>`).join('')}
+    </div></div>` : ''}
 
   ${agrRow ? `<div class="card c-doc"><span class="eyebrow">Documents</span><h2>Your agreement</h2>
     <p style="color:var(--muted);font-size:14px">Signed by ${escq(agrRow.signed_name)} on ${String(agrRow.signed_at).slice(0, 10)} — kept right here for your records.</p>
@@ -1148,22 +1193,70 @@ app.get('/portal/:id/:token', async (c) => {
     ${evRows.map((e) => `<div>${FRIENDLY2[e.type] || e.type}<time>${String(e.created_at).slice(0, 10)}</time></div>`).join('')}
   </div></div>` : ''}
 
-  <div class="card c-msg"><span class="eyebrow">Talk To Us</span><h2>Send us a note</h2>
-    <p style="color:var(--muted);font-size:13.5px;margin-bottom:12px">Questions, changes, ideas — a real person reads every message and replies, usually the same day.</p>
-    <form id="msgForm"><textarea name="message" rows="3" required placeholder="Type your message…"></textarea>
-    <button class="btn" type="submit">Send message</button>
-    <p id="msgOk" style="display:none;color:var(--good);font-weight:500;margin-top:10px">Sent — we'll get back to you shortly.</p></form>
+  <div class="card c-msg"><span class="eyebrow">Talk To Us</span><h2>How can we help?</h2>
+    <div class="cbtns">
+      <button class="cbtn on" id="mQ" onclick="setMode('q')">Ask a question</button>
+      <button class="cbtn" id="mC" onclick="setMode('c')">Request a change</button>
+      <button class="cbtn" id="mP" onclick="setMode('p')">Send us a photo</button>
+    </div>
+    <form id="msgForm">
+      <p id="modeHint" style="color:var(--muted);font-size:13px;margin-bottom:9px">A real person reads every message and replies, usually the same day.</p>
+      <div id="photoRow" style="display:none;margin-bottom:11px">
+        <input type="file" id="photoFile" accept="image/png,image/jpeg,image/webp" style="font-size:13px;margin-bottom:9px">
+        ${slug ? `<label style="display:flex;gap:8px;align-items:center;font-size:13.5px;color:var(--ink)"><input type="checkbox" id="wantOnSite" checked style="width:16px;height:16px;accent-color:var(--brand)"> Please add this photo to my website</label>` : ''}
+      </div>
+      <textarea name="message" id="msgText" rows="3" placeholder="Type your message…"></textarea>
+      <button class="btn" type="submit" id="msgBtn">Send</button>
+      <p id="msgOk" style="display:none;color:var(--good);font-weight:500;margin-top:10px"></p>
+    </form>
   </div>
 
   <p class="foot">Website care by <a href="https://conversionco918.com">ConversionCo</a></p>
 </div>
 <script>
+let MODE = 'q';
+const HINTS = {
+  q: 'A real person reads every message and replies, usually the same day.',
+  c: 'Describe the change in your own words — new price, different photo, updated hours, anything. We take it from there and you get an email when it\\'s live.',
+  p: 'Send us any photo — your space, your team, your work.${slug ? " Tick the box and we\\'ll place it on your website for you." : ''}'
+};
+const PLACEHOLDERS = { q: 'Type your message…', c: 'e.g. "Change the NAD+ price to $850" or "Use a beach photo in the top section"', p: 'Anything we should know about this photo? (optional)' };
+function setMode(m) {
+  MODE = m;
+  for (const [k, elId] of [['q','mQ'],['c','mC'],['p','mP']]) document.getElementById(elId).classList.toggle('on', k === m);
+  document.getElementById('modeHint').textContent = HINTS[m];
+  document.getElementById('msgText').placeholder = PLACEHOLDERS[m];
+  document.getElementById('photoRow').style.display = m === 'p' ? 'block' : 'none';
+  document.getElementById('msgText').required = m !== 'p';
+}
+setMode('q');
 document.getElementById('msgForm').addEventListener('submit', async (e) => {
   e.preventDefault();
-  const msg = new FormData(e.target).get('message');
-  try { await fetch('/portal-msg/${id}/${tok}', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: msg }) }); } catch {}
-  e.target.querySelector('button').style.display = 'none';
-  document.getElementById('msgOk').style.display = 'block';
+  const btn = document.getElementById('msgBtn'); btn.disabled = true;
+  const msg = document.getElementById('msgText').value;
+  const ok = document.getElementById('msgOk');
+  try {
+    if (MODE === 'p') {
+      const f = document.getElementById('photoFile').files[0];
+      if (!f) { btn.disabled = false; return alert('Choose a photo first.'); }
+      if (f.size > 3200000) { btn.disabled = false; return alert('Please keep photos under ~3MB.'); }
+      const b64 = await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(f); });
+      const want = document.getElementById('wantOnSite');
+      const r = await fetch('/portal-photo/${id}/${tok}', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ b64, note: msg, wantOnSite: !!(want && want.checked) }) }).then((x) => x.json());
+      if (r.error) { btn.disabled = false; return alert(r.error); }
+      ok.textContent = r.queued ? 'Photo received — it will appear on your website within the day. We\\'ll email you when it\\'s live.' : 'Photo received — thank you. It\\'s safely in your library.';
+    } else if (MODE === 'c') {
+      if (!msg.trim()) { btn.disabled = false; return; }
+      await fetch('/portal-req/${id}/${tok}', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: msg }) });
+      ok.textContent = 'Change request received — we\\'re on it. You\\'ll get an email when it\\'s live.';
+    } else {
+      if (!msg.trim()) { btn.disabled = false; return; }
+      await fetch('/portal-msg/${id}/${tok}', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: msg }) });
+      ok.textContent = 'Sent — we\\'ll get back to you shortly.';
+    }
+    btn.style.display = 'none'; ok.style.display = 'block';
+  } catch { btn.disabled = false; alert('Something hiccuped — try again?'); }
 });
 </script>
 </body></html>`);
@@ -1194,6 +1287,129 @@ app.post('/portal-msg/:id/:token', async (c) => {
     } catch {}
   }
   return c.json({ ok: true });
+});
+
+// Portal logo (tokenized, public): uploaded logo first, then the site's logo file
+app.get('/portal-logo/:id/:token', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'portal', id)) return c.text('nope', 403);
+  const db = c.env.DB;
+  let row = await db.prepare(`SELECT content, content_type FROM site_files WHERE slug=? AND path='logo'`).bind(`_assets-${id}`).first();
+  if (!row) {
+    const slug = await slugForClient(db, id);
+    if (slug) row = await db.prepare(`SELECT content, content_type FROM site_files WHERE slug=? AND path='img/logo.png' AND is_base64=1`).bind(slug).first();
+  }
+  if (!row) return c.text('no logo', 404);
+  return c.body(Uint8Array.from(atob(row.content), (ch) => ch.charCodeAt(0)), 200,
+    { 'Content-Type': row.content_type || 'image/png', 'Cache-Control': 'public, max-age=3600' });
+});
+
+// Per-client PWA manifest: their business as an app on their phone
+app.get('/portal-manifest/:id/:token', async (c) => {
+  const id = Number(c.req.param('id'));
+  const tok = c.req.param('token');
+  if (tok !== await portalToken(c.env, 'portal', id)) return c.text('nope', 403);
+  const client = await c.env.DB.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.text('nope', 404);
+  const biz = client.business_name || client.name || 'Client Portal';
+  const hasLogo = await c.env.DB.prepare(`SELECT 1 AS x FROM site_files WHERE slug=? AND path='logo'`).bind(`_assets-${id}`).first();
+  const icon = hasLogo ? `/portal-logo/${id}/${tok}` : '/icon-192.png';
+  return c.json({
+    name: biz, short_name: biz.slice(0, 12), start_url: `/portal/${id}/${tok}`,
+    display: 'standalone', background_color: '#FBFAF7', theme_color: '#0B1D33',
+    icons: [{ src: icon, sizes: '192x192', type: 'image/png' }, { src: hasLogo ? icon : '/icon-512.png', sizes: '512x512', type: 'image/png' }],
+  });
+});
+
+// Portal change request → straight into the revision queue (done within the hour)
+app.post('/portal-req/:id/:token', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'portal', id)) return c.text('nope', 403);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'not found' }, 404);
+  let f = {}; try { f = await c.req.json(); } catch {}
+  const msg = String(f.message || '').slice(0, 1500);
+  if (!msg.trim()) return c.json({ error: 'empty' }, 400);
+  await db.prepare('INSERT INTO revisions (client_id, request) VALUES (?, ?)')
+    .bind(id, `[from the client, via their portal] ${msg}`).run();
+  await logEvent(db, id, 'portal_message', `✏️ Change request from ${client.name || client.email} (queued): "${msg.slice(0, 100)}"`);
+  const settings = await getSettings(db);
+  if (settings.notify_email && c.env.GHL_TOKEN && settings.ghl_location_id) {
+    try {
+      const ghl = ghlFor(c.env, settings);
+      const contact = await ghl.upsertContact({ email: settings.notify_email, name: 'ConversionCo Notifications' });
+      await ghl.sendEmail({ contactId: contact.id || contact.contactId,
+        subject: `✏️ Client change request — ${client.business_name || client.name || client.email} (auto-queued)`,
+        html: `<p><b>${client.name || ''}</b> asked via their portal:</p><blockquote style="border-left:3px solid #C9A254;padding-left:12px;">${msg.slice(0, 1200)}</blockquote><p>It's already in the revision queue — applied within the hour unless you pull it in <a href="${BASE_URL}">Mission Control</a>.</p>`,
+        emailFrom: settings.email_from || undefined });
+    } catch {}
+  }
+  return c.json({ ok: true, queued: true });
+});
+
+// Portal photo upload → client asset library; "add to my website" auto-queues placement
+app.post('/portal-photo/:id/:token', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'portal', id)) return c.text('nope', 403);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'not found' }, 404);
+  let f = {}; try { f = await c.req.json(); } catch {}
+  const b64raw = String(f.b64 || '');
+  const m = b64raw.match(/^data:image\/(png|jpeg|jpg|webp);base64,/);
+  if (!m) return c.json({ error: 'Please choose a PNG, JPG, or WEBP photo.' }, 400);
+  const ext = m[1] === 'jpeg' ? 'jpg' : m[1];
+  const mime = ext === 'webp' ? 'image/webp' : ext === 'png' ? 'image/png' : 'image/jpeg';
+  const clean = b64raw.replace(/^data:[^,]+,/, '');
+  if (clean.length > 4_400_000) return c.json({ error: 'Please keep photos under ~3MB.' }, 400);
+  // next free library slot (1-6)
+  const used = new Set(((await db.prepare(`SELECT path FROM site_files WHERE slug=? AND path LIKE 'photo-%'`).bind(`_assets-${id}`).all()).results || []).map((r) => r.path));
+  let slot = 0; for (let i = 1; i <= 6; i++) if (!used.has(`photo-${i}`)) { slot = i; break; }
+  if (!slot) return c.json({ error: 'Your photo library is full (6) — reply to any of our emails and we\'ll make room.' }, 400);
+  await db.prepare(`INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
+    VALUES (?, ?, ?, ?, 1, datetime('now'))
+    ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, content_type=excluded.content_type, updated_at=datetime('now')`)
+    .bind(`_assets-${id}`, `photo-${slot}`, clean, mime).run();
+  const note = String(f.note || '').slice(0, 500);
+  const slug = await slugForClient(db, id);
+  let queued = false;
+  if (f.wantOnSite && slug && c.env.GITHUB_TOKEN) {
+    // push the file into their site's repo folder so the revision runner can use it
+    try {
+      const settings0 = await getSettings(db);
+      const repo = settings0.sites_repo || 'conversionco918/conversionco-client-sites';
+      const path = `sites/${slug}/img/client-photo-${slot}.${ext}`;
+      const ghHeaders = { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+      const getRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, { headers: ghHeaders });
+      const existing = getRes.ok ? await getRes.json() : null;
+      const putRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+        method: 'PUT', headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: `Client photo (portal upload) → ${slug}`, content: clean, ...(existing?.sha ? { sha: existing.sha } : {}) }) });
+      if (putRes.ok) {
+        await db.prepare(`INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
+          VALUES (?, ?, ?, ?, 1, datetime('now'))
+          ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, content_type=excluded.content_type, updated_at=datetime('now')`)
+          .bind(slug, `img/client-photo-${slot}.${ext}`, clean, mime).run();
+        await db.prepare('INSERT INTO revisions (client_id, request) VALUES (?, ?)')
+          .bind(id, `[from the client, via their portal] They uploaded a new photo — img/client-photo-${slot}.${ext} (already committed in sites/${slug}/img/) — and asked for it on their website. Place it tastefully where it fits best${note ? `; their note: "${note}"` : ''}. Keep every other design choice unchanged.`).run();
+        queued = true;
+      }
+    } catch { /* photo is safe in the library either way */ }
+  }
+  await logEvent(db, id, 'photo_uploaded', `📷 Client uploaded a photo via their portal (library slot ${slot})${queued ? ' — placement auto-queued for the site' : ''}${note ? ` · note: "${note.slice(0, 80)}"` : ''}`);
+  const settings = await getSettings(db);
+  if (settings.notify_email && c.env.GHL_TOKEN && settings.ghl_location_id) {
+    try {
+      const ghl = ghlFor(c.env, settings);
+      const contact = await ghl.upsertContact({ email: settings.notify_email, name: 'ConversionCo Notifications' });
+      await ghl.sendEmail({ contactId: contact.id || contact.contactId,
+        subject: `📷 ${client.business_name || client.name || client.email} sent a photo${queued ? ' — placement auto-queued' : ''}`,
+        html: `<p><b>${client.name || ''}</b> uploaded a photo via their portal (library slot ${slot}).${note ? `<br>Note: "${note}"` : ''}</p><p>${queued ? 'They asked for it on their website — it\'s already in the revision queue and will be placed within the hour.' : 'It\'s saved in their photo library.'}</p><p><a href="${BASE_URL}">Open Mission Control</a></p>`,
+        emailFrom: settings.email_from || undefined });
+    } catch {}
+  }
+  return c.json({ ok: true, slot, queued });
 });
 
 // Render a stored report inside the portal (proxied from GitHub)
