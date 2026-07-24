@@ -384,7 +384,7 @@ app.get('/debug/:key', async (c) => {
     gsc: await (async () => {
       // Google Search Console: configured flag + per-client state and the latest
       // exact-numbers snapshot (gsc_data_<id>) — report engines PREFER this data.
-      const rows = (await c.env.DB.prepare(`SELECT key, value FROM settings WHERE key LIKE 'gsc\\_%' ESCAPE '\\'`).all()).results || [];
+      const rows = (await c.env.DB.prepare(`SELECT key, value FROM settings WHERE key LIKE 'gsc%'`).all()).results || [];
       const out = { configured: gscConfigured(c.env) };
       for (const r of rows) { try { out[r.key] = JSON.parse(r.value); } catch {} }
       return out;
@@ -1043,7 +1043,7 @@ app.get('/portal/:id/:token', async (c) => {
       const spot = (p) => p ? `Page 1, #${p}` : 'not on Page 1 yet';
       return `<div style="border-bottom:1px dashed rgba(142,163,188,.25);padding-bottom:8px;">
       <div style="font-size:13px;color:#8EA3BC;">when someone searches "${String(k.kw || '').replace(/[<>&]/g, '')}"</div>
-      <div style="font-size:15px;margin-top:2px;"><b style="color:#C9A254">You: ${k.you ? '📍 ' + spot(k.you) : (k.pending ? 'your spot is waiting — tracking starts at launch' : 'not on Page 1 yet — that\\'s the target')}</b></div>
+      <div style="font-size:15px;margin-top:2px;"><b style="color:#C9A254">You: ${k.you ? '📍 ' + spot(k.you) : (k.pending ? 'your spot is waiting — tracking starts at launch' : "not on Page 1 yet — that's the target")}</b></div>
       ${k.competitors ? `<div style="font-size:13px;color:#8EA3BC;margin-top:2px;">${Object.entries(k.competitors).map(([n, p]) => `${String(n).replace(/[<>&]/g, '')}: ${spot(p)}`).join(' · ')}</div>` : ''}
     </div>`; }).join('')}
     </div>`
