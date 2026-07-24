@@ -476,8 +476,10 @@ function openDrawer(id) {
         <button class="btn btn-red" onclick="delClient(${c.id})">Remove</button>
       </div>
       ${c.stage === 'prospect' ? `<div style="background:#fdf4ff;border:1px solid #f0abfc;border-radius:10px;padding:14px;">
-        <p style="font-size:12.5px;font-weight:600;color:#a21caf;margin-bottom:6px;">💡 Prospect pitch kit</p>
+        <p style="font-size:12.5px;font-weight:600;color:#a21caf;margin-bottom:6px;">💡 Prospect pitch kit${c.vertical && c.vertical !== 'iv-therapy' ? ` <span style="background:#a21caf;color:#fff;border-radius:99px;padding:2px 9px;font-size:10.5px;margin-left:6px;">${esc(c.vertical)}</span>` : ''}</p>
+        ${(() => { try { const i1 = JSON.parse(c.intake1_data || '{}'); return i1._hunted ? `<p style="font-size:11.5px;color:#7c3aed;margin-bottom:6px;">🎯 Found by the prospector${i1._evidence ? ` — ${esc(i1._evidence)}` : ''}${i1._their_site ? ` · <a href="${esc(i1._their_site)}" target="_blank">their current site</a>` : ''}</p>` : ''; } catch(e) { return ''; } })()}
         ${c.preview_url ? `<p style="font-size:12.5px;margin-bottom:8px;">Demo: <a href="${esc(c.preview_url)}" target="_blank">${esc(c.preview_url)}</a> <button class="btn btn-ghost" style="padding:5px 9px;font-size:11px" onclick="copyText('${esc(c.preview_url)}')">Copy</button></p>` : `<p style="font-size:12.5px;color:#a16207;margin-bottom:8px;">⚙ Demo builds on the next builder run — link appears here.</p>`}
+        <button class="btn btn-ghost" style="margin-bottom:8px;" onclick="copyOutreach(${c.id}, this)">📨 Copy outreach email</button>
         <p style="font-size:11.5px;color:#64748b;margin-bottom:8px;">Pitch it: "I already built you a homepage — want to see it?" Then convert them:</p>
         <div style="display:flex;gap:6px;flex-wrap:wrap;">
           <input id="convEmail" type="email" placeholder="their real email" style="flex:1;min-width:170px;padding:9px 11px;border:1.5px solid var(--line);border-radius:8px;font-size:13px;">
@@ -751,6 +753,13 @@ async function startHosting(id, btn) {
   refresh(); setTimeout(() => openDrawer(id), 400);
 }
 function copyText(t){ navigator.clipboard?.writeText(t).catch(()=>{}); }
+async function copyOutreach(id, btn) {
+  const r = await api(`/api/clients/${id}/links`);
+  if (!r.outreach) return toast('No outreach draft yet — the prospector writes one when it finds them');
+  copyText(r.outreach);
+  if (btn) btn.textContent = '✓ Copied — paste into your email';
+  toast('Outreach email copied — review, personalize, and send it from your own email');
+}
 async function queueRevision(id, btn) {
   const v = document.getElementById('revInput').value.trim();
   if (!v) return toast('Describe the change first');

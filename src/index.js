@@ -68,6 +68,7 @@ async function ensureSchema(db) {
   try { await db.prepare(`ALTER TABLE leads ADD COLUMN source TEXT DEFAULT ''`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE leads ADD COLUMN status TEXT DEFAULT ''`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN competitors TEXT DEFAULT ''`).run(); } catch {}
+  try { await db.prepare(`ALTER TABLE clients ADD COLUMN vertical TEXT DEFAULT ''`).run(); } catch {}
   // first-party visitor counting: one row per site/day/page (HTML views only, bots skipped)
   try { await db.prepare(`CREATE TABLE IF NOT EXISTS hits (
     slug TEXT NOT NULL, day TEXT NOT NULL, path TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0,
@@ -430,7 +431,8 @@ app.get('/debug/:key', async (c) => {
       const out = [];
       for (const r of rows) {
         out.push({ id: r.id, business_name: r.business_name, name: r.name,
-          theme: r.theme || '', vibe: r.vibe || '', intake1: r.intake1_data || '',
+          theme: r.theme || '', vibe: r.vibe || '', vertical: r.vertical || 'iv-therapy',
+          intake1: r.intake1_data || '',
           pitch_url: `${BASE_URL}/pitch/${r.id}/${await portalToken(c.env, 'pitch', r.id)}` });
       }
       return out;
@@ -2176,6 +2178,55 @@ app.get('/api/cf-check/:key', async (c) => {
   } catch (e) { return c.json({ ok: false, error: String(e.message).slice(0, 150) }); }
 });
 
+// 🎯 Keyed: the PROSPECTOR drops hunted businesses here (GET — headless sessions
+// can only WebFetch). Dedupes hard, stores honest evidence + an outreach draft
+// Tiffany approves and sends HERSELF. The demo builder picks the prospect up on
+// its normal cycle. Nothing here ever emails the business directly.
+app.get('/api/add-prospect/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const db = c.env.DB;
+  const q = c.req.query();
+  const biz = String(q.biz || '').trim().slice(0, 120);
+  const cty = String(q.city || '').trim().slice(0, 80);
+  const vertical = String(q.vertical || 'iv-therapy').trim().slice(0, 40);
+  const email = String(q.email || '').trim().slice(0, 160); // ONLY a publicly published address — never guessed
+  const site = String(q.site || '').trim().slice(0, 200);
+  const evidence = String(q.evidence || '').trim().slice(0, 500);
+  const draft = String(q.draft || '').trim().slice(0, 1800);
+  if (!biz || !cty) return c.json({ ok: false, error: 'biz + city required' }, 400);
+  // hard dedupe: same business name (loose match) anywhere in the pipeline
+  const dupe = await db.prepare(`SELECT id, stage FROM clients WHERE LOWER(REPLACE(business_name,' ','')) = ?`)
+    .bind(biz.toLowerCase().replace(/ /g, '')).first();
+  if (dupe) return c.json({ ok: false, skipped: true, reason: `already in pipeline (id ${dupe.id}, ${dupe.stage})` });
+  const placeholderEmail = email || `prospect+${biz.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40)}@conversionco918.com`;
+  const existing = await db.prepare('SELECT id FROM clients WHERE email = ?').bind(placeholderEmail).first();
+  if (existing) return c.json({ ok: false, skipped: true, reason: 'email already in pipeline' });
+  const intake1 = JSON.stringify({
+    'Business Name': biz, 'Contact Name': '', 'Email': placeholderEmail,
+    'Primary City & State': cty,
+    'Services Offered': vertical === 'med-spa' ? 'Med spa treatments' : vertical === 'injector' ? 'Botox & filler' : vertical === 'lash-brow' ? 'Lashes & brows' : vertical === 'weight-loss' ? 'Medical weight loss' : 'IV therapy',
+    '_prospect': true, '_hunted': true, '_vertical': vertical,
+    '_their_site': site, '_evidence': evidence, '_created': new Date().toISOString(),
+  });
+  const r = await db.prepare(`INSERT INTO clients (email, name, business_name, stage, vertical, intake1_data) VALUES (?, '', ?, 'prospect', ?, ?)`)
+    .bind(placeholderEmail, biz, vertical, intake1).run();
+  const id = r.meta.last_row_id;
+  if (draft) await setSetting(db, `outreach_${id}`, draft);
+  await logEvent(db, id, 'prospect_created', `🎯 Hunted prospect: ${biz} (${cty}, ${vertical})${evidence ? ` — ${evidence.slice(0, 90)}` : ''} — demo queued${draft ? ' + outreach drafted' : ''}`);
+  return c.json({ ok: true, id });
+});
+
+// Keyed: read/update an outreach draft (also readable by the dashboard)
+app.get('/api/outreach/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const id = Number(c.req.query('id'));
+  if (!id) return c.json({ ok: false, error: 'id required' });
+  const settings = await getSettings(c.env.DB);
+  const set = c.req.query('draft');
+  if (set !== undefined) { await setSetting(c.env.DB, `outreach_${id}`, String(set).slice(0, 1800)); return c.json({ ok: true }); }
+  return c.json({ ok: true, draft: settings[`outreach_${id}`] || '' });
+});
+
 // Keyed: run the nightly backup on demand (verification / before risky changes)
 app.get('/api/backup-now/:key', async (c) => {
   if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
@@ -2870,12 +2921,14 @@ app.get('/api/clients/:id/leads', async (c) => {
 });
 app.get('/api/clients/:id/links', async (c) => {
   const id = Number(c.req.param('id'));
+  const settingsL = await getSettings(c.env.DB);
   return c.json({
     portal: `${BASE_URL}/portal/${id}/${await portalToken(c.env, 'portal', id)}`,
     pitch: `${BASE_URL}/pitch/${id}/${await portalToken(c.env, 'pitch', id)}`,
     agreement: `${BASE_URL}/agreement/${id}/${await portalToken(c.env, 'agr', id)}`,
     gbp: `${BASE_URL}/gbp/${id}/${await portalToken(c.env, 'gbp', id)}`,
     exit: `${BASE_URL}/exit/${id}/${await portalToken(c.env, 'exit', id)}`,
+    outreach: settingsL[`outreach_${id}`] || '',
   });
 });
 
