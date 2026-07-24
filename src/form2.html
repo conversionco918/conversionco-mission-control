@@ -38,6 +38,7 @@ function Engine({ title, subtitle, steps, submitUrl, extra, accent }) {
     setBusy(true);
     try {
       const payload = { ...extra, ...a };
+      Object.keys(payload).forEach((k) => { if (k.startsWith('_')) delete payload[k]; });
       await fetch(submitUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
       setDone(true);
     } catch (e) { setErr('Something went wrong — please try again.'); }
@@ -45,7 +46,37 @@ function Engine({ title, subtitle, steps, submitUrl, extra, accent }) {
   };
   const F = {
     text: (f) => <input key={f.k} style={ST.in} placeholder={f.ph || ''} value={a[f.k] || ''} onChange={(e) => set(f.k, e.target.value)} inputMode={f.mode} />,
-    area: (f) => <textarea key={f.k} style={{ ...ST.in, minHeight: 96, resize: 'vertical' }} placeholder={f.ph || ''} value={a[f.k] || ''} onChange={(e) => set(f.k, e.target.value)} />,
+    area: (f) => {
+      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+      const micOn = a['_mic'] === f.k;
+      const toggleMic = () => {
+        if (!SR) return;
+        if (window.__ccRec) { try { window.__ccRec.stop(); } catch (e) {} window.__ccRec = null; set('_mic', ''); return; }
+        const rec = new SR();
+        rec.continuous = true; rec.interimResults = false; rec.lang = 'en-US';
+        const base = a[f.k] || '';
+        let extraTxt = '';
+        rec.onresult = (ev) => {
+          for (let i = ev.resultIndex; i < ev.results.length; i++) if (ev.results[i].isFinal) extraTxt += (extraTxt || base ? ' ' : '') + ev.results[i][0].transcript.trim();
+          set(f.k, (base + (base && extraTxt ? ' ' : '') + extraTxt).trim());
+        };
+        rec.onend = () => { window.__ccRec = null; set('_mic', ''); };
+        rec.onerror = () => { window.__ccRec = null; set('_mic', ''); };
+        window.__ccRec = rec; set('_mic', f.k);
+        try { rec.start(); } catch (e) { window.__ccRec = null; set('_mic', ''); }
+      };
+      return (
+        <div key={f.k}>
+          <textarea style={{ ...ST.in, minHeight: 96, resize: 'vertical' }} placeholder={f.ph || ''} value={a[f.k] || ''} onChange={(e) => set(f.k, e.target.value)} />
+          {SR && f.mic ? (
+            <button type="button" onClick={toggleMic} style={{ marginTop: 8, padding: '10px 16px', borderRadius: 99, border: '1.5px solid ' + (micOn ? '#dc2626' : '#cbd5e1'), background: micOn ? '#fef2f2' : '#fff', color: micOn ? '#dc2626' : '#334155', fontSize: 13.5, cursor: 'pointer' }}>
+              {micOn ? '⏹ Stop — I’m done talking' : '🎤 Or just talk — tap and tell us like a friend'}
+            </button>
+          ) : null}
+          {micOn ? <p style={{ fontSize: 12, color: '#64748b', marginTop: 6 }}>Listening… speak naturally, your words appear above. You can edit anything after.</p> : null}
+        </div>
+      );
+    },
     select: (f) => (
       <div key={f.k} style={ST.optWrap}>{f.opts.map((o) => (
         <button key={o} style={{ ...ST.opt, ...(a[f.k] === o ? ST.optOn : {}) }} onClick={() => set(f.k, o)}>{o}</button>))}
@@ -161,7 +192,7 @@ const STEPS2 = [
     { k: 'Booking Link', label: 'Booking link (if you have one)', ph: 'paste it here' }] },
   { q: "Tell us your story.", hint: "2–4 sentences, like you're telling a friend why you started. This becomes your About page — real beats polished.",
     fields: [
-    { k: 'Your Story', t: 'area', req: 1, ph: 'e.g. After 10 years in the ER, I kept seeing people who just needed hydration and care without the hospital chaos. So I brought it to their couch…' },
+    { k: 'Your Story', t: 'area', req: 1, mic: 1, ph: 'e.g. After 10 years in the ER, I kept seeing people who just needed hydration and care without the hospital chaos. So I brought it to their couch…' },
     { k: 'Years of Experience & Credentials', label: 'Years + credentials', req: 1, ph: 'e.g. 10 years — RN, BSN' }] },
   { q: "Real reviews from real clients?", hint: "Paste up to 3 — even texts from happy clients count. Real quotes beat anything we could write.",
     fields: [

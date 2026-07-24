@@ -4,6 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ConversionCo — Mission Control</title>
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#071B33">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="MissionCtrl">
+<link rel="apple-touch-icon" href="/icon-192.png">
 <style>
   :root {
     --navy: #071B33; --navy2: #0d2b4d; --bg: #f1f5f9; --card: #ffffff;
@@ -377,7 +383,17 @@ function renderFeed() {
   if (!STATE.events.length) { f.innerHTML = '<div class="empty">Activity will appear here.</div>'; return; }
   f.innerHTML = STATE.events.map(e => `<div class="item"><b>${esc(e.client_name || e.client_email || 'System')}</b> — ${esc(pretty(e.type))}${e.detail && e.type==='error' ? `<br><span style="color:var(--red);font-size:12px">${esc(e.detail)}</span>`:''}<time>${ago(e.created_at)}</time></div>`).join('');
 }
-function pretty(t){ return ({client_created:'added to pipeline', booking_email_sent:'booking link emailed 📅', intake1_sent:'Intake 1 email sent', intake1_done:'submitted Intake 1 🎉', intake2_sent:'Intake 2 email sent', intake2_done:'submitted Intake 2 🎉', stage_changed:'stage updated', error:'⚠ error', client_deleted:'removed', webhook_received:'webhook ping', build_started:'⚙ build started', build_stalled:'⚠️ build stalled — re-queued', preview_ready:'★ preview is ready', invoice_sent:'invoice sent 💳', invoice_paid:'payment received 💰', agreement_sent:'agreement sent 📄', agreement_signed:'agreement signed ✍️', portal_invited:'portal login sent 🔑', hosting_active:'hosting active 🔒', owner_digest:'weekly digest sent 📊', sms_sent:'text sent 📱', sms_skipped:'text skipped', prospect_created:'💡 prospect added', demo_ready:'💡 demo site ready', nudge_sent:'🤖 auto-nudge sent', build_stalled:'⚠️ build stalled — re-queued'})[t] || t; }
+function pretty(t){ return ({client_created:'added to pipeline', booking_email_sent:'booking link emailed 📅', intake1_sent:'Intake 1 email sent', intake1_done:'submitted Intake 1 🎉', intake2_sent:'Intake 2 email sent', intake2_done:'submitted Intake 2 🎉', stage_changed:'stage updated', error:'⚠ error', client_deleted:'removed', webhook_received:'webhook ping', build_started:'⚙ build started', build_stalled:'⚠️ build stalled — re-queued', preview_ready:'★ preview is ready', invoice_sent:'invoice sent 💳', invoice_paid:'payment received 💰', agreement_sent:'agreement sent 📄', agreement_signed:'agreement signed ✍️', portal_invited:'portal login sent 🔑', hosting_active:'hosting active 🔒', owner_digest:'weekly digest sent 📊', sms_sent:'text sent 📱', sms_skipped:'text skipped', prospect_created:'💡 prospect added', demo_ready:'💡 demo site ready', nudge_sent:'🤖 auto-nudge sent', build_stalled:'⚠️ build stalled — re-queued', site_rolled_back:'⏪ site restored to previous version'})[t] || t; }
+
+async function rollbackSite(id, btn) {
+  if (!confirm('Restore this website to its PREVIOUS version?\n\nSafe: this creates a new version (history is never deleted) and republishes within ~5 minutes. You can roll forward again later.')) return;
+  btn.disabled = true;
+  const r = await api(`/api/clients/${id}/rollback`, { method:'POST', body: '{}' });
+  btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error);
+  toast(`⏪ Restored to previous version (${r.restored}) — live again within ~5 min`);
+  refresh(); setTimeout(() => openDrawer(id), 400);
+}
 
 async function addProspect() {
   const business_name = document.getElementById('proBiz').value.trim();
@@ -440,6 +456,7 @@ function openDrawer(id) {
       <div class="actions">
         ${c.stage === 'intake1_done' || c.stage === 'intake2_sent' ? `<button class="btn btn-green" onclick="sendIntake2(${c.id}, this)">${c.stage==='intake2_sent'?'Resend Intake 2':'Approve → Send Intake 2'}</button>` : ''}
         ${c.stage === 'new' || c.stage === 'intake1_sent' ? `<button class="btn btn-primary" onclick="resendIntake1('${esc(c.email)}', this)">${c.stage==='intake1_sent'?'Resend Intake 1':'Send Intake 1'}</button>` : ''}
+        ${(c.preview_url || c.live_url) && c.stage !== 'prospect' ? `<button class="btn btn-ghost" onclick="rollbackSite(${c.id}, this)" title="Restore the site to its previous version — safe, creates a new version, never deletes history.">⏪ Undo last change</button>` : ''}
         <button class="btn btn-red" onclick="delClient(${c.id})">Remove</button>
       </div>
       ${c.stage === 'prospect' ? `<div style="background:#fdf4ff;border:1px solid #f0abfc;border-radius:10px;padding:14px;">
@@ -599,6 +616,10 @@ function openDrawer(id) {
         <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:5px;">Notes</label>
         <textarea rows="4" onblur="patchClient(${c.id}, {notes: this.value}, true)">${esc(c.notes)}</textarea>
       </div>
+      <div>
+        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Local competitors <span style="font-weight:400;color:var(--muted)">(2–3 names — monthly reports compare their reviews vs. this client's)</span></label>
+        <input type="text" placeholder="e.g. Radiance Drip Bar, Revive IV Lounge" value="${esc(c.competitors || '')}" onblur="patchClient(${c.id}, {competitors: this.value}, true)" style="width:100%;padding:10px 12px;border:1.5px solid var(--line);border-radius:8px;font-size:13.5px;">
+      </div>
     </div>`;
   document.getElementById('drawer').classList.add('open');
   api(`/api/clients/${id}/agreement`).then((r) => {
@@ -628,7 +649,7 @@ function openDrawer(id) {
     if (!box || !r.leads) return;
     box.innerHTML = `<label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Leads from their website ${r.leads.length ? `(${r.leads.length} recent)` : ''}</label>` +
       (r.leads.length
-        ? `<div class="intake" style="padding:12px 14px;">${r.leads.map(l => `<div style="padding:7px 0;border-bottom:1px dashed #e2e8f0;font-size:13px;"><b>${esc(l.name || 'No name')}</b> · ${esc(l.phone || l.email || '')}<br><span style="color:#64748b;">${esc((l.message || '').slice(0, 120))}</span><br><span style="color:#94a3b8;font-size:11px;">${esc(l.created_at)}</span></div>`).join('')}</div>`
+        ? `<div class="intake" style="padding:12px 14px;">${r.leads.map(l => `<div style="padding:7px 0;border-bottom:1px dashed #e2e8f0;font-size:13px;"><b>${esc(l.name || 'No name')}</b> · ${esc(l.phone || l.email || '')} ${l.source ? `<span class="chip" style="background:#eef2f7;color:#475569;font-size:10.5px;padding:2px 8px;">via ${esc(l.source)}</span>` : ''}<br><span style="color:#64748b;">${esc((l.message || '').slice(0, 120))}</span><br><span style="color:#94a3b8;font-size:11px;">${esc(l.created_at)}</span></div>`).join('')}</div>`
         : `<p style="font-size:12px;color:#94a3b8;">None yet — leads from their site's contact form appear here (and email you instantly).</p>`);
   });
   api(`/api/clients/${id}/score`).then((sc) => {

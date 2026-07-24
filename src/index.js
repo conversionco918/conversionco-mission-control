@@ -63,6 +63,8 @@ async function ensureSchema(db) {
     id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER, slug TEXT DEFAULT '',
     name TEXT DEFAULT '', email TEXT DEFAULT '', phone TEXT DEFAULT '', message TEXT DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now')))`).run(); } catch {}
+  try { await db.prepare(`ALTER TABLE leads ADD COLUMN source TEXT DEFAULT ''`).run(); } catch {}
+  try { await db.prepare(`ALTER TABLE clients ADD COLUMN competitors TEXT DEFAULT ''`).run(); } catch {}
   schemaReady = true;
 }
 
@@ -343,6 +345,17 @@ app.get('/debug/:key', async (c) => {
         out.push({ id: r.id, business_name: r.business_name, name: r.name,
           theme: r.theme || '', vibe: r.vibe || '', intake1: r.intake1_data || '',
           pitch_url: `${BASE_URL}/pitch/${r.id}/${await portalToken(c.env, 'pitch', r.id)}` });
+      }
+      return out;
+    })(),
+    clientLeads: await (async () => {
+      // recent lead messages + sources per client — feeds the FAQ-that-learns and
+      // lead-source sections of the report engines
+      const rows = (await c.env.DB.prepare(`SELECT client_id, name, message, source, created_at FROM leads WHERE created_at > datetime('now','-35 days') ORDER BY id DESC LIMIT 200`).all()).results || [];
+      const out = {};
+      for (const l of rows) {
+        if (!l.client_id) continue;
+        (out[l.client_id] = out[l.client_id] || []).push({ name: l.name, message: (l.message || '').slice(0, 300), source: l.source || 'direct', at: l.created_at });
       }
       return out;
     })(),
@@ -1063,9 +1076,17 @@ app.post('/lead/:slug', async (c) => {
   let f = {}; try { f = await c.req.json(); } catch { try { f = Object.fromEntries(Object.entries(await c.req.parseBody()).map(([k, v]) => [k, String(v)])); } catch {} }
   const meta = await db.prepare(`SELECT content FROM site_files WHERE slug=? AND path='site-meta.json'`).bind(slug).first();
   let clientId = null; try { clientId = JSON.parse(meta?.content || '{}').client_id ?? null; } catch {}
-  await db.prepare(`INSERT INTO leads (client_id, slug, name, email, phone, message) VALUES (?, ?, ?, ?, ?, ?)`)
-    .bind(clientId, slug, String(f.name || '').slice(0, 120), String(f.email || '').slice(0, 160), String(f.phone || '').slice(0, 40), String(f.message || '').slice(0, 1500)).run();
-  await logEvent(db, clientId, 'lead_received', `🔥 New lead on ${slug}: ${f.name || 'no name'} ${f.phone || f.email || ''}`);
+  // lead-source tag: explicit field (utm/?s= from the form) beats referrer sniffing
+  let source = String(f.src || f.source || '').slice(0, 60).trim();
+  if (!source) {
+    const ref = String(c.req.header('Referer') || '');
+    if (/[?&](utm_source|s)=/i.test(ref)) source = decodeURIComponent((ref.match(/[?&](?:utm_source|s)=([^&]+)/i) || [])[1] || '').slice(0, 60);
+    else if (ref) source = 'website';
+  }
+  if (!source) source = 'direct';
+  await db.prepare(`INSERT INTO leads (client_id, slug, name, email, phone, message, source) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .bind(clientId, slug, String(f.name || '').slice(0, 120), String(f.email || '').slice(0, 160), String(f.phone || '').slice(0, 40), String(f.message || '').slice(0, 1500), source).run();
+  await logEvent(db, clientId, 'lead_received', `🔥 New lead on ${slug} (via ${source}): ${f.name || 'no name'} ${f.phone || f.email || ''}`);
   const settings = await getSettings(db);
   if (settings.notify_email && c.env.GHL_TOKEN && settings.ghl_location_id) {
     try {
@@ -1096,6 +1117,21 @@ app.get('/portfolio.json', async (c) => {
   c.header('Access-Control-Allow-Origin', '*');
   return c.json({ sites: out });
 });
+
+// ---- PWA: installable Mission Control (public routes — manifest fetches lack cookies) ----
+const ICON192 = 'iVBORw0KGgoAAAANSUhEUgAAAMAAAADACAIAAADdvvtQAAADiUlEQVR42u3dy03kQBRA0cZCIohZEQP7yYsIyItEJhUWSAgJGMqu/3vnrmfcbuq4XO6f7x7+PN2kqx3+BAJIAAkgASQBJIAEkACSABJAAkgASQAJIAEkgCSABJAAEkACSAJIAAkgASQBJIAEkACSABJAAkgASQAJIAEkgASQdLV7f4LPvb48lvyzv8///K3eu/ND44VoYAKopRuSkgJq7ia5pESABtBJyCgFoMF0UjGKD+isnl+HvPkGAUp9TZ78yj8soJJxbTiogx8OoJl6ug7kxIcGKM745WF00DP+4mviVaEZ6Mqo1NB5fXms/O+x56GDnl83WzNh/OfRY8xDwT/OscJRHvt1oAiAfjqUG77A0+kd+wCT0EHP3Hlod0MHPYVbrh/pkIYCroFWXnPEWw9tDOjbA7fJCP00JTSZKr7dw30noYOeReahTQ35Vsa5gYz0InJeQFtPP8EmoSAzUCs9JUPYapi9lbHiKSb2CRSg7acfk5BFtBID6jfDn93yOnsCUOqzwO777xR2/aD3mtBmgL4OWNc3LoYZ+vosNqJpBhJAU1esyU9kZiDlANTjQG+1zZX3DaCwF8AxnkveU1jbQzztSsgaSABZtQC0u560hg56GAJIAIWYfhJOQmYgASSAgp1Z8pzFDiA8lxSAst3KZJfnaw0kgASQAJqwLIixju70ZQGABJAL4Oj7vxmgmrl9nVsdxLiAdwoTQJufBfzQuLNY6vPXLcPNVuwzQEWH6SL3Li3cfoDfCc27iO43Ttne8d0YUOXP5PYY6fJthpl+bvG+2jzLUE49MU9h4w1V6nEKW241M9JQvZ6tV05hf2RzjKHkem5h7trcZHhOnV+abDnAVdt97IvMUzft/viXbe8BHfsbGu4bn3GvALpyrA8esKV2xiK6wbpknS8WRnrBOtQMtML45aETGVDhfNNwOAc/HECrGKof10U+BQDQZEblI918gwBFMzRsXQ8QRnnppAM0jFGqj5WlA9RPUsKPI6YG1EpSTjcAuSYHSAvkq80CSAAJIAEkASSABJAAkgASQAJIAEkACSABpDhN/nmXVLdY79Tcj0eagQSQABJAyphvZcgMJIAEkACSABJAAkgASQAJIAEkgCSABJAAEkASQAJIAAkgASQBJIAEkACSABJAAkgASQAJIAEkgCSABJAAEkACSAJIAAkgASQBJIAEkACSABJAWrQ32LZxEm35/n4AAAAASUVORK5CYII=';
+const ICON512 = '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';
+function b64bytes(b64) { const bin = atob(b64); const a = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i); return a; }
+app.get('/manifest.json', (c) => c.json({
+  name: 'ConversionCo Mission Control', short_name: 'MissionCtrl',
+  start_url: '/', display: 'standalone', background_color: '#071B33', theme_color: '#071B33',
+  icons: [
+    { src: '/icon-192.png', sizes: '192x192', type: 'image/png' },
+    { src: '/icon-512.png', sizes: '512x512', type: 'image/png' },
+  ],
+}));
+app.get('/icon-192.png', (c) => c.body(b64bytes(ICON192), 200, { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=604800' }));
+app.get('/icon-512.png', (c) => c.body(b64bytes(ICON512), 200, { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=604800' }));
 
 // Everything below requires a session
 app.use('*', async (c, next) => {
@@ -1283,7 +1319,7 @@ app.patch('/api/clients/:id', async (c) => {
   const id = Number(c.req.param('id'));
   const body = await c.req.json();
   const allowed = {};
-  for (const k of ['stage', 'notes', 'name', 'phone', 'business_name', 'preview_url', 'live_url', 'theme', 'tier', 'launch_checklist', 'vibe', 'email']) {
+  for (const k of ['stage', 'notes', 'name', 'phone', 'business_name', 'preview_url', 'live_url', 'theme', 'tier', 'launch_checklist', 'vibe', 'email', 'competitors']) {
     if (k in body) allowed[k] = body[k];
   }
   if (!Object.keys(allowed).length) return c.json({ error: 'nothing to update' }, 400);
@@ -1486,6 +1522,56 @@ app.post('/api/clients/:id/billing-bypass', async (c) => {
   }
   await touchClient(db, id, { billing: JSON.stringify(billing) });
   return c.json({ ok: true });
+});
+
+// ⏪ Panic button: restore the client's site to its previous version (new commit,
+// never a force-push) — auto-publish then reimports it within 5 minutes.
+app.post('/api/clients/:id/rollback', async (c) => {
+  const id = Number(c.req.param('id'));
+  const db = c.env.DB;
+  if (!c.env.GITHUB_TOKEN) return c.json({ error: 'GitHub not configured' }, 500);
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  // resolve slug from imported metas
+  const metas = (await db.prepare(`SELECT slug, content FROM site_files WHERE path='site-meta.json'`).all()).results || [];
+  let slug = null;
+  for (const m of metas) { try { if (JSON.parse(m.content).client_id === id) { slug = m.slug; break; } } catch {} }
+  if (!slug) return c.json({ error: 'no site found for this client yet' }, 400);
+  const settings = await getSettings(db);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  const gh = ghFetcher(c.env);
+  const ghPost = async (path, method, body) => {
+    const res = await fetch(`https://api.github.com${path}`, {
+      method, headers: { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json', 'Content-Type': 'application/json' },
+      body: JSON.stringify(body) });
+    const data = await res.json();
+    if (!res.ok) throw new Error(`GitHub ${method} ${path} -> ${res.status}: ${data.message || ''}`);
+    return data;
+  };
+  try {
+    const commits = await gh(`/repos/${repo}/commits?path=sites/${slug}&per_page=3&sha=main`);
+    if (!Array.isArray(commits) || commits.length < 2) return c.json({ error: 'No earlier version exists yet for this site' }, 400);
+    const prev = commits[1]; // the version before the latest change
+    const prevCommit = await gh(`/repos/${repo}/git/commits/${prev.sha}`);
+    const prevTree = await gh(`/repos/${repo}/git/trees/${prevCommit.tree.sha}?recursive=0`);
+    const sitesEntry = (prevTree.tree || []).find((t) => t.path === 'sites');
+    const prevSites = await gh(`/repos/${repo}/git/trees/${sitesEntry.sha}`);
+    const slugEntry = (prevSites.tree || []).find((t) => t.path === slug && t.type === 'tree');
+    if (!slugEntry) return c.json({ error: 'Previous version not found in history' }, 400);
+    const headRef = await gh(`/repos/${repo}/git/ref/heads/main`);
+    const headCommit = await gh(`/repos/${repo}/git/commits/${headRef.object.sha}`);
+    const newTree = await ghPost(`/repos/${repo}/git/trees`, 'POST', {
+      base_tree: headCommit.tree.sha,
+      tree: [{ path: `sites/${slug}`, mode: '040000', type: 'tree', sha: slugEntry.sha }],
+    });
+    const newCommit = await ghPost(`/repos/${repo}/git/commits`, 'POST', {
+      message: `⏪ Rollback sites/${slug} to ${prev.sha.slice(0, 7)} (panic button from Mission Control)`,
+      tree: newTree.sha, parents: [headRef.object.sha],
+    });
+    await ghPost(`/repos/${repo}/git/refs/heads/main`, 'PATCH', { sha: newCommit.sha, force: false });
+    await logEvent(db, id, 'site_rolled_back', `⏪ Site restored to the previous version (${prev.sha.slice(0, 7)}: "${(prev.commit?.message || '').split('\n')[0].slice(0, 70)}") — republishing within 5 min`);
+    return c.json({ ok: true, restored: prev.sha.slice(0, 7), was: (prev.commit?.message || '').split('\n')[0].slice(0, 90) });
+  } catch (e) { return c.json({ error: 'Rollback failed: ' + String(e.message).slice(0, 200) }, 502); }
 });
 
 app.get('/api/clients/:id/score', async (c) => {
