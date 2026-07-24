@@ -67,11 +67,16 @@ export async function computeScore(db, client, settings) {
   local = Math.min(20, local);
 
   // ---- 4. Reliability (0-15) from uptime record ----
+  // Realistic: reliability must be EARNED. Full points require a clean streak of at
+  // least 7 daily checks — a brand-new site ramps up as its track record builds.
   let upStat = null; try { upStat = JSON.parse(settings[`uptime_${client.id}`] || 'null'); } catch {}
-  let reliability = 15, upPct = null;
+  let reliability, upPct = null;
   if (upStat && upStat.total > 0) {
     upPct = Math.round(100 * (upStat.total - (upStat.fails || 0)) / upStat.total);
-    reliability = Math.round(15 * upPct / 100);
+    const trackRecord = Math.min(upStat.total, 7) / 7; // ramps over the first week
+    reliability = Math.round(15 * (upPct / 100) * trackRecord);
+  } else {
+    reliability = 0; // no checks yet = nothing earned yet
   }
 
   // ---- 5. Off-site launch checklist (0-20) ----
