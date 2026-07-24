@@ -1552,13 +1552,18 @@ app.patch('/api/clients/:id', async (c) => {
     if (k in body) allowed[k] = body[k];
   }
   if (!Object.keys(allowed).length) return c.json({ error: 'nothing to update' }, 400);
-  // 🚀 LAUNCH DAY: first time the site goes live (stage=live or live_url set), make it an event
+  // 🚀 LAUNCH DAY: first time the site goes live (stage=live or live_url set), make it an event.
+  // quietLaunch:true = imported/already-live client — record the launch state, skip the email.
+  const quietLaunch = body.quietLaunch === true;
   const before = await c.env.DB.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
   const goingLive = before && ((allowed.stage === 'live' && before.stage !== 'live') || (allowed.live_url && !before.live_url));
   await touchClient(c.env.DB, id, allowed);
   if (goingLive) {
     let bL = {}; try { bL = JSON.parse(before.billing || '{}'); } catch {}
-    if (!bL.launched_at) {
+    if (bL.launched_at || quietLaunch) {
+      if (!bL.launched_at) { bL.launched_at = new Date().toISOString(); await touchClient(c.env.DB, id, { billing: JSON.stringify(bL) }); }
+      if (quietLaunch) await logEvent(c.env.DB, id, 'launched', `🚀 ${before.business_name || before.name || before.email} imported as LIVE (quiet — no launch email)`);
+    } else {
       bL.launched_at = new Date().toISOString();
       await touchClient(c.env.DB, id, { billing: JSON.stringify(bL) });
       const settingsL = await getSettings(c.env.DB);
