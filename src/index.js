@@ -89,6 +89,45 @@ app.use('*', async (c, next) => {
   return next();
 });
 
+// 🌐 DIRECT LIVE HOSTING: when a client's custom domain points at this worker,
+// serve their site straight from storage — no separate hosting anywhere.
+// Mapping lives in settings: livehost_<hostname> = slug (set by golive-domain).
+app.use('*', async (c, next) => {
+  const host = (c.req.header('Host') || '').toLowerCase().split(':')[0];
+  if (!host || host.endsWith('.workers.dev')) return next();
+  const settings = await getSettings(c.env.DB);
+  const slug = settings[`livehost_${host}`] || settings[`livehost_${host.replace(/^www\./, '')}`];
+  if (!slug) return next();
+  let path = c.req.path.replace(/^\/+/, '') || 'index.html';
+  if (path === '' || path.endsWith('/')) path += 'index.html';
+  let row = await c.env.DB.prepare('SELECT * FROM site_files WHERE slug = ? AND path = ?').bind(slug, path).first();
+  if (!row && !path.includes('.')) {
+    row = await c.env.DB.prepare('SELECT * FROM site_files WHERE slug = ? AND path = ?').bind(slug, path + '/index.html').first()
+      || await c.env.DB.prepare('SELECT * FROM site_files WHERE slug = ? AND path = ?').bind(slug, path + '.html').first();
+  }
+  if (!row) {
+    const nf = await c.env.DB.prepare(`SELECT * FROM site_files WHERE slug = ? AND path = '404.html'`).bind(slug).first();
+    if (nf) return new Response(nf.is_base64 ? Uint8Array.from(atob(nf.content), (ch) => ch.charCodeAt(0)) : nf.content,
+      { status: 404, headers: { 'Content-Type': 'text/html' } });
+    return c.text('Not found', 404);
+  }
+  try {
+    const ua = c.req.header('User-Agent') || '';
+    const isHtml = String(row.content_type || '').includes('text/html');
+    const isBot = /bot|crawl|spider|slurp|headless|preview|monitor|lighthouse|pingdom/i.test(ua) || !ua;
+    const isFrame = (c.req.header('Sec-Fetch-Dest') || '') === 'iframe';
+    if (isHtml && !isBot && !isFrame) {
+      const day = new Date().toISOString().slice(0, 10);
+      c.executionCtx.waitUntil(c.env.DB.prepare(
+        `INSERT INTO hits (slug, day, path, n) VALUES (?, ?, ?, 1)
+         ON CONFLICT(slug, day, path) DO UPDATE SET n = n + 1`
+      ).bind(slug, day, path).run().catch(() => {}));
+    }
+  } catch { /* counting must never break serving */ }
+  const body = row.is_base64 ? Uint8Array.from(atob(row.content), (ch) => ch.charCodeAt(0)) : row.content;
+  return new Response(body, { headers: { 'Content-Type': row.content_type, 'Cache-Control': 'public, max-age=300' } });
+});
+
 // ---------------- helpers ----------------
 async function hmac(secret, msg) {
   const key = await crypto.subtle.importKey(
@@ -2568,6 +2607,65 @@ app.post('/api/clients/:id/billing-bypass', async (c) => {
   }
   await touchClient(db, id, { billing: JSON.stringify(billing) });
   return c.json({ ok: true });
+});
+
+// 🌐 GO-LIVE AUTOPILOT: attach a client's domain to direct hosting — zone check,
+// Workers custom domains for apex + www (DNS + SSL automatic), live-host serving
+// mapping, optional hello@ email forward, card flipped live + instant GSC.
+app.post('/api/clients/:id/golive-domain', async (c) => {
+  const id = Number(c.req.param('id'));
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  let f = {}; try { f = await c.req.json(); } catch {}
+  const domain = String(f.domain || '').toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '').replace(/^www\./, '');
+  if (!domain || !domain.includes('.')) return c.json({ error: 'domain required (e.g. herbusiness.com)' }, 400);
+  if (!c.env.CLOUDFLARE_API_TOKEN || !c.env.CF_ACCOUNT_ID) return c.json({ error: 'Cloudflare token/account not configured' }, 400);
+  const slug = await slugForClient(db, id);
+  if (!slug) return c.json({ error: 'no built site for this client yet' }, 400);
+  const cf = async (path, method, body) => {
+    const res = await fetch(`https://api.cloudflare.com/client/v4${path}`, {
+      method: method || 'GET',
+      headers: { Authorization: `Bearer ${c.env.CLOUDFLARE_API_TOKEN}`, 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined });
+    return res.json().catch(() => ({}));
+  };
+  const steps = [];
+  // 1. the zone must already be in the Cloudflare account (nameservers moved)
+  const zones = await cf(`/zones?name=${domain}`);
+  const zone = zones && zones.result && zones.result[0];
+  if (!zone) {
+    return c.json({ ok: false, steps, error: `${domain} is not in the Cloudflare account yet (or the API token cannot list zones). One-time setup: add the domain as a zone in Cloudflare + point its nameservers there, and give the token Zone:Read + Workers Custom Domains:Edit + Email Routing:Edit.` });
+  }
+  steps.push(`zone found (status: ${zone.status})`);
+  // 2. attach apex + www to this worker (creates DNS records + SSL automatically)
+  for (const host of [domain, `www.${domain}`]) {
+    const att = await cf(`/accounts/${c.env.CF_ACCOUNT_ID}/workers/domains`, 'PUT', {
+      environment: 'production', hostname: host, service: 'conversionco-mission-control', zone_id: zone.id });
+    steps.push(`${host}: ${att.success ? 'attached ✓' : 'FAILED — ' + JSON.stringify(att.errors || att.messages || []).slice(0, 160)}`);
+    if (!att.success && host === domain) {
+      return c.json({ ok: false, steps, error: 'Could not attach the domain — the token likely needs Workers Custom Domains edit permission.' });
+    }
+  }
+  // 3. map the hostnames to the site so the worker serves it
+  await setSetting(db, `livehost_${domain}`, slug);
+  await setSetting(db, `livehost_www.${domain}`, slug);
+  steps.push('direct serving mapped');
+  // 4. optional branded inbox: hello@domain forwards to the client's email
+  if (f.emailForward && client.email) {
+    const er = await cf(`/zones/${zone.id}/email/routing/rules`, 'POST', {
+      enabled: true, name: 'hello forward',
+      matchers: [{ type: 'literal', field: 'to', value: `hello@${domain}` }],
+      actions: [{ type: 'forward', value: [client.email] }] });
+    steps.push(`hello@${domain}: ${er && er.success ? `forwards to ${client.email} ✓` : 'not set (enable Email Routing on the zone once, then re-run)'}`);
+  }
+  // 5. flip the card live + instant GSC enrollment (quiet — no launch email here)
+  await touchClient(db, id, { live_url: `https://${domain}`, stage: 'live', launched_at: new Date().toISOString() });
+  await logEvent(db, id, 'launched', `🌐 ${domain} attached to direct hosting — DNS, SSL, serving, and Google enrollment all automatic`);
+  c.executionCtx.waitUntil((async () => {
+    try { const s2 = await getSettings(db); await gscEnsureClient(c.env, s2, { ...client, live_url: `https://${domain}`, stage: 'live' }); } catch {}
+  })());
+  return c.json({ ok: true, steps, url: `https://${domain}` });
 });
 
 // ⏪ Panic button: restore the client's site to its previous version (new commit,
