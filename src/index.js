@@ -589,8 +589,26 @@ app.get('/api/build-started/:key', async (c) => {
   const client = await c.env.DB.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
   if (!client) return c.json({ ok: false, error: 'client not found' });
   await touchClient(c.env.DB, id, { stage: 'generating' });
+  await setSetting(c.env.DB, `buildprog_${id}`, JSON.stringify({ started_at: new Date().toISOString(), pct: 5, step: 'Build started' }));
   await logEvent(c.env.DB, id, 'build_started', `⚙ Build started for ${client.business_name || client.name || client.email} — site is being generated now`);
   return c.json({ ok: true });
+});
+
+// Keyed: the builder reports milestones so the dashboard progress bar is real
+app.get('/api/build-progress/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const id = Number(c.req.query('id'));
+  const pct = Math.max(1, Math.min(99, Number(c.req.query('pct')) || 0));
+  const step = String(c.req.query('step') || '').slice(0, 60);
+  if (!id || !pct) return c.json({ ok: false, error: '?id= and ?pct= required' });
+  const settings = await getSettings(c.env.DB);
+  let prog = {}; try { prog = JSON.parse(settings[`buildprog_${id}`] || '{}'); } catch {}
+  if (!prog.started_at) prog.started_at = new Date().toISOString();
+  prog.pct = Math.max(prog.pct || 0, pct); // never move backwards
+  if (step) prog.step = step;
+  prog.updated_at = new Date().toISOString();
+  await setSetting(c.env.DB, `buildprog_${id}`, JSON.stringify(prog));
+  return c.json({ ok: true, ...prog });
 });
 
 // Keyed: clear stored email-template overrides so the code defaults (personal style) apply
@@ -1093,7 +1111,13 @@ async function computeOverview(db, clients, settings) {
   }
   for (const l of newLeads) needs.push({ id: l.client_id, sev: 3, kind: 'lead', msg: `🔥 New lead for ${l.cbiz || l.cname || 'client'}: ${l.name || l.email || l.phone || 'someone'} (${ago2(l.created_at)})` });
   needs.sort((a, b2) => a.sev - b2.sev);
-  return { money: { collected, outstanding, hostingCount, mrr: hostingCount * 49 }, needs: needs.slice(0, 12), health };
+  const buildProgress = {};
+  for (const cl of clients) {
+    if (cl.stage !== 'generating') continue;
+    let prog = {}; try { prog = JSON.parse(settings[`buildprog_${cl.id}`] || '{}'); } catch {}
+    buildProgress[cl.id] = { pct: prog.pct || 5, step: prog.step || 'Build started', started_at: prog.started_at || cl.updated_at };
+  }
+  return { money: { collected, outstanding, hostingCount, mrr: hostingCount * 49 }, needs: needs.slice(0, 12), health, buildProgress };
 }
 function ago2(iso) { if (!iso) return ''; const m = (Date.now() - Date.parse(iso + (String(iso).includes('Z') ? '' : 'Z'))) / 60000; if (m < 60) return `${Math.max(1, Math.floor(m))}m ago`; if (m < 1440) return `${Math.floor(m / 60)}h ago`; return `${Math.floor(m / 1440)}d ago`; }
 

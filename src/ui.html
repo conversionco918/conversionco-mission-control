@@ -119,6 +119,14 @@
   .bcard .em { font-size: 11.5px; color: var(--muted); word-break: break-all; }
   .bcard .tier { font-size: 10.5px; font-weight: 700; color: #7c3aed; }
 
+  /* build progress bar */
+  .bprog { margin-top: 6px; max-width: 280px; }
+  .bprog .track { height: 8px; background: #e2e8f0; border-radius: 99px; overflow: hidden; }
+  .bprog .fill { height: 100%; border-radius: 99px; background: linear-gradient(90deg, #be185d, #7c3aed);
+    background-size: 200% 100%; animation: bshine 2.2s linear infinite; transition: width .8s ease; }
+  @keyframes bshine { 0% { background-position: 0% 0; } 100% { background-position: 200% 0; } }
+  .bprog .blabel { font-size: 11px; color: var(--muted); margin-top: 3px; display: flex; justify-content: space-between; gap: 8px; }
+
   /* mobile polish */
   @media (max-width: 700px) {
     main { padding: 12px; }
@@ -271,6 +279,27 @@ function dot(c) {
   return `<span class="dot ${h.dot}" title="${esc(h.why)}"></span>`;
 }
 
+// Build progress bar: real milestones from the builder, blended with elapsed time.
+// A typical build runs ~15 minutes; the time-based floor never exceeds 92% so the
+// bar only hits 100% when the site actually publishes (stage flips to preview).
+const BUILD_MINUTES = 15;
+function buildBar(c) {
+  if (c.stage !== 'generating') return '';
+  const p = (STATE.overview && STATE.overview.buildProgress && STATE.overview.buildProgress[c.id]) || {};
+  const started = Date.parse((p.started_at || c.updated_at || '') + (String(p.started_at || c.updated_at || '').includes('Z') ? '' : 'Z'));
+  const elapsedMin = isNaN(started) ? 0 : Math.max(0, (Date.now() - started) / 60000);
+  const timePct = Math.min(92, (elapsedMin / BUILD_MINUTES) * 100);
+  const pct = Math.round(Math.min(97, Math.max(p.pct || 5, timePct)));
+  const left = Math.ceil(BUILD_MINUTES - elapsedMin);
+  const eta = elapsedMin >= BUILD_MINUTES ? 'finishing up…' : `~${Math.max(1, left)} min left`;
+  return `<div class="bprog"><div class="track"><div class="fill" style="width:${pct}%"></div></div>
+    <div class="blabel"><span>⚙ ${esc(p.step || 'Building')}</span><span>${pct}% · ${eta}</span></div></div>`;
+}
+// keep bars moving between refreshes
+setInterval(() => {
+  if ((STATE.clients || []).some(c => c.stage === 'generating')) { renderClients(); renderBoard(); }
+}, 15000);
+
 function renderOverview() {
   const ov = STATE.overview;
   const ms = document.getElementById('moneyStrip'), ns = document.getElementById('needsStrip');
@@ -316,6 +345,7 @@ function renderBoard() {
         <b>${dot(c)}${esc(c.business_name || c.name || c.email)}</b>
         <span class="em">${esc(c.email)}</span>
         ${c.tier === 'premium' ? '<span class="tier">★ PREMIUM</span>' : ''}
+        ${buildBar(c)}
         <div style="font-size:11px;color:var(--muted);margin-top:3px;">${ago(c.updated_at)}</div>
       </div>`).join('') || '<div style="font-size:12px;color:#94a3b8;padding:6px;">—</div>'}
     </div>`).join('');
@@ -328,7 +358,7 @@ function renderClients() {
     const st = STAGES[c.stage] || STAGES.new;
     return `<tr class="rowclick" onclick="openDrawer(${c.id})">
       <td>${dot(c)}<b>${esc(c.name || c.email)}</b>${c.name ? `<br><span style="color:var(--muted);font-size:12px;margin-left:16px;">${esc(c.email)}</span>` : ''}</td>
-      <td><span class="chip" style="background:${st.bg};color:${st.fg}">${st.label}</span></td>
+      <td><span class="chip" style="background:${st.bg};color:${st.fg}">${st.label}</span>${buildBar(c)}</td>
       <td style="color:var(--muted);font-size:13px">${ago(c.updated_at)}</td>
       <td>${c.stage === 'intake1_done' ? `<button class="btn btn-green" onclick="event.stopPropagation();sendIntake2(${c.id}, this)">Approve → Intake 2</button>` : ''}</td>
     </tr>`;
@@ -376,7 +406,7 @@ function openDrawer(id) {
   document.getElementById('drawer').innerHTML = `
     <div class="dhead"><h2>${esc(c.name || c.email)}</h2><p>${esc(c.email)}${c.phone ? ' · ' + esc(c.phone) : ''}</p></div>
     <div class="dbody">
-      <div><span class="chip" style="background:${st.bg};color:${st.fg}">${st.label}</span> <span id="seoScore" style="font-size:12.5px;color:#64748b;"></span></div>
+      <div><span class="chip" style="background:${st.bg};color:${st.fg}">${st.label}</span> <span id="seoScore" style="font-size:12.5px;color:#64748b;"></span>${buildBar(c)}</div>
       <div class="actions">
         ${c.stage === 'intake1_done' || c.stage === 'intake2_sent' ? `<button class="btn btn-green" onclick="sendIntake2(${c.id}, this)">${c.stage==='intake2_sent'?'Resend Intake 2':'Approve → Send Intake 2'}</button>` : ''}
         ${c.stage === 'new' || c.stage === 'intake1_sent' ? `<button class="btn btn-primary" onclick="resendIntake1('${esc(c.email)}', this)">${c.stage==='intake1_sent'?'Resend Intake 1':'Send Intake 1'}</button>` : ''}
