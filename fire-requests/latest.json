@@ -1,0 +1,11 @@
+{
+  "requested_at": "2026-07-24T22:57:33.419Z",
+  "by": "dashboard fire button",
+  "waiting": [
+    {
+      "id": 18,
+      "biz": "Golden Hour IV Co.",
+      "stage": "intake2_done"
+    }
+  ]
+}
