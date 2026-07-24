@@ -3643,6 +3643,41 @@ async function githubTokenHealth(env) {
   }
 }
 
+// 🚨 QUEUE WATCH: paid clients and queued revisions must NEVER sit silently.
+// If the scheduled build/revision sessions stall for any reason, Tiffany hears
+// about it within the hour — instead of a client quietly waiting.
+async function queueWatch(env, settings) {
+  const db = env.DB;
+  const now = Date.now();
+  // paid + intake2_done clients waiting on a build for 90+ minutes
+  const waiting = (await db.prepare(`SELECT * FROM clients WHERE stage = 'intake2_done'`).all()).results || [];
+  for (const cl of waiting) {
+    let b = {}; try { b = JSON.parse(cl.billing || '{}'); } catch {}
+    if (!depositPaid(b)) continue;
+    const readyAt = Date.parse((cl.updated_at || '').replace(' ', 'T') + 'Z') || now;
+    if (now - readyAt < 90 * 60 * 1000) continue;
+    const last = Number(settings[`qw_build_${cl.id}`] || 0);
+    if (now - last < 12 * 60 * 60 * 1000) continue;
+    await setSetting(db, `qw_build_${cl.id}`, String(now));
+    const biz = cl.business_name || cl.name || cl.email;
+    const hrs = Math.round((now - readyAt) / 3600000 * 10) / 10;
+    await logEvent(db, cl.id, 'error', `🚨 BUILD STALLED: ${biz} has been paid + build-ready for ~${hrs}h with no build started — the builder task may not be running`);
+    await notifyOwner(env, settings, `🚨 Build stalled: ${biz} is waiting`,
+      `<p><b>${biz}</b> paid their deposit and finished intake ~${hrs} hours ago, but no build has started. The scheduled builder may be stuck.</p><p>Fast fixes: open the auto-builder scheduled task in your Claude app and check its last run — or open a Claude session and say "build client ${cl.id} now".</p>`);
+  }
+  // revisions pending for 2+ hours (the runner fires hourly — 2h late = stalled)
+  const oldRevs = (await db.prepare(`SELECT r.*, c.business_name FROM revisions r LEFT JOIN clients c ON c.id = r.client_id WHERE r.status = 'pending' AND r.created_at < datetime('now','-2 hours')`).all()).results || [];
+  if (oldRevs.length) {
+    const last = Number(settings.qw_revisions || 0);
+    if (now - last > 6 * 60 * 60 * 1000) {
+      await setSetting(db, 'qw_revisions', String(now));
+      await logEvent(db, null, 'error', `🚨 REVISIONS STALLED: ${oldRevs.length} change(s) pending 2+ hours — the hourly runner may not be completing`);
+      await notifyOwner(env, settings, `🚨 ${oldRevs.length} website change(s) stuck in the queue`,
+        `<p>These have been waiting 2+ hours (the runner normally clears them hourly):</p><p>${oldRevs.slice(0, 5).map((r) => `• ${r.business_name || 'client ' + r.client_id}: "${String(r.request).slice(0, 70)}"`).join('<br>')}</p><p>Check the revision-runner scheduled task's last run in your Claude app, or ask Claude to apply them directly.</p>`);
+    }
+  }
+}
+
 // ⛑ DOWN WATCH: every 5 minutes, quick check of every LIVE client domain.
 // 2 consecutive fails (~10 min down) → one immediate alert. Recovery → one all-clear.
 async function downWatch(env, settings) {
@@ -4011,6 +4046,9 @@ export default {
     ));
     ctx.waitUntil(retryFailedEmails(env, settings).catch((e) =>
       logEvent(env.DB, null, 'error', `Email retry failed: ${e.message}`)
+    ));
+    ctx.waitUntil(queueWatch(env, settings).catch((e) =>
+      logEvent(env.DB, null, 'error', `Queue watch failed: ${e.message}`)
     ));
   },
 };
