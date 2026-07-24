@@ -486,6 +486,10 @@ function openDrawer(id) {
           <button class="btn btn-green" onclick="convertProspect(${c.id})">Convert → Intake 1</button>
         </div>
       </div>` : ''}
+      ${['intake2_done','generating'].includes(c.stage) ? `<div style="background:#F0FDFA;border:1px solid #99E5DC;border-radius:10px;padding:14px;">
+        <p style="font-size:12.5px;font-weight:600;color:#0B7A6F;margin-bottom:6px;">🛠 Builder status</p>
+        <div id="bstat"><button class="btn btn-ghost" style="padding:6px 12px;font-size:12px" onclick="builderStatus(${c.id})">Check the builder now</button></div>
+      </div>` : ''}
       ${c.preview_url && c.stage !== 'prospect' ? `<div class="kv"><b>Preview site</b><a href="${esc(c.preview_url)}" target="_blank">${esc(c.preview_url)}</a></div>` : ''}
       <div>
         <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Website tier — set after the pricing call</label>
@@ -753,6 +757,28 @@ async function startHosting(id, btn) {
   refresh(); setTimeout(() => openDrawer(id), 400);
 }
 function copyText(t){ navigator.clipboard?.writeText(t).catch(()=>{}); }
+async function builderStatus(id) {
+  const el = document.getElementById('bstat');
+  if (!el) return;
+  el.innerHTML = '<span style="font-size:12.5px;color:#556;">Checking…</span>';
+  const s = await api('/api/builder-status');
+  const me = (s.waiting || []).find(w => w.id === id);
+  const fmtT = (iso) => new Date(iso).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  const fmtDT = (sql) => new Date(String(sql).replace(' ', 'T') + 'Z').toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  let h = '';
+  if (me && me.stage === 'generating') {
+    h = '<p style="font-size:13px;">⚙️ <b>Build in progress right now</b> — the progress bar above updates as it goes.</p>';
+  } else if (me && me.overdue) {
+    h = '<p style="font-size:13px;color:#B45309;">⚠️ <b>Overdue</b> — paid and build-ready for ' + (Math.round(me.waitingMins / 6) / 10) + 'h with no build started. An alarm email was sent to you.</p>'
+      + '<p style="font-size:12px;color:#556;margin-top:6px;">Next scheduled attempt: <b>' + fmtT(s.nextRunAt) + '</b> (~' + s.minutesUntil + ' min). Backup: tell Claude "build client ' + id + ' now".</p>';
+  } else if (me && !me.paid) {
+    h = '<p style="font-size:13px;">⏸ Waiting on the <b>deposit</b> — the builder only builds paid clients.</p>';
+  } else {
+    h = '<p style="font-size:13px;">✅ <b>In line.</b> The builder wakes at <b>' + fmtT(s.nextRunAt) + '</b> (~' + s.minutesUntil + ' min) and will pick this build up' + (me ? ' (waiting ' + me.waitingMins + ' min so far)' : '') + '.</p>';
+  }
+  if (s.lastBuildStartedAt) h += '<p style="font-size:11.5px;color:#667;margin-top:6px;">Last build started: ' + fmtDT(s.lastBuildStartedAt) + (s.lastPublishedAt ? ' · last site published: ' + fmtDT(s.lastPublishedAt) : '') + '</p>';
+  el.innerHTML = h + '<button class="btn btn-ghost" style="margin-top:8px;padding:5px 10px;font-size:11px" onclick="builderStatus(' + id + ')">↻ Re-check</button>';
+}
 async function copyOutreach(id, btn) {
   const r = await api(`/api/clients/${id}/links`);
   if (!r.outreach) return toast('No outreach draft yet — the prospector writes one when it finds them');

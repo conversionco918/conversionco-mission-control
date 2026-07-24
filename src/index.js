@@ -2854,6 +2854,35 @@ app.get('/api/clients/:id/score', async (c) => {
   return c.json(score || { error: 'no site yet' });
 });
 
+// 🛠 BUILDER HEARTBEAT — "is the machine coming for my queued builds?"
+// The auto-builder scheduled task fires every 2 hours at :23 UTC (0,2,4…22).
+app.get('/api/builder-status', async (c) => {
+  const db = c.env.DB;
+  const now = new Date();
+  let next = null;
+  for (let add = 0; add <= 26 && !next; add++) {
+    const cand = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours() + add, 23, 0));
+    if (cand > now && cand.getUTCHours() % 2 === 0) next = cand;
+  }
+  const lastOf = async (t) => (await db.prepare('SELECT created_at FROM events WHERE type = ? ORDER BY id DESC LIMIT 1').bind(t).first())?.created_at || null;
+  const waiting = [];
+  const rows = (await db.prepare(`SELECT * FROM clients WHERE stage IN ('intake2_done','generating')`).all()).results || [];
+  for (const cl of rows) {
+    let b = {}; try { b = JSON.parse(cl.billing || '{}'); } catch {}
+    const readyAt = Date.parse(String(cl.updated_at || '').replace(' ', 'T') + 'Z') || Date.now();
+    const waitingMins = Math.max(0, Math.round((Date.now() - readyAt) / 60000));
+    waiting.push({ id: cl.id, biz: cl.business_name || cl.name || cl.email, stage: cl.stage,
+      paid: depositPaid(b), waitingMins, overdue: cl.stage === 'intake2_done' && depositPaid(b) && waitingMins > 90 });
+  }
+  return c.json({
+    nextRunAt: next ? next.toISOString() : null,
+    minutesUntil: next ? Math.round((next - now) / 60000) : null,
+    lastBuildStartedAt: await lastOf('build_started'),
+    lastPublishedAt: await lastOf('auto_published'),
+    waiting,
+  });
+});
+
 app.post('/api/clients/:id/revision', async (c) => {
   const id = Number(c.req.param('id'));
   const { request } = await c.req.json();
