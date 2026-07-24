@@ -553,7 +553,15 @@ function openDrawer(id) {
       ${intakeBlock('Intake 1 — Client details', c.intake1_data)}
       ${intakeBlock('Intake 2 — Website vision', c.intake2_data)}
       <div>
-        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Share links</label>
+        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">👁 View as the client (admin access)</label>
+        <div class="actions">
+          <button class="btn btn-primary" onclick="openLink(${c.id}, 'portal', this)">👁 Open their portal</button>
+          <button class="btn btn-ghost" onclick="openLink(${c.id}, 'pitch', this)">Open pitch page</button>
+          <button class="btn btn-ghost" onclick="openLink(${c.id}, 'agreement', this)">Open agreement</button>
+          <button class="btn btn-ghost" onclick="openLink(${c.id}, 'gbp', this)">Open GBP walkthrough</button>
+        </div>
+        <p style="font-size:11px;color:#94a3b8;margin-top:6px;">Opens exactly what the client sees — same links, same live data. Great before a call.</p>
+        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin:14px 0 6px;">Share links</label>
         <div class="actions">
           <button class="btn btn-green" onclick="sendPortalInvite(${c.id}, this)">📧 Email portal login to client</button>
           <button class="btn btn-ghost" onclick="copyLink(${c.id}, 'portal', this)">🔗 Copy portal link</button>
@@ -751,6 +759,13 @@ async function sendPortalInvite(id, btn) {
   if (r.error) return toast('⚠ ' + r.error);
   toast('Portal login emailed 🔑');
   refresh();
+}
+async function openLink(id, kind, btn) {
+  btn.disabled = true;
+  const r = await api(`/api/clients/${id}/links`);
+  btn.disabled = false;
+  if (!r[kind]) return toast('⚠ could not build link');
+  window.open(r[kind], '_blank');
 }
 async function copyLink(id, kind, btn) {
   btn.disabled = true;
