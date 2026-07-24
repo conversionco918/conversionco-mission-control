@@ -1222,7 +1222,15 @@ app.patch('/api/clients/:id', async (c) => {
   }
   if (!Object.keys(allowed).length) return c.json({ error: 'nothing to update' }, 400);
   await touchClient(c.env.DB, id, allowed);
-  if (allowed.stage) await logEvent(c.env.DB, id, 'stage_changed', `Moved to ${allowed.stage}`);
+  if (allowed.stage) {
+    await logEvent(c.env.DB, id, 'stage_changed', `Moved to ${allowed.stage}`);
+    // keep the progress bar honest when the stage is set by hand
+    if (allowed.stage === 'generating') {
+      await setSetting(c.env.DB, `buildprog_${id}`, JSON.stringify({ started_at: new Date().toISOString(), pct: 5, step: 'Waiting for the builder' }));
+    } else {
+      await setSetting(c.env.DB, `buildprog_${id}`, '');
+    }
+  }
   return c.json({ ok: true });
 });
 
@@ -2068,6 +2076,23 @@ async function dailyUptime(env) {
   return results;
 }
 
+// Build watchdog (runs every 5 min): a card stuck in "Building" with no progress
+// for 60+ minutes gets re-queued automatically and flagged in the activity feed —
+// a stalled build can never sit silently again.
+async function buildWatchdog(env, settings) {
+  const db = env.DB;
+  const gen = (await db.prepare(`SELECT * FROM clients WHERE stage = 'generating'`).all()).results || [];
+  for (const cl of gen) {
+    let prog = {}; try { prog = JSON.parse(settings[`buildprog_${cl.id}`] || '{}'); } catch {}
+    const lastBeat = Date.parse(prog.updated_at || prog.started_at || cl.updated_at || 0);
+    if (!lastBeat || Date.now() - lastBeat < 60 * 60000) continue;
+    const mins = Math.round((Date.now() - lastBeat) / 60000);
+    await touchClient(db, cl.id, { stage: cl.intake2_data ? 'intake2_done' : 'intake2_sent' });
+    await setSetting(db, `buildprog_${cl.id}`, '');
+    await logEvent(db, cl.id, 'build_stalled', `⚠️ Build showed no progress for ${mins} min — automatically re-queued for the next builder run (${cl.business_name || cl.name || cl.email})`);
+  }
+}
+
 // Monday owner's digest: the week in one email, straight to Tiffany
 async function weeklyOwnerDigest(env) {
   const db = env.DB;
@@ -2136,6 +2161,9 @@ export default {
     ));
     ctx.waitUntil(pollBilling(env).catch((e) =>
       logEvent(env.DB, null, 'error', `Billing poll failed: ${e.message}`)
+    ));
+    ctx.waitUntil(buildWatchdog(env, settings).catch((e) =>
+      logEvent(env.DB, null, 'error', `Build watchdog failed: ${e.message}`)
     ));
   },
 };
