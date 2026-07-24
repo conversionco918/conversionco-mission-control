@@ -79,6 +79,22 @@ export async function gscVerifyViaCloudflareDns(env, domain) {
   return true;
 }
 
+// ---- manual-DNS path (domains NOT on Cloudflare, e.g. Squarespace DNS) ----
+export async function gscGetDnsToken(env, domain) {
+  const tok = await gReq(env, 'POST', 'https://www.googleapis.com/siteVerification/v1/token', {
+    site: { type: 'INET_DOMAIN', identifier: domain },
+    verificationMethod: 'DNS_TXT',
+  });
+  return tok.token; // value for a TXT record at the domain root
+}
+
+export async function gscRequestVerify(env, domain) {
+  await gReq(env, 'POST', 'https://www.googleapis.com/siteVerification/v1/webResource?verificationMethod=DNS_TXT', {
+    site: { type: 'INET_DOMAIN', identifier: domain },
+  });
+  return true;
+}
+
 // ---- sitemap submission: one API call replaces a manual Search Console chore ----
 export async function gscSubmitSitemap(env, domain) {
   const siteUrl = encodeURIComponent(`sc-domain:${domain}`);

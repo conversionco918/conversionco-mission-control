@@ -9,7 +9,7 @@ import { PRICES, ensureCustomer, sendInvoice, invoiceStatus, hostingCheckout, ch
 function depositPaid(b) { return b.dep_status === 'paid' || b.invoice_status === 'paid'; }
 function finalPaid(b) { return b.fin_status === 'paid' || b.invoice_status === 'paid'; }
 import { computeScore } from './score.js';
-import { gscConfigured, gscAddProperty, gscVerifyViaCloudflareDns, gscQueryStats, gscSubmitSitemap } from './google.js';
+import { gscConfigured, gscAddProperty, gscVerifyViaCloudflareDns, gscQueryStats, gscSubmitSitemap, gscGetDnsToken, gscRequestVerify } from './google.js';
 import dashboardHtml from './ui.html';
 import form1Html from './form1.html';
 import form2Html from './form2.html';
@@ -752,6 +752,31 @@ app.get('/api/gsc-test/:key', async (c) => {
     const props = await gscListProperties(c.env);
     return c.json({ ok: true, configured: true, properties: props });
   } catch (e) { return c.json({ ok: false, configured: true, error: String(e.message).slice(0, 300) }); }
+});
+
+// Keyed: enroll ANY domain in Search Console on demand (testing + Tiffany's own site).
+// Tries Cloudflare auto-verify first; for domains with DNS elsewhere (e.g. Squarespace)
+// it returns the TXT record to add manually, and re-calling after DNS propagates
+// completes verification. Always finishes with a stats pull attempt.
+app.get('/api/gsc-enroll/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  if (!gscConfigured(c.env)) return c.json({ ok: false, configured: false });
+  const domain = (c.req.query('domain') || '').trim().toLowerCase().replace(/^www\./, '');
+  if (!domain || !domain.includes('.')) return c.json({ ok: false, error: 'pass ?domain=example.com' });
+  const out = { ok: true, domain };
+  try { await gscAddProperty(c.env, domain); out.property = 'added'; }
+  catch (e) { out.property = `error: ${String(e.message).slice(0, 160)}`; }
+  try { await gscVerifyViaCloudflareDns(c.env, domain); out.verified = 'auto (Cloudflare DNS)'; }
+  catch {
+    // not a Cloudflare zone — manual DNS path
+    try {
+      out.txt_record = { host: '@', type: 'TXT', value: await gscGetDnsToken(c.env, domain) };
+      try { await gscRequestVerify(c.env, domain); out.verified = true; }
+      catch (e2) { out.verified = false; out.note = `Add the TXT record at the DNS host, wait a few minutes, then call this again. Google said: ${String(e2.message).slice(0, 160)}`; }
+    } catch (e3) { out.verified = false; out.error = String(e3.message).slice(0, 200); }
+  }
+  try { out.stats = await gscQueryStats(c.env, domain, 28); } catch (e) { out.stats_error = String(e.message).slice(0, 160); }
+  return c.json(out);
 });
 
 // Keyed: run the Sunday Search Console pull on demand (first-run / catch-up)
@@ -2657,6 +2682,17 @@ async function gscPullAll(env, settings) {
     }
     await setSetting(db, stKey, JSON.stringify(st));
   }
+  // Tiffany's own site: same weekly snapshot (gsc_data_self) for the owner digest.
+  // Silently skips until conversionco918.com is verified in her console.
+  try {
+    const stats = await gscQueryStats(env, 'conversionco918.com', 28);
+    let prev = null; try { prev = JSON.parse(settings['gsc_data_self'] || 'null'); } catch {}
+    const prevPos = {}; for (const r of (prev && prev.queries) || []) prevPos[r.q] = r.pos;
+    await setSetting(db, 'gsc_data_self', JSON.stringify({
+      domain: 'conversionco918.com', checked_at: new Date().toISOString(), window: stats.window,
+      queries: stats.rows.map((r) => ({ ...r, prev: prevPos[r.q] ?? null })), totals: stats.totals,
+    }));
+  } catch { /* not verified yet — fine */ }
 }
 
 export default {
