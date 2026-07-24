@@ -1580,6 +1580,15 @@ app.patch('/api/clients/:id', async (c) => {
 <p>— The ConversionCo Team</p>`,
         'launch_emailed', '🚀 Launch-day email sent');
     }
+    // 📡 INSTANT Search Console enrollment — Google gets the map the moment a site
+    // goes live (property + verification + sitemap). Sunday's pull is the safety net.
+    try {
+      const afterCl = await c.env.DB.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+      const settingsG = await getSettings(c.env.DB);
+      c.executionCtx.waitUntil(gscEnsureClient(c.env, settingsG, afterCl).then((r) => {
+        if (r) return logEvent(c.env.DB, id, 'gsc_enroll_kickoff', `📡 Search Console enrollment ran at go-live for ${r.domain}${r.st.verified ? ' — verified ✓' : ' — verification pending (auto-retries every Sunday)'}`);
+      }).catch(() => {}));
+    } catch { /* Sunday safety net covers it */ }
   }
   if (allowed.stage) {
     await logEvent(c.env.DB, id, 'stage_changed', `Moved to ${allowed.stage}`);
@@ -2629,53 +2638,73 @@ ${needsHtml}
   } catch (e) { await logEvent(db, null, 'error', `Owner digest failed: ${e.message}`); }
 }
 
-// Google Search Console autopilot (Sundays inside the noon cron). Dormant until
-// the GOOGLE_* secrets exist — Tiffany's one-time errand. After that, ZERO
-// per-client setup: one ConversionCo Google account owns ONE console, and every
-// client's live domain becomes its own property inside it automatically:
-//   1. property created (sc-domain:) the first Sunday the client has a live domain
-//   2. auto-verified via a DNS TXT record when the domain is a Cloudflare zone
-//      (flagged once in the feed if it isn't, for a one-time manual verify)
-//   3. sitemap submitted + the gsc/sitemap launch-checklist boxes tick themselves
-//   4. exact positions / impressions / clicks pulled weekly with week-over-week
-//      deltas → settings gsc_data_<id> → portal card + report engines
+// Ensure ONE client's Search Console enrollment: property created, ownership
+// verified (already-verified detection → Cloudflare DNS auto-verify → manual flag),
+// sitemap submitted, launch-checklist gsc/sitemap boxes ticked. Called the MOMENT
+// a site goes live (PATCH hook) AND every Sunday (gscPullAll) as the safety net,
+// so enrollment is guaranteed for every client, always. Returns {domain, st} or null.
+async function gscEnsureClient(env, settings, cl) {
+  if (!gscConfigured(env)) return null;
+  const db = env.DB;
+  let domain = '';
+  try { domain = new URL(cl.live_url).hostname.replace(/^www\./, ''); } catch {}
+  if (!domain || domain.endsWith('workers.dev') || domain.endsWith('conversionco918.com')) return null;
+  const stKey = `gsc_${cl.id}`;
+  let st = {}; try { st = JSON.parse(settings[stKey] || '{}'); } catch {}
+  try {
+    if (st.property !== domain) { await gscAddProperty(env, domain); st.property = domain; st.verified = ''; st.checklist_ticked = false; }
+    if (!st.verified) {
+      // a domain may already be verified outside the auto path (manual TXT / gsc-enroll)
+      try {
+        const props = await gscListProperties(env);
+        const mine = props.find((p) => p.site === `sc-domain:${domain}` && p.permission && p.permission !== 'siteUnverifiedUser');
+        if (mine) st.verified = 'manual';
+      } catch { /* fall through to auto-verify */ }
+    }
+    if (!st.verified) {
+      try { st.verify_attempts = (st.verify_attempts || 0) + 1; await gscVerifyViaCloudflareDns(env, domain); st.verified = new Date().toISOString(); }
+      catch (e) {
+        if (st.verify_attempts >= 3 && !st.manual_flagged) {
+          st.manual_flagged = true;
+          await logEvent(db, cl.id, 'gsc_manual_needed', `⚠️ Search Console can't auto-verify ${domain} (${String(e.message).slice(0, 100)}) — verify this one domain by hand in Search Console (DNS TXT), then everything runs itself forever.`);
+        }
+      }
+    }
+    if (st.verified && !st.checklist_ticked) {
+      let lc = {}; try { lc = JSON.parse(cl.launch_checklist || '{}'); } catch {}
+      try { await gscSubmitSitemap(env, domain); lc.sitemap = true; } catch { /* retried next Sunday via checklist_ticked staying false */ }
+      lc.gsc = true;
+      await touchClient(db, cl.id, { launch_checklist: JSON.stringify(lc) });
+      if (lc.sitemap) st.checklist_ticked = true;
+      await logEvent(db, cl.id, 'gsc_verified', `✅ Search Console live for ${domain} — property verified${lc.sitemap ? ' and sitemap submitted' : ''} automatically`);
+    }
+    st.last_error = '';
+  } catch (e) {
+    st.last_error = String(e.message).slice(0, 160);
+    if (st.err_logged !== st.last_error) {
+      st.err_logged = st.last_error;
+      await logEvent(db, cl.id, 'gsc_error', `Search Console enrollment issue for ${domain}: ${st.last_error} (auto-retries every Sunday)`);
+    }
+  }
+  await setSetting(db, stKey, JSON.stringify(st));
+  return { domain, st };
+}
+
+// Google Search Console autopilot (Sundays inside the noon cron): re-ensures every
+// live client's enrollment (safety net for the instant go-live hook) and pulls the
+// weekly exact-numbers snapshot with week-over-week deltas → settings gsc_data_<id>
+// → portal card + report engines.
 async function gscPullAll(env, settings) {
   if (!gscConfigured(env)) return;
   const db = env.DB;
   const clients = (await db.prepare(`SELECT * FROM clients WHERE live_url != '' AND stage != 'archived'`).all()).results || [];
   for (const cl of clients) {
-    let domain = '';
-    try { domain = new URL(cl.live_url).hostname.replace(/^www\./, ''); } catch {}
-    if (!domain || domain.endsWith('workers.dev') || domain.endsWith('conversionco918.com')) continue;
+    const ensured = await gscEnsureClient(env, settings, cl);
+    if (!ensured) continue;
+    const { domain } = ensured;
     const stKey = `gsc_${cl.id}`;
-    let st = {}; try { st = JSON.parse(settings[stKey] || '{}'); } catch {}
+    let st = ensured.st;
     try {
-      if (st.property !== domain) { await gscAddProperty(env, domain); st.property = domain; st.verified = ''; st.checklist_ticked = false; }
-      if (!st.verified) {
-        // a domain may already be verified outside the auto path (manual TXT / gsc-enroll)
-        try {
-          const props = await gscListProperties(env);
-          const mine = props.find((p) => p.site === `sc-domain:${domain}` && p.permission && p.permission !== 'siteUnverifiedUser');
-          if (mine) st.verified = 'manual';
-        } catch { /* fall through to auto-verify */ }
-      }
-      if (!st.verified) {
-        try { st.verify_attempts = (st.verify_attempts || 0) + 1; await gscVerifyViaCloudflareDns(env, domain); st.verified = new Date().toISOString(); }
-        catch (e) {
-          if (st.verify_attempts === 3 && !st.manual_flagged) {
-            st.manual_flagged = true;
-            await logEvent(db, cl.id, 'gsc_manual_needed', `⚠️ Search Console can't auto-verify ${domain} (${String(e.message).slice(0, 100)}) — verify this one domain by hand in Search Console (DNS TXT), then everything runs itself forever.`);
-          }
-        }
-      }
-      if (st.verified && !st.checklist_ticked) {
-        let lc = {}; try { lc = JSON.parse(cl.launch_checklist || '{}'); } catch {}
-        try { await gscSubmitSitemap(env, domain); lc.sitemap = true; } catch { /* retried next Sunday via checklist_ticked staying false */ }
-        lc.gsc = true;
-        await touchClient(db, cl.id, { launch_checklist: JSON.stringify(lc) });
-        if (lc.sitemap) st.checklist_ticked = true;
-        await logEvent(db, cl.id, 'gsc_verified', `✅ Search Console live for ${domain} — property verified${lc.sitemap ? ' and sitemap submitted' : ''} automatically`);
-      }
       // pull the numbers (Google only returns rows once the property is verified)
       const stats = await gscQueryStats(env, domain, 28);
       let prev = null; try { prev = JSON.parse(settings[`gsc_data_${cl.id}`] || 'null'); } catch {}
