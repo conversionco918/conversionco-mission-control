@@ -727,6 +727,29 @@ app.get('/api/grabimg/:key', async (c) => {
 });
 
 
+// Keyed text-file reader from the sites repo (GET, WebFetch-able) — lets the
+// builder read catalog.json / site-metas when its sandbox can't reach GitHub.
+app.get('/api/readfile/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  if (!c.env.GITHUB_TOKEN) return c.json({ ok: false, error: 'GITHUB_TOKEN secret not set' });
+  const path = String(c.req.query('path') || '');
+  if (!path) return c.json({ ok: false, error: 'path required' }, 400);
+  const settings = await getSettings(c.env.DB);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  const ghHeaders = { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+  const r = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, { headers: ghHeaders });
+  if (!r.ok) return c.json({ ok: false, error: `not found: ${path}` }, 404);
+  const j = await r.json();
+  if (Array.isArray(j)) return c.json({ ok: true, dir: j.map((f) => ({ name: f.name, type: f.type, size: f.size })) });
+  let content = String(j.content || '');
+  if (!content && j.sha) { // >1MB → blob API
+    const b = await fetch(`https://api.github.com/repos/${repo}/git/blobs/${j.sha}`, { headers: ghHeaders });
+    if (b.ok) content = String((await b.json()).content || '');
+  }
+  const text = new TextDecoder().decode(Uint8Array.from(atob(content.replace(/\n/g, '')), (ch) => ch.charCodeAt(0)));
+  return c.text(text.slice(0, 200000));
+});
+
 // Keyed server-side file copy WITHIN the sites repo (GET so it's WebFetch-able).
 // Built for the builder: copy library images into a client's img/ folder without
 // the bytes ever leaving GitHub. Handles >1MB files via the git blob API.
