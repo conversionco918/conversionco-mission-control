@@ -317,12 +317,16 @@ app.get('/debug/:key', async (c) => {
       return out;
     })(),
     tiers: await (async () => {
-      const rows = (await c.env.DB.prepare('SELECT id, email, business_name, tier, stage, billing FROM clients').all()).results || [];
-      return rows.map((r) => {
+      const rows = (await c.env.DB.prepare('SELECT id, email, business_name, tier, stage, billing, competitors, live_url FROM clients').all()).results || [];
+      const out = [];
+      for (const r of rows) {
         let b = {}; try { b = JSON.parse(r.billing || '{}'); } catch {}
-        return { id: r.id, email: r.email, business_name: r.business_name, tier: r.tier, stage: r.stage,
-          paid: depositPaid(b), paidInFull: finalPaid(b), hosting: b.sub_status === 'active' };
-      });
+        out.push({ id: r.id, email: r.email, business_name: r.business_name, tier: r.tier, stage: r.stage,
+          paid: depositPaid(b), paidInFull: finalPaid(b), hosting: b.sub_status === 'active',
+          competitors: r.competitors || '', live_url: r.live_url || '',
+          gbp_url: `${BASE_URL}/gbp/${r.id}/${await portalToken(c.env, 'gbp', r.id)}` });
+      }
+      return out;
     })(),
     revisionQueue: await (async () => {
       const rows = (await c.env.DB.prepare(`SELECT r.*, cl.business_name, cl.tier, cl.email FROM revisions r JOIN clients cl ON cl.id = r.client_id WHERE r.status = 'pending' ORDER BY r.id`).all()).results || [];
@@ -634,6 +638,64 @@ app.get('/api/build-progress/:key', async (c) => {
   return c.json({ ok: true, ...prog });
 });
 
+// Shared: send a personal-style email to a client (moments engine)
+async function emailClient(env, db, client, settings, subject, html, eventType, eventDetail) {
+  if (!client?.email || !env.GHL_TOKEN || !settings.ghl_location_id) return false;
+  try {
+    const ghl = new GHL(env.GHL_TOKEN, settings.ghl_location_id);
+    const contact = await ghl.upsertContact({ email: client.email, name: client.name || '' });
+    await ghl.sendEmail({ contactId: contact.id || contact.contactId, subject, html, emailFrom: settings.email_from || undefined });
+    if (eventType) await logEvent(db, client.id, eventType, eventDetail || subject);
+    return true;
+  } catch { return false; }
+}
+
+// Keyed: 🎉 Page 1 celebration — the engines call this the moment a keyword newly lands on Page 1
+app.get('/api/celebrate/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const id = Number(c.req.query('id'));
+  const kw = String(c.req.query('kw') || '').slice(0, 90);
+  const pos = Number(c.req.query('pos')) || null;
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ ok: false, error: 'client not found' });
+  const settings = await getSettings(db);
+  const first = (client.name || '').split(' ')[0] || 'there';
+  const url = `${BASE_URL}/portal/${id}/${await portalToken(c.env, 'portal', id)}`;
+  const ok = await emailClient(c.env, db, client, settings,
+    `You just hit Page 1 of Google 🎉`,
+    `<p>${first} — stop what you're doing for a second.</p>
+<p>When someone searches <b>"${kw}"</b>, your website is now on <b>Page 1 of Google${pos ? `, position #${pos}` : ''}</b>. That's not an ad — that's your site earning its spot.</p>
+<p>See it live in your portal:</p><p><a href="${url}">${url}</a></p>
+<p>Congratulations — this is what we've been building toward. More to come.</p>
+<p>— The ConversionCo Team</p>`,
+    'page1_celebrated', `🎉 Page 1 email sent: "${kw}"${pos ? ' #' + pos : ''}`);
+  return c.json({ ok });
+});
+
+// Keyed: 📬 report-ready email — engines call after committing a report, with one highlight
+app.get('/api/report-ready/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const id = Number(c.req.query('id'));
+  const highlight = String(c.req.query('highlight') || '').slice(0, 160);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ ok: false, error: 'client not found' });
+  const settings = await getSettings(db);
+  const first = (client.name || '').split(' ')[0] || 'there';
+  const url = `${BASE_URL}/portal/${id}/${await portalToken(c.env, 'portal', id)}`;
+  const ok = await emailClient(c.env, db, client, settings,
+    `Your new report is in — one highlight inside`,
+    `<p>Hi ${first},</p>
+<p>Your latest report just landed in your portal. The highlight:</p>
+<p style="font-size:17px;"><b>${highlight || 'Everything ran clean this period — details inside.'}</b></p>
+<p>The full picture — your Google standing, your website's health, and everything we did for you — is one tap away:</p>
+<p><a href="${url}">${url}</a></p>
+<p>Questions? Just reply.</p><p>— The ConversionCo Team</p>`,
+    'report_notified', `📬 Report-ready email sent${highlight ? ': ' + highlight.slice(0, 80) : ''}`);
+  return c.json({ ok });
+});
+
 // Keyed: resend the agreement invite (same email the card button sends)
 app.get('/api/send-agreement/:key', async (c) => {
   if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
@@ -850,8 +912,9 @@ app.get('/portal/:id/:token', async (c) => {
   const FRIENDLY = { auto_published: '🚀 Website updated & republished', revision_done: '✅ A requested change was completed',
     theme_changed: '🎨 Fresh look applied to your site', logo_uploaded: '🖼 Your logo was added', photo_uploaded: '📷 New photo added to your site',
     lead_received: '🔥 New lead captured from your website', preview_ready: '👀 A new version was published', hosting_active: '🛡 Hosting & security activated',
-    build_started: '⚙️ Your website build is underway', invoice_paid: '💳 Payment received — thank you!' };
-  const evRows = (await db.prepare(`SELECT type, created_at FROM events WHERE client_id = ? AND type IN ('auto_published','revision_done','theme_changed','logo_uploaded','photo_uploaded','lead_received','preview_ready','hosting_active','build_started','invoice_paid') ORDER BY id DESC LIMIT 8`).bind(id).all()).results || [];
+    build_started: '⚙️ Your website build is underway', invoice_paid: '💳 Payment received — thank you!',
+    launched: '🚀 Your website went LIVE', page1_celebrated: '🎉 You hit Page 1 of Google', first_lead_celebrated: '🎉 Your first lead arrived' };
+  const evRows = (await db.prepare(`SELECT type, created_at FROM events WHERE client_id = ? AND type IN ('auto_published','revision_done','theme_changed','logo_uploaded','photo_uploaded','lead_received','preview_ready','hosting_active','build_started','invoice_paid','launched','page1_celebrated','first_lead_celebrated') ORDER BY id DESC LIMIT 8`).bind(id).all()).results || [];
   // reports list + rank spot-check from GitHub (best effort)
   let reports = [], ranks = null;
   if (slug && c.env.GITHUB_TOKEN) {
@@ -944,7 +1007,8 @@ app.get('/portal/:id/:token', async (c) => {
     </div></div>
   </div>
 
-  ${ranks && Array.isArray(ranks.keywords) && ranks.keywords.length ? `<div class="card"><h2>What page of Google you're on 🔎</h2>
+  <div class="card"><h2>What page of Google you're on 🔎</h2>
+    ${ranks && Array.isArray(ranks.keywords) && ranks.keywords.length ? `
     <p style="color:#8EA3BC;font-size:12.5px;margin-bottom:10px">We run these exact searches every week${ranks.checked_at ? ` · last checked ${String(ranks.checked_at).slice(0, 10)}` : ''}. Positions can vary a little by searcher location — the trend is what matters.</p>
     <div style="display:flex;flex-direction:column;gap:10px">
     ${ranks.keywords.map((k) => {
@@ -954,7 +1018,22 @@ app.get('/portal/:id/:token', async (c) => {
       <div style="font-size:15px;margin-top:2px;"><b style="color:#C9A254">You: ${k.you ? '📍 ' + spot(k.you) : (k.pending ? 'your spot is waiting — tracking starts at launch' : 'not on Page 1 yet — that\\'s the target')}</b></div>
       ${k.competitors ? `<div style="font-size:13px;color:#8EA3BC;margin-top:2px;">${Object.entries(k.competitors).map(([n, p]) => `${String(n).replace(/[<>&]/g, '')}: ${spot(p)}`).join(' · ')}</div>` : ''}
     </div>`; }).join('')}
-    </div></div>` : ''}
+    </div>`
+    : (client.live_url
+      ? `<p style="color:#8EA3BC;font-size:13.5px">Your first Google position check runs this week — from then on, this card shows exactly what page of Google you're on for your key searches, updated weekly.</p>`
+      : `<p style="color:#8EA3BC;font-size:13.5px">Your site is pre-launch. The day your domain goes live, we start checking <b style="color:#C9A254">what page of Google you're on</b> — every week, right here, next to your local competitors. Page 1 is the goal.</p>`)}
+  </div>
+
+  ${(() => { let hist = []; try { hist = JSON.parse(settings[`scorehist_${id}`] || '[]'); } catch {} if (hist.length < 2) return '';
+    const w = 560, h = 90, min = Math.min(...hist.map(p => p.s)) - 4, max = Math.max(...hist.map(p => p.s)) + 4;
+    const pts = hist.map((p, i) => `${(i / (hist.length - 1) * w).toFixed(1)},${(h - (p.s - min) / Math.max(1, max - min) * h).toFixed(1)}`).join(' ');
+    const last = hist[hist.length - 1].s, firstS = hist[0].s;
+    return `<div class="card"><h2>Your climb 📈</h2>
+      <p style="color:#8EA3BC;font-size:12.5px;margin-bottom:10px">Your website score over time — started at ${firstS}, now ${last}.</p>
+      <svg viewBox="0 0 ${w} ${h + 10}" style="width:100%;height:auto" role="img" aria-label="Score trend from ${firstS} to ${last}">
+        <polyline points="${pts}" fill="none" stroke="#C9A254" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="${w}" cy="${(h - (last - min) / Math.max(1, max - min) * h).toFixed(1)}" r="5" fill="#C9A254"/>
+      </svg></div>`; })()}
 
   ${reports.length ? `<div class="card"><h2>Your performance reports</h2><div class="replist" style="display:flex;flex-direction:column;gap:8px">
     ${reports.map((r) => `<a href="/portal/${id}/${tok}/report/${r}" target="_blank">📊 ${r.replace('.html', '')}</a>`).join('')}
@@ -1087,6 +1166,46 @@ app.get('/pitch/:id/:token', async (c) => {
 </body></html>`);
 });
 
+// GBP concierge: a beautiful tokenized walkthrough so saying yes to the Google
+// Business Profile is effortless (the biggest unlock in the score).
+app.get('/gbp/:id/:token', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'gbp', id)) return c.text('not found', 404);
+  const client = await c.env.DB.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.text('not found', 404);
+  const biz = client.business_name || client.name || 'Your Business';
+  let city = '';
+  try { const i1 = JSON.parse(client.intake1_data || '{}'); city = i1['Primary City & State'] || ''; } catch {}
+  const steps = [
+    ['Go to Google', `On your phone, open <b>google.com/business</b> and sign in with the Google account you use for ${biz}.`],
+    ['Add your business', `Tap <b>Add your business</b> and type it exactly like this: <b>${biz}</b>${city ? ` — ${city}` : ''}. Consistent spelling matters to Google.`],
+    ['Pick your category', `Choose <b>“IV therapy service”</b> (or the closest match). You can add more categories later — we'll tell you which.`],
+    ['Location & hours', `If clients come to you, enter your address. If you travel to them, choose “I deliver goods and services” and set your service area${city ? ` around ${city}` : ''}. Add your real hours.`],
+    ['Phone & website', `Use the same phone number that's on your website, and your website address — matching details are a ranking signal.`],
+    ['Verify', `Google will offer a verification method (video, phone, or postcard). Do it right away — nothing counts until you're verified.`],
+  ];
+  return c.html(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex"><title>Google setup — ${biz}</title>
+<style>body{font-family:-apple-system,'Segoe UI',sans-serif;background:#FBFAF7;color:#16202B;margin:0;padding:0 0 60px;line-height:1.65}
+.wrap{max-width:640px;margin:0 auto;padding:0 20px}.hero{background:#0B1D33;color:#fff;padding:44px 0 36px}
+.hero .wrap p{opacity:.8}.hero h1{font-size:clamp(24px,6vw,32px);margin:8px 0 6px}
+.eyebrow{font-size:11px;letter-spacing:.22em;text-transform:uppercase;color:#C9A254;font-weight:600}
+.step{background:#fff;border:1px solid #E7E3DA;border-radius:14px;padding:20px 22px;margin-top:14px;display:flex;gap:16px}
+.n{width:34px;height:34px;border-radius:50%;background:#0B1D33;color:#C9A254;display:flex;align-items:center;justify-content:center;font-weight:600;flex:0 0 34px}
+.step h3{margin:2px 0 6px;font-size:16px}.step p{margin:0;font-size:14.5px;color:#5B6B7B}
+.done{background:#fff;border:1px solid #C9A254;border-radius:14px;padding:22px;margin-top:26px;text-align:center}
+.done b{font-size:16px}.done p{color:#5B6B7B;font-size:14px;margin:8px 0 0}
+.foot{text-align:center;color:#8A99A8;font-size:12px;margin-top:30px}</style></head><body>
+<div class="hero"><div class="wrap"><span class="eyebrow">15 minutes · we're with you</span>
+<h1>Put ${biz} on Google Maps</h1>
+<p>This is the single biggest step for showing up when locals search. Six steps — do them in order, and reply to any of our emails if you get stuck on one.</p></div></div>
+<div class="wrap">
+${steps.map((s, i) => `<div class="step"><div class="n">${i + 1}</div><div><h3>${s[0]}</h3><p>${s[1]}</p></div></div>`).join('')}
+<div class="done"><b>Done? Tell us. 🎉</b><p>Reply to any ConversionCo email with the word <b>“verified”</b> — we take it from there: photos, services, your review link, and wiring it to your website. Your score jumps the moment it's live.</p></div>
+<div class="foot">Prepared for ${biz} by ConversionCo · conversionco918.com</div>
+</div></body></html>`);
+});
+
 // Lead capture from client sites (public, CORS)
 app.options('/lead/:slug', (c) => { corsHeaders(c); return c.body(null, 204); });
 app.post('/lead/:slug', async (c) => {
@@ -1107,6 +1226,23 @@ app.post('/lead/:slug', async (c) => {
   await db.prepare(`INSERT INTO leads (client_id, slug, name, email, phone, message, source) VALUES (?, ?, ?, ?, ?, ?, ?)`)
     .bind(clientId, slug, String(f.name || '').slice(0, 120), String(f.email || '').slice(0, 160), String(f.phone || '').slice(0, 40), String(f.message || '').slice(0, 1500), source).run();
   await logEvent(db, clientId, 'lead_received', `🔥 New lead on ${slug} (via ${source}): ${f.name || 'no name'} ${f.phone || f.email || ''}`);
+  // 🎉 FIRST-LEAD CELEBRATION: the moment their website earns its first potential customer
+  if (clientId) {
+    const n = (await db.prepare('SELECT COUNT(*) AS n FROM leads WHERE client_id = ?').bind(clientId).first())?.n || 0;
+    if (n === 1) {
+      const clientRow = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(clientId).first();
+      const settingsC = await getSettings(db);
+      const firstC = (clientRow?.name || '').split(' ')[0] || 'there';
+      const purl = `${BASE_URL}/portal/${clientId}/${await portalToken(c.env, 'portal', clientId)}`;
+      c.executionCtx.waitUntil(emailClient(c.env, db, clientRow, settingsC,
+        `It happened — your first lead 🎉`,
+        `<p>${firstC} — it happened.</p>
+<p>Your website just brought you its <b>first potential customer</b>. A real person found you, liked what they saw, and reached out — all on their own.</p>
+<p>Their details are in your portal (and in the email we just sent you):</p><p><a href="${purl}">${purl}</a></p>
+<p>The first one is the hardest. From here, it compounds.</p><p>— The ConversionCo Team</p>`,
+        'first_lead_celebrated', '🎉 First-lead celebration email sent'));
+    }
+  }
   const settings = await getSettings(db);
   if (settings.notify_email && c.env.GHL_TOKEN && settings.ghl_location_id) {
     try {
@@ -1343,7 +1479,30 @@ app.patch('/api/clients/:id', async (c) => {
     if (k in body) allowed[k] = body[k];
   }
   if (!Object.keys(allowed).length) return c.json({ error: 'nothing to update' }, 400);
+  // 🚀 LAUNCH DAY: first time the site goes live (stage=live or live_url set), make it an event
+  const before = await c.env.DB.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  const goingLive = before && ((allowed.stage === 'live' && before.stage !== 'live') || (allowed.live_url && !before.live_url));
   await touchClient(c.env.DB, id, allowed);
+  if (goingLive) {
+    let bL = {}; try { bL = JSON.parse(before.billing || '{}'); } catch {}
+    if (!bL.launched_at) {
+      bL.launched_at = new Date().toISOString();
+      await touchClient(c.env.DB, id, { billing: JSON.stringify(bL) });
+      const settingsL = await getSettings(c.env.DB);
+      const firstL = (before.name || '').split(' ')[0] || 'there';
+      const site = allowed.live_url || before.live_url || '';
+      const purlL = `${BASE_URL}/portal/${id}/${await portalToken(c.env, 'portal', id)}`;
+      await logEvent(c.env.DB, id, 'launched', `🚀 LAUNCH DAY — ${before.business_name || before.name || before.email} is live${site ? ' at ' + site : ''}`);
+      await emailClient(c.env, c.env.DB, before, settingsL,
+        `You're live. 🚀`,
+        `<p>${firstL} — today's the day.</p>
+<p><b>${before.business_name || 'Your business'} is officially live on the internet${site ? ` at ${site}` : ''}.</b> Google has been told where to find you, your daily protection checks are running, and starting this week we track <b>what page of Google you're on</b> — you'll see it in your portal and in every report.</p>
+<p>Here's your window into all of it:</p><p><a href="${purlL}">${purlL}</a></p>
+<p>Thirty days from now, we'll show you a before-and-after. Welcome to the climb.</p>
+<p>— The ConversionCo Team</p>`,
+        'launch_emailed', '🚀 Launch-day email sent');
+    }
+  }
   if (allowed.stage) {
     await logEvent(c.env.DB, id, 'stage_changed', `Moved to ${allowed.stage}`);
     // keep the progress bar honest when the stage is set by hand
@@ -1699,6 +1858,7 @@ app.get('/api/clients/:id/links', async (c) => {
     portal: `${BASE_URL}/portal/${id}/${await portalToken(c.env, 'portal', id)}`,
     pitch: `${BASE_URL}/pitch/${id}/${await portalToken(c.env, 'pitch', id)}`,
     agreement: `${BASE_URL}/agreement/${id}/${await portalToken(c.env, 'agr', id)}`,
+    gbp: `${BASE_URL}/gbp/${id}/${await portalToken(c.env, 'gbp', id)}`,
   });
 });
 
@@ -2236,6 +2396,17 @@ async function dailyUptime(env) {
     if (!up) st.fails = (st.fails || 0) + 1;
     st.last = up ? 'up' : 'down'; st.how = how; st.at = new Date().toISOString();
     await setSetting(db, key, JSON.stringify(st));
+    // score journey: record today's score so the portal can draw the climb
+    try {
+      const sc = await computeScore(db, client, settings);
+      if (sc) {
+        let hist = []; try { hist = JSON.parse(settings[`scorehist_${client.id}`] || '[]'); } catch {}
+        const today = new Date().toISOString().slice(0, 10);
+        if (!hist.length || hist[hist.length - 1].d !== today) hist.push({ d: today, s: sc.total });
+        else hist[hist.length - 1].s = sc.total;
+        await setSetting(db, `scorehist_${client.id}`, JSON.stringify(hist.slice(-90)));
+      }
+    } catch { /* history is best-effort */ }
     results.push({ id: client.id, name: client.business_name || client.name || client.email, up, how });
     if (!up) {
       await logEvent(db, client.id, 'site_down', `⛔ SITE CHECK FAILED — ${how}`);
