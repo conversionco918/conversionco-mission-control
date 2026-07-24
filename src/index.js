@@ -2917,20 +2917,20 @@ app.post('/api/clients/:id/approve-preview', async (c) => {
 app.post('/api/fire-builder', async (c) => {
   const db = c.env.DB;
   if (!c.env.GITHUB_TOKEN) return c.json({ ok: false, error: 'GITHUB_TOKEN secret not set' });
-  const settings = await getSettings(db);
-  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
   const rows = (await db.prepare(`SELECT id, business_name, name, stage FROM clients WHERE stage IN ('intake2_done','generating')`).all()).results || [];
   const payload = { requested_at: new Date().toISOString(), by: 'dashboard fire button',
     waiting: rows.map((r) => ({ id: r.id, biz: r.business_name || r.name, stage: r.stage })) };
+  // Flag lives on the mission-control repo's fire-signal branch (NOT main — no
+  // deploys) because Claude's sandbox can watch this repo but not the sites repo.
   const ghHeaders = { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
-  const api = `https://api.github.com/repos/${repo}/contents/fire-requests/latest.json`;
-  const getRes = await fetch(api, { headers: ghHeaders });
+  const api = `https://api.github.com/repos/conversionco918/conversionco-mission-control/contents/fire-requests/latest.json`;
+  const getRes = await fetch(api + '?ref=fire-signal', { headers: ghHeaders });
   const existing = getRes.ok ? await getRes.json() : null;
   const bytes = new TextEncoder().encode(JSON.stringify(payload, null, 2));
   let bin = ''; for (let i = 0; i < bytes.length; i += 8192) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
   const putRes = await fetch(api, { method: 'PUT', headers: { ...ghHeaders, 'Content-Type': 'application/json' },
     body: JSON.stringify({ message: `🔥 FIRE BUILDER requested from dashboard (${payload.waiting.length} waiting)`,
-      content: btoa(bin), ...(existing && existing.sha ? { sha: existing.sha } : {}) }) });
+      branch: 'fire-signal', content: btoa(bin), ...(existing && existing.sha ? { sha: existing.sha } : {}) }) });
   if (!putRes.ok) { const out = await putRes.json().catch(() => ({}));
     return c.json({ ok: false, error: ('flag commit failed: ' + JSON.stringify(out)).slice(0, 200) }); }
   await logEvent(db, null, 'fire_requested', `🔥 Manual builder fire requested from the dashboard (${payload.waiting.length} client(s) waiting)`);
