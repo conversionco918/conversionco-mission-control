@@ -1006,7 +1006,7 @@ app.get('/portal/:id/:token', async (c) => {
   const ladder = (pos, prev) => {
     const w = pos ? Math.max(6, Math.round(101 - Math.min(100, pos))) : 0;
     const gh = (prev && prev !== pos) ? `<div class="ghost" style="left:${Math.max(2, Math.min(97, Math.round(101 - Math.min(100, prev))))}%"></div>` : '';
-    return `<div class="ladder"><div class="goal"></div>${pos ? `<div class="lfill" style="width:${w}%"></div>` : ''}${gh}</div><div class="lscale"><span>#100</span><span>Page 1 🏁</span></div>`;
+    return `<div class="ladder"><div class="goal"></div>${pos ? `<div class="lfill" style="width:0%" data-w="${w}"></div>` : ''}${gh}</div><div class="lscale"><span>#100</span><span>Page 1 🏁</span></div>`;
   };
   const moveTxt = (pos, prev) => (!prev || prev === pos) ? '' : (pos < prev ? ` <span class="up">▲ up from #${prev}</span>` : ` <span class="mut">was #${prev}</span>`);
   let gsc = null; try { gsc = JSON.parse(settings[`gsc_data_${id}`] || 'null'); } catch {}
@@ -1036,16 +1036,24 @@ app.get('/portal/:id/:token', async (c) => {
     preview_ready: 'Your website took its first breath', launched: 'You went live on the web', gsc_verified: 'Google began measuring you',
     page1_celebrated: 'You reached Page 1 of Google', first_lead_celebrated: 'Your first lead arrived' };
   const storyRows = (await db.prepare(`SELECT type, MIN(created_at) AS at FROM events WHERE client_id = ? AND type IN ('client_created','agreement_signed','build_started','preview_ready','launched','gsc_verified','page1_celebrated','first_lead_celebrated') GROUP BY type ORDER BY at`).bind(id).all()).results || [];
+  // fresh real win → one-time confetti (client-side localStorage gate)
+  const winRow = await db.prepare(`SELECT type, created_at FROM events WHERE client_id = ? AND type IN ('page1_celebrated','first_lead_celebrated') AND created_at > datetime('now','-14 days') ORDER BY id DESC LIMIT 1`).bind(id).first();
+  // Page One certificate — earliest genuine Page-1 event, forever
+  const certRow = await db.prepare(`SELECT detail, created_at FROM events WHERE client_id = ? AND type = 'page1_celebrated' ORDER BY id ASC LIMIT 1`).bind(id).first();
+  const certKw = certRow ? ((String(certRow.detail || '').match(/"([^"]+)"/) || [])[1] || '') : '';
+  // 30-day before/after — only when real history spans 25+ days
+  const histSpanDays = hist.length >= 2 ? Math.round((Date.parse(hist[hist.length - 1].d) - Date.parse(hist[0].d)) / 86400000) : 0;
+  let gscFirst = null; try { gscFirst = JSON.parse(settings[`gsc_first_${id}`] || 'null'); } catch {}
   const tiles = [];
   if (hasGsc) {
-    tiles.push(`<div class="tile"><div class="v">${Number(gsc.totals?.imp || 0).toLocaleString()}<small>×</small></div><div class="l">Times shown on Google</div></div>`);
-    tiles.push(`<div class="tile"><div class="v">${Number(gsc.totals?.clicks || 0).toLocaleString()}</div><div class="l">Clicks to your website</div></div>`);
+    tiles.push(`<div class="tile"><div class="v" data-cnt="${Number(gsc.totals?.imp || 0)}">${Number(gsc.totals?.imp || 0).toLocaleString()}<small>×</small></div><div class="l">Times shown on Google</div></div>`);
+    tiles.push(`<div class="tile"><div class="v" data-cnt="${Number(gsc.totals?.clicks || 0)}">${Number(gsc.totals?.clicks || 0).toLocaleString()}</div><div class="l">Clicks to your website</div></div>`);
     const best = Math.min(...gsc.queries.map((q) => q.pos).filter((p) => p > 0));
     if (isFinite(best)) tiles.push(`<div class="tile"><div class="v">#${best}</div><div class="l">Best Google spot</div></div>`);
   }
-  if (leadsN > 0) tiles.push(`<div class="tile"><div class="v">${leadsN}</div><div class="l">People who reached out</div></div>`);
-  if (score) tiles.push(`<div class="tile"><div class="v">${score.total}<small>/100</small></div><div class="l">Website score</div></div>`);
-  if (!score && up && up.total >= 3 && upPct !== null) tiles.push(`<div class="tile"><div class="v">${upPct}%</div><div class="l">Uptime, checked daily</div></div>`);
+  if (leadsN > 0) tiles.push(`<div class="tile"><div class="v" data-cnt="${leadsN}">${leadsN}</div><div class="l">People who reached out</div></div>`);
+  if (score) tiles.push(`<div class="tile"><div class="v" data-cnt="${score.total}">${score.total}<small>/100</small></div><div class="l">Website score</div></div>`);
+  if (!score && up && up.total >= 3 && upPct !== null) tiles.push(`<div class="tile"><div class="v" data-cnt="${upPct}">${upPct}%</div><div class="l">Uptime, checked daily</div></div>`);
   const FRIENDLY2 = { auto_published: 'Website updated & republished', revision_done: 'A requested change was completed',
     theme_changed: 'Fresh look applied to your site', logo_uploaded: 'Your logo was added', photo_uploaded: 'New photo added to your site',
     lead_received: 'New lead from your website', preview_ready: 'A new version was published', hosting_active: 'Hosting & security activated',
@@ -1097,7 +1105,15 @@ app.get('/portal/:id/:token', async (c) => {
   .grow{padding:14px 0;border-bottom:1px dashed var(--line)} .grow:last-of-type{border-bottom:0;padding-bottom:4px}
   .grow .kw{font-size:13px;color:var(--muted)} .grow .kw b{color:var(--ink);font-weight:500}
   .ladder{position:relative;height:16px;background:var(--line);border-radius:99px;margin:9px 0 4px}
-  .lfill{position:absolute;left:0;top:0;height:100%;border-radius:99px 5px 5px 99px;background:var(--sec,#2F7E76);min-width:8px}
+  .lfill{position:absolute;left:0;top:0;height:100%;border-radius:99px 5px 5px 99px;background:var(--sec,#2F7E76);min-width:8px;transition:width 1.1s cubic-bezier(.22,1,.36,1)}
+  @media (prefers-reduced-motion: reduce){.lfill{transition:none}}
+  .winbanner{display:none;background:var(--card);border:1.5px solid var(--brand);border-radius:16px;padding:16px 18px;margin:14px 0;text-align:center;font-family:'Cormorant Garamond',serif;font-size:20px;color:var(--ink)}
+  .sinceline{display:none;font-size:13px;color:var(--faint);margin-top:5px}
+  .framewrap{position:relative;height:300px;overflow:hidden;border-radius:12px;border:1px solid var(--line);background:#fff}
+  .framewrap iframe{width:1272px;height:577px;transform:scale(.52);transform-origin:0 0;border:0;pointer-events:none}
+  .micbtn{background:var(--paper);border:1.5px solid var(--line);border-radius:99px;width:42px;height:42px;font-size:17px;cursor:pointer;flex:0 0 42px}
+  .micbtn.rec{border-color:#B91C1C;background:#FEF2F2;animation:pulse 1.2s infinite}
+  @keyframes pulse{50%{transform:scale(1.08)}}
   .ghost{position:absolute;top:-4px;width:2px;height:24px;background:var(--faint);border-radius:2px}
   .goal{position:absolute;right:0;top:0;height:100%;width:10%;border-radius:0 99px 99px 0;background:var(--sec,#2F7E76);opacity:.14}
   .lscale{display:flex;justify-content:space-between;font-size:10.5px;color:var(--faint)}
@@ -1120,12 +1136,20 @@ app.get('/portal/:id/:token', async (c) => {
   <div class="head"><img src="/portal-logo/${id}/${tok}" onerror="this.outerHTML='<div class=mono>${escq(biz).slice(0, 1)}</div>'">
     <div><h1>${biz}</h1><div class="sub">Private client portal · prepared by your ConversionCo team${isPremium ? ' · Premium' : ''}</div></div></div>
   <p style="font-family:'Cormorant Garamond',serif;font-style:italic;font-size:17px;color:var(--muted);margin-top:14px">${escq(welcomeLine)}</p>
+  <p class="sinceline" id="sinceLine"></p>
+
+  <div class="winbanner" id="winBanner">${winRow ? (winRow.type === 'page1_celebrated' ? '🎉 You are on Page 1 of Google. Take a moment — this is what the work was for.' : '🎉 Your first lead came in through your website. The machine is working.') : ''}</div>
 
   ${client.stage === 'live'
     ? `<div class="livebar"><span class="livepill"><i></i>Live on the web</span>${siteUrl ? `<a class="btn" href="${siteUrl}" target="_blank">View your website →</a>` : ''}</div>`
     : `<div class="card"><span class="eyebrow">Your Project</span><h2>Where things stand</h2><div class="steps">
     ${PORTAL_STAGES.map(([k, label], i) => `<div class="step ${i < doneIdx ? 'done' : i === doneIdx ? 'now' : 'pend'}"><span class="dot">${i < doneIdx ? '✓' : i === doneIdx ? '●' : i + 1}</span>${label}</div>`).join('')}
   </div>${siteUrl ? `<a class="btn" href="${siteUrl}" target="_blank" style="margin-top:16px">View your website →</a>` : ''}</div>`}
+
+  ${slug ? `<div class="card" style="padding:14px 14px 12px"><div class="framewrap">
+    <iframe src="/preview/${slug}/" loading="lazy" title="Your website, live"></iframe>
+    <a href="${siteUrl || `/preview/${slug}/`}" target="_blank" style="position:absolute;inset:0" aria-label="Open your website"></a>
+  </div><p class="note" style="margin-top:9px;text-align:center">This is what the world sees right now — tap to open it full size.</p></div>` : ''}
 
   ${tiles.length ? `<div class="card"><span class="eyebrow">At a Glance</span><h2>Your numbers right now</h2><div class="tiles">${tiles.join('')}</div></div>` : ''}
 
@@ -1182,10 +1206,20 @@ app.get('/portal/:id/:token', async (c) => {
     ${storyRows.map((s) => `<div class="m">${MILES[s.type] || s.type}<time>${String(s.at).slice(0, 10)}</time></div>`).join('')}
     </div></div>` : ''}
 
-  ${agrRow ? `<div class="card c-doc"><span class="eyebrow">Documents</span><h2>Your agreement</h2>
-    <p style="color:var(--muted);font-size:14px">Signed by ${escq(agrRow.signed_name)} on ${String(agrRow.signed_at).slice(0, 10)} — kept right here for your records.</p>
-    <a class="btn" style="margin-top:12px" href="/agreement/${id}/${agrTok}" target="_blank">View your signed agreement →</a>
+  ${(agrRow || certRow) ? `<div class="card c-doc"><span class="eyebrow">Documents</span><h2>Your documents</h2>
+    ${agrRow ? `<p style="color:var(--muted);font-size:14px">Your agreement — signed by ${escq(agrRow.signed_name)} on ${String(agrRow.signed_at).slice(0, 10)}, kept right here for your records.</p>
+    <a class="btn" style="margin-top:10px" href="/agreement/${id}/${agrTok}" target="_blank">View your signed agreement →</a>` : ''}
+    ${certRow ? `<p style="color:var(--muted);font-size:14px;margin-top:${agrRow ? '18px' : '0'}">Your Page One certificate — earned ${String(certRow.created_at).slice(0, 10)}${certKw ? ` for the search "${escq(certKw)}"` : ''}. Print it, frame it — you earned it.</p>
+    <a class="btn" style="margin-top:10px;background:#A16207" href="/portal/${id}/${tok}/certificate" target="_blank">Your Page One certificate →</a>` : ''}
   </div>` : ''}
+
+  ${(histSpanDays >= 25 && score && hist.length >= 2) ? `<div class="card c-score"><span class="eyebrow">Then &amp; Now</span><h2>Your first ${histSpanDays} days</h2>
+    <div style="display:flex;gap:26px;align-items:center;flex-wrap:wrap">
+      <div style="text-align:center"><div class="note" style="margin:0">then</div><div style="font-family:'Cormorant Garamond',serif;font-size:44px;color:var(--faint);line-height:1">${hist[0].s}</div></div>
+      <div style="font-size:24px;color:#7C3AED">→</div>
+      <div style="text-align:center"><div class="note" style="margin:0">now</div><div style="font-family:'Cormorant Garamond',serif;font-size:44px;color:#7C3AED;line-height:1">${hist[hist.length - 1].s}</div></div>
+      ${(gscFirst && hasGsc && Number(gsc.totals?.imp || 0) > gscFirst.imp) ? `<div style="margin-left:auto;text-align:center"><div class="note" style="margin:0">shown on Google</div><div style="font-size:17px">${Number(gscFirst.imp).toLocaleString()}× → <b style="color:#7C3AED">${Number(gsc.totals.imp).toLocaleString()}×</b></div></div>` : ''}
+    </div></div>` : ''}
 
   ${blogs.length ? `<div class="card c-blog"><span class="eyebrow">Published For You</span><h2>Fresh on your website</h2><ul class="list">${blogs.map((b) => `<li><a href="/preview/${slug}/${b.path}" target="_blank">${b.path.replace('blog-', '').replace('.html', '').replace(/-/g, ' ')} →</a></li>`).join('')}</ul></div>` : ''}
 
@@ -1205,8 +1239,11 @@ app.get('/portal/:id/:token', async (c) => {
         <input type="file" id="photoFile" accept="image/png,image/jpeg,image/webp" style="font-size:13px;margin-bottom:9px">
         ${slug ? `<label style="display:flex;gap:8px;align-items:center;font-size:13.5px;color:var(--ink)"><input type="checkbox" id="wantOnSite" checked style="width:16px;height:16px;accent-color:var(--brand)"> Please add this photo to my website</label>` : ''}
       </div>
-      <textarea name="message" id="msgText" rows="3" placeholder="Type your message…"></textarea>
-      <button class="btn" type="submit" id="msgBtn">Send</button>
+      <div style="display:flex;gap:9px;align-items:flex-start">
+        <textarea name="message" id="msgText" rows="3" placeholder="Type your message…" style="flex:1;margin-bottom:0"></textarea>
+        <button type="button" class="micbtn" id="micBtn" title="Hold on — talk instead of type" style="display:none">🎤</button>
+      </div>
+      <button class="btn" type="submit" id="msgBtn" style="margin-top:12px">Send</button>
       <p id="msgOk" style="display:none;color:var(--good);font-weight:500;margin-top:10px"></p>
     </form>
   </div>
@@ -1214,6 +1251,87 @@ app.get('/portal/:id/:token', async (c) => {
   <p class="foot">Website care by <a href="https://conversionco918.com">ConversionCo</a></p>
 </div>
 <script>
+window.CCWIN = ${winRow ? JSON.stringify({ t: winRow.type, at: winRow.created_at }) : 'null'};
+window.CCEV = ${JSON.stringify(evRows.map((e) => ({ t: e.type, at: e.created_at })))};
+window.CCIMP = ${hasGsc ? Number(gsc.totals?.imp || 0) : 'null'};
+// numbers that move (respecting reduced-motion)
+(function () {
+  var noMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  document.querySelectorAll('.lfill[data-w]').forEach(function (el) {
+    var w = el.getAttribute('data-w') + '%';
+    if (noMotion) { el.style.width = w; } else { setTimeout(function () { el.style.width = w; }, 150); }
+  });
+  if (!noMotion) document.querySelectorAll('.tile .v[data-cnt]').forEach(function (el) {
+    var target = parseInt(el.getAttribute('data-cnt'), 10); if (!isFinite(target) || target <= 0) return;
+    var suffix = el.querySelector('small') ? el.querySelector('small').outerHTML : '';
+    var extra = /%$/.test(el.textContent.trim()) ? '%' : '';
+    var t0 = null;
+    function step(ts) {
+      if (!t0) t0 = ts;
+      var p = Math.min(1, (ts - t0) / 900); p = 1 - Math.pow(1 - p, 3);
+      el.innerHTML = Math.round(target * p).toLocaleString() + extra + suffix;
+      if (p < 1) requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  });
+})();
+// one-time confetti on a real, recent win
+(function () {
+  if (!window.CCWIN) return;
+  var key = 'cc_win_' + CCWIN.t + '_' + CCWIN.at;
+  try { if (localStorage.getItem(key)) return; localStorage.setItem(key, '1'); } catch (e) { return; }
+  document.getElementById('winBanner').style.display = 'block';
+  if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  var cv = document.createElement('canvas'); cv.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:99';
+  cv.width = innerWidth; cv.height = innerHeight; document.body.appendChild(cv);
+  var ctx = cv.getContext('2d'); var pieces = []; var colors = ['#2F7E76', '#A16207', '#7C3AED', '#1B7F4B', '#BE123C'];
+  for (var i = 0; i < 90; i++) pieces.push({ x: Math.random() * cv.width, y: -20 - Math.random() * cv.height * 0.4, r: 3 + Math.random() * 5, c: colors[i % colors.length], v: 2 + Math.random() * 3, a: Math.random() * 6.28, s: (Math.random() - 0.5) * 0.2 });
+  var frames = 0;
+  (function draw() {
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    pieces.forEach(function (p) { p.y += p.v; p.a += p.s; ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.a); ctx.fillStyle = p.c; ctx.fillRect(-p.r, -p.r / 2, p.r * 2, p.r); ctx.restore(); });
+    if (++frames < 260) requestAnimationFrame(draw); else cv.remove();
+  })();
+})();
+// since your last visit — honest diff, stored locally
+(function () {
+  try {
+    var K = 'cc_visit_${id}';
+    var last = localStorage.getItem(K);
+    if (last) {
+      var lv = Date.parse(last); var msgs = [];
+      var ups = CCEV.filter(function (e) { return ['auto_published', 'revision_done', 'preview_ready', 'photo_uploaded'].indexOf(e.t) >= 0 && Date.parse(e.at.replace(' ', 'T') + 'Z') > lv; }).length;
+      if (ups) msgs.push(ups + ' update' + (ups > 1 ? 's' : '') + ' went out on your website');
+      var pi = localStorage.getItem(K + '_imp');
+      if (pi !== null && CCIMP !== null && CCIMP > +pi) msgs.push("Google's count of people who saw you grew by " + (CCIMP - +pi));
+      if (msgs.length) { var el = document.getElementById('sinceLine'); el.textContent = 'Since you were last here: ' + msgs.join(', and ') + '.'; el.style.display = 'block'; }
+    }
+    localStorage.setItem(K, new Date().toISOString());
+    if (CCIMP !== null) localStorage.setItem(K + '_imp', CCIMP);
+  } catch (e) {}
+})();
+// talk instead of type
+(function () {
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  var btn = document.getElementById('micBtn');
+  if (!SR || !btn) return;
+  btn.style.display = 'block';
+  var rec = null, on = false;
+  btn.addEventListener('click', function () {
+    var ta = document.getElementById('msgText');
+    if (on) { try { rec.stop(); } catch (e) {} return; }
+    rec = new SR(); rec.continuous = true; rec.interimResults = true; rec.lang = 'en-US';
+    var base = ta.value ? ta.value + ' ' : '';
+    rec.onresult = function (ev) {
+      var out = '';
+      for (var i = 0; i < ev.results.length; i++) out += ev.results[i][0].transcript;
+      ta.value = base + out;
+    };
+    rec.onend = function () { on = false; btn.classList.remove('rec'); btn.textContent = '🎤'; };
+    rec.onerror = function () { on = false; btn.classList.remove('rec'); btn.textContent = '🎤'; };
+    rec.start(); on = true; btn.classList.add('rec'); btn.textContent = '⏹';
+  });
+})();
 let MODE = 'q';
 const HINTS = {
   q: 'A real person reads every message and replies, usually the same day.',
@@ -1410,6 +1528,55 @@ app.post('/portal-photo/:id/:token', async (c) => {
     } catch {}
   }
   return c.json({ ok: true, slot, queued });
+});
+
+// 📜 Page One certificate — print-ready, earned only (real page1_celebrated event)
+app.get('/portal/:id/:token/certificate', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'portal', id)) return c.text('nope', 403);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  const ev = await db.prepare(`SELECT detail, created_at FROM events WHERE client_id = ? AND type = 'page1_celebrated' ORDER BY id ASC LIMIT 1`).bind(id).first();
+  if (!client || !ev) return c.text('Not found', 404);
+  const settings = await getSettings(db);
+  const accent = settings[`portal_accent_${id}`] || (THEMES[client.theme] && THEMES[client.theme].tokens && THEMES[client.theme].tokens['--gold']) || '#2F7E76';
+  const biz = client.business_name || client.name || 'This business';
+  const kw = (String(ev.detail || '').match(/"([^"]+)"/) || [])[1] || '';
+  const when = new Date(String(ev.created_at).replace(' ', 'T') + 'Z').toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+  return c.html(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex"><title>Page One of Google — ${biz}</title>
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;1,400&family=Karla:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0}
+body{background:#EFEBE2;font-family:'Karla',sans-serif;color:#16202B;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px}
+.cert{background:#FDFCF8;max-width:760px;width:100%;padding:64px 56px;text-align:center;border:1px solid #E7E3DA;box-shadow:0 20px 60px rgba(22,32,43,.12);position:relative}
+.cert::before{content:"";position:absolute;inset:14px;border:1.5px solid ${accent};pointer-events:none}
+.cert::after{content:"";position:absolute;inset:19px;border:.5px solid ${accent}55;pointer-events:none}
+.crest{width:58px;height:58px;border-radius:50%;border:1.5px solid ${accent};display:flex;align-items:center;justify-content:center;font-family:'Cormorant Garamond',serif;font-size:24px;color:${accent};margin:0 auto 22px}
+.eyebrow{font-size:11px;letter-spacing:.34em;text-transform:uppercase;color:#8A99A8;margin-bottom:20px}
+h1{font-family:'Cormorant Garamond',serif;font-weight:500;font-size:40px;line-height:1.1;margin-bottom:6px}
+.rule{width:60px;height:2px;background:${accent};margin:22px auto}
+.body{font-size:15.5px;color:#5B6B7B;max-width:480px;margin:0 auto;line-height:1.75}
+.body b{color:#16202B;font-weight:500}
+.big{font-family:'Cormorant Garamond',serif;font-style:italic;font-size:26px;color:${accent};margin:20px 0}
+.date{font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:#8A99A8;margin-top:30px}
+.sig{font-family:'Cormorant Garamond',serif;font-style:italic;font-size:18px;margin-top:26px}
+.sig small{display:block;font-family:'Karla',sans-serif;font-style:normal;font-size:10.5px;letter-spacing:.2em;text-transform:uppercase;color:#8A99A8;margin-top:6px}
+.printbtn{position:fixed;top:18px;right:18px;background:#0B1D33;color:#fff;border:0;border-radius:99px;padding:11px 22px;font-size:13px;cursor:pointer}
+@media print{.printbtn{display:none}body{background:#fff;padding:0}.cert{box-shadow:none;border:0}}
+</style></head><body>
+<button class="printbtn" onclick="window.print()">Print / save</button>
+<div class="cert">
+  <div class="crest">${(biz).slice(0, 1)}</div>
+  <div class="eyebrow">Certificate of Achievement</div>
+  <h1>${biz}</h1>
+  <div class="rule"></div>
+  <p class="body">has earned a place on <b>Page One of Google</b> — not through advertising, but through a website and search presence strong enough that Google itself put it there${kw ? ' for the search' : ''}.</p>
+  ${kw ? `<div class="big">"${kw}"</div>` : ''}
+  <div class="date">Verified · ${when}</div>
+  <p class="sig">The ConversionCo Team<small>conversionco918.com</small></p>
+</div>
+</body></html>`);
 });
 
 // Render a stored report inside the portal (proxied from GitHub)
@@ -3061,6 +3228,10 @@ async function gscPullAll(env, settings) {
         domain, checked_at: new Date().toISOString(), window: stats.window, queries, totals: stats.totals,
       }));
       st.last_pull = new Date().toISOString(); st.last_error = ''; st.err_logged = '';
+      // remember the very first non-empty snapshot — powers the "then & now" card forever
+      if (queries.length && !settings[`gsc_first_${cl.id}`]) {
+        await setSetting(db, `gsc_first_${cl.id}`, JSON.stringify({ at: new Date().toISOString(), imp: stats.totals.imp, clicks: stats.totals.clicks }));
+      }
       if (queries.length) await logEvent(db, cl.id, 'gsc_pulled', `📈 Google's own numbers in for ${domain} — ${queries.length} searches tracked, seen ${stats.totals.imp}×, ${stats.totals.clicks} clicks (28 days)`);
     } catch (e) {
       st.last_error = String(e.message).slice(0, 160);
