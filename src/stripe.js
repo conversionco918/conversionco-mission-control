@@ -35,7 +35,9 @@ async function stripeReq(key, method, path, params) {
 export const PRICES = {
   standard: { amount: 64900, label: 'Standard Website Package', display: '$649' },
   premium: { amount: 99900, label: 'Premium Website + SEO Engine', display: '$999' },
-  hosting: { amount: 4900, label: 'Website Hosting & Security', display: '$49/mo' },
+  hosting: { amount: 4900, label: 'Care Plan — Hosting & Security', display: '$49/mo' },
+  care199: { amount: 19900, label: 'Care Plan — Growth (content + reviews)', display: '$199/mo' },
+  care399: { amount: 39900, label: 'Care Plan — Dominance (full service)', display: '$399/mo' },
 };
 
 export async function ensureCustomer(key, email, name) {
@@ -80,16 +82,17 @@ export async function invoiceStatus(key, invoiceId) {
   return { status: inv.status, paid: inv.status === 'paid', url: inv.hosted_invoice_url };
 }
 
-export async function hostingCheckout(key, customerId, businessName, returnUrl) {
+export async function hostingCheckout(key, customerId, businessName, returnUrl, planKey = 'hosting') {
+  const plan = PRICES[planKey] && ['hosting', 'care199', 'care399'].includes(planKey) ? PRICES[planKey] : PRICES.hosting;
   const session = await stripeReq(key, 'POST', '/checkout/sessions', {
     mode: 'subscription',
     customer: customerId,
     success_url: returnUrl,
     cancel_url: returnUrl,
     line_items: { 0: { quantity: 1, price_data: {
-      currency: 'usd', unit_amount: PRICES.hosting.amount,
+      currency: 'usd', unit_amount: plan.amount,
       recurring: { interval: 'month' },
-      product_data: { name: `${PRICES.hosting.label}${businessName ? ` — ${businessName}` : ''}` },
+      product_data: { name: `${plan.label}${businessName ? ` — ${businessName}` : ''}` },
     } } },
   });
   return { id: session.id, url: session.url };

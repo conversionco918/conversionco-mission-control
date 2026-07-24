@@ -336,6 +336,16 @@ app.get('/debug/:key', async (c) => {
           intake1: r.intake1_data || '', intake2: r.intake2_data || '' };
       });
     })(),
+    demoQueue: await (async () => {
+      const rows = (await c.env.DB.prepare(`SELECT * FROM clients WHERE stage = 'prospect'`).all()).results || [];
+      const out = [];
+      for (const r of rows) {
+        out.push({ id: r.id, business_name: r.business_name, name: r.name,
+          theme: r.theme || '', vibe: r.vibe || '', intake1: r.intake1_data || '',
+          pitch_url: `${BASE_URL}/pitch/${r.id}/${await portalToken(c.env, 'pitch', r.id)}` });
+      }
+      return out;
+    })(),
     counters: await (async () => {
       const rows = (await c.env.DB.prepare('SELECT id FROM clients').all()).results || [];
       const out = {};
@@ -905,7 +915,7 @@ app.get('/portal/:id/:token', async (c) => {
   </div></div>
 
   <div class="two">
-    <div class="card"><h2>Your plan${billing.sub_status === 'active' ? ' <span class="chipA">🛡 PROTECTED</span>' : ''}</h2>
+    <div class="card"><h2>Your plan${billing.sub_status === 'active' ? ` <span class="chipA">🛡 ${billing.sub_plan === 'care399' ? 'DOMINANCE CARE' : billing.sub_plan === 'care199' ? 'GROWTH CARE' : 'PROTECTED'}</span>` : ''}</h2>
       <ul class="plan">${plan.map((p) => `<li>${p}</li>`).join('')}</ul>
     </div>
     <div class="card"><h2>Recent activity</h2><div class="feed">
@@ -1106,7 +1116,7 @@ async function computeOverview(db, clients, settings) {
   for (const r of revFailed) (revFailedByClient[r.client_id] = revFailedByClient[r.client_id] || []).push(r.request);
   const newLeads = (await db.prepare(`SELECT l.*, c.business_name AS cbiz, c.name AS cname FROM leads l LEFT JOIN clients c ON c.id = l.client_id WHERE l.created_at > datetime('now','-2 days') ORDER BY l.id DESC LIMIT 20`).all()).results || [];
 
-  let collected = 0, outstanding = 0, hostingCount = 0;
+  let collected = 0, outstanding = 0, hostingCount = 0, mrrTotal = 0;
   const needs = [], health = {};
   const dayMs = 86400000;
   for (const cl of clients) {
@@ -1123,7 +1133,7 @@ async function computeOverview(db, clients, settings) {
       else if (b.fin_status === 'open') { outstanding += half; needs.push({ id: cl.id, sev: 2, kind: 'invoice', msg: `💳 ${label} — final balance outstanding (${halfDisplay(tierKey)})` }); }
     }
     if (b.invoice_status === 'open') { outstanding += amt; needs.push({ id: cl.id, sev: 2, kind: 'invoice', msg: `💳 ${label} — invoice outstanding (${PRICES[tierKey].display})` }); }
-    if (b.sub_status === 'active') hostingCount++;
+    if (b.sub_status === 'active') { hostingCount++; mrrTotal += (PRICES[b.sub_plan] && ['hosting','care199','care399'].includes(b.sub_plan) ? PRICES[b.sub_plan].amount : PRICES.hosting.amount) / 100; }
 
     let why = [], dot = 'green';
     let upt = {}; try { upt = JSON.parse(settings[`uptime_${cl.id}`] || '{}'); } catch {}
@@ -1149,7 +1159,7 @@ async function computeOverview(db, clients, settings) {
     let prog = {}; try { prog = JSON.parse(settings[`buildprog_${cl.id}`] || '{}'); } catch {}
     buildProgress[cl.id] = { pct: prog.pct || 5, step: prog.step || 'Build started', started_at: prog.started_at || cl.updated_at };
   }
-  return { money: { collected, outstanding, hostingCount, mrr: hostingCount * 49 }, needs: needs.slice(0, 12), health, buildProgress };
+  return { money: { collected, outstanding, hostingCount, mrr: Math.round(mrrTotal) }, needs: needs.slice(0, 12), health, buildProgress };
 }
 function ago2(iso) { if (!iso) return ''; const m = (Date.now() - Date.parse(iso + (String(iso).includes('Z') ? '' : 'Z'))) / 60000; if (m < 60) return `${Math.max(1, Math.floor(m))}m ago`; if (m < 1440) return `${Math.floor(m / 60)}h ago`; return `${Math.floor(m / 1440)}d ago`; }
 
@@ -1208,6 +1218,30 @@ app.post('/api/clients', async (c) => {
   }
 });
 
+// Demo-first pitching: create a PROSPECT (no email needed) — the auto-builder
+// makes them a one-page demo site before you've ever spoken to them.
+app.post('/api/prospects', async (c) => {
+  const db = c.env.DB;
+  const { business_name, city, email = '', name = '' } = await c.req.json();
+  if (!business_name || !String(business_name).trim()) return c.json({ error: 'Business name required' }, 400);
+  if (!city || !String(city).trim()) return c.json({ error: 'City required' }, 400);
+  const biz = String(business_name).trim(), cty = String(city).trim();
+  const placeholderEmail = email.trim() || `prospect+${biz.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40)}@conversionco918.com`;
+  const existing = await db.prepare('SELECT id FROM clients WHERE email = ?').bind(placeholderEmail).first();
+  if (existing) return c.json({ error: 'A prospect/client with that email already exists' }, 400);
+  // synthesize a minimal intake1 so the demo builder + pitch page read it like a real client
+  const intake1 = JSON.stringify({
+    'Business Name': biz, 'Contact Name': name || '', 'Email': placeholderEmail,
+    'Primary City & State': cty, 'Services Offered': 'IV therapy',
+    '_prospect': true, '_created': new Date().toISOString(),
+  });
+  const r = await db.prepare(`INSERT INTO clients (email, name, business_name, stage, intake1_data) VALUES (?, ?, ?, 'prospect', ?)`)
+    .bind(placeholderEmail, name || '', biz, intake1).run();
+  const id = r.meta.last_row_id;
+  await logEvent(db, id, 'prospect_created', `💡 Prospect added: ${biz} (${cty}) — demo build queued`);
+  return c.json({ ok: true, id });
+});
+
 // Approve after pricing call -> send Intake 2
 app.post('/api/clients/:id/send-intake2', async (c) => {
   const db = c.env.DB;
@@ -1249,7 +1283,7 @@ app.patch('/api/clients/:id', async (c) => {
   const id = Number(c.req.param('id'));
   const body = await c.req.json();
   const allowed = {};
-  for (const k of ['stage', 'notes', 'name', 'phone', 'business_name', 'preview_url', 'live_url', 'theme', 'tier', 'launch_checklist', 'vibe']) {
+  for (const k of ['stage', 'notes', 'name', 'phone', 'business_name', 'preview_url', 'live_url', 'theme', 'tier', 'launch_checklist', 'vibe', 'email']) {
     if (k in body) allowed[k] = body[k];
   }
   if (!Object.keys(allowed).length) return c.json({ error: 'nothing to update' }, 400);
@@ -1348,16 +1382,19 @@ app.post('/api/clients/:id/hosting', async (c) => {
   const db = c.env.DB;
   const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
   if (!client) return c.json({ error: 'client not found' }, 404);
+  let planKey = 'hosting';
+  try { planKey = (await c.req.json())?.plan || 'hosting'; } catch {}
+  if (!['hosting', 'care199', 'care399'].includes(planKey)) planKey = 'hosting';
   try {
     const cust = await ensureCustomer(c.env.STRIPE_SECRET_KEY, client.email, client.name || client.business_name || '');
     const ret = client.live_url || client.preview_url || 'https://conversionco918.com';
-    const sess = await hostingCheckout(c.env.STRIPE_SECRET_KEY, cust.id, client.business_name || '', ret);
+    const sess = await hostingCheckout(c.env.STRIPE_SECRET_KEY, cust.id, client.business_name || '', ret, planKey);
     const billing = getBilling(client);
     billing.customer_id = cust.id;
-    billing.sub_session_id = sess.id; billing.sub_link = sess.url; billing.sub_status = 'pending';
+    billing.sub_session_id = sess.id; billing.sub_link = sess.url; billing.sub_status = 'pending'; billing.sub_plan = planKey;
     await touchClient(db, id, { billing: JSON.stringify(billing) });
-    await logEvent(db, id, 'hosting_link', 'Hosting & security $49/mo — checkout link created 🔒');
-    return c.json({ ok: true, url: sess.url });
+    await logEvent(db, id, 'hosting_link', `${PRICES[planKey].label} (${PRICES[planKey].display}) — checkout link created 🔒`);
+    return c.json({ ok: true, url: sess.url, plan: planKey });
   } catch (e) {
     return c.json({ error: 'Stripe: ' + e.message }, 502);
   }
@@ -1889,6 +1926,13 @@ async function importSite(env, settings, slug, clientId, treeFiles) {
   }
   const previewUrl = `${BASE_URL}/preview/${slug}/`;
   if (clientId) {
+    // prospects keep their stage — the demo just attaches to the card
+    const clP = await db.prepare('SELECT stage FROM clients WHERE id = ?').bind(Number(clientId)).first();
+    if (clP && clP.stage === 'prospect') {
+      await touchClient(db, Number(clientId), { preview_url: previewUrl });
+      await logEvent(db, Number(clientId), 'demo_ready', `💡 Prospect demo is live: ${previewUrl}`);
+      return { files: count, preview_url: previewUrl };
+    }
     await touchClient(db, Number(clientId), { stage: 'preview_ready', preview_url: previewUrl });
     await logEvent(db, Number(clientId), 'preview_ready', previewUrl);
     // 50/50 billing: the build is done — auto-send the final balance invoice
@@ -2108,6 +2152,67 @@ async function dailyUptime(env) {
   return results;
 }
 
+// Onboarding autopilot (added 7/24): the system sends its own friendly nudges so
+// Tiffany never has to chase people. Each nudge fires at most once (flags in billing
+// JSON), in the personal email style, and is logged to the feed.
+const NUDGES = [
+  { flag: 'n_agr1', days: 2, when: (b, cl, signed) => b.agr_sent && !signed,
+    since: (b) => b.agr_sent,
+    subject: (biz) => `Quick nudge — your agreement is waiting`,
+    body: (first, biz, links) => `<p>Hi ${first},</p><p>Just a friendly nudge — your ConversionCo service agreement is still waiting for a signature. It's a two-minute read, and the moment it's signed we can get ${biz} moving:</p><p><a href="${links.agr}">${links.agr}</a></p><p>Any questions about anything in it, just reply — happy to walk you through.</p><p>Talk soon,<br>The ConversionCo Team</p>` },
+  { flag: 'n_agr2', days: 5, when: (b, cl, signed) => b.agr_sent && !signed,
+    since: (b) => b.agr_sent,
+    subject: (biz) => `Still excited to build ${biz}`,
+    body: (first, biz, links) => `<p>Hi ${first},</p><p>We're still holding your spot in the build calendar for ${biz}. The only thing between you and a start date is the two-minute agreement:</p><p><a href="${links.agr}">${links.agr}</a></p><p>If timing has changed or you have questions, just reply and tell me where you're at — no pressure either way.</p><p>Talk soon,<br>The ConversionCo Team</p>` },
+  { flag: 'n_dep1', days: 3, when: (b) => b.dep_status === 'open',
+    since: (b) => b.agr_sent || b.dep_created || null,
+    subject: () => `Your build spot is reserved — deposit invoice inside`,
+    body: (first, biz, links) => `<p>Hi ${first},</p><p>Your 50% deposit invoice for ${biz} is still open — the build kicks off automatically the moment it's paid, and your preview lands within days:</p><p>${links.dep ? `<a href="${links.dep}">${links.dep}</a>` : 'The invoice is in your inbox from Stripe.'}</p><p>Questions about anything? Just reply.</p><p>Talk soon,<br>The ConversionCo Team</p>` },
+  { flag: 'n_int2', days: 2, when: (b, cl) => depositPaid(b) && cl.stage === 'intake2_sent' && !cl.intake2_data,
+    since: (b, cl) => cl.updated_at,
+    subject: (biz) => `The last form before we start designing`,
+    body: (first, biz, links) => `<p>Hi ${first},</p><p>You're paid up and we're ready to build ${biz} — the only thing we're waiting on is your Website Vision form (menu, prices, look and feel). It takes about 10 minutes and the build starts automatically when you submit:</p><p><a href="${links.form2}">${links.form2}</a></p><p>Stuck on any question? Reply here and we'll fill it in together.</p><p>Talk soon,<br>The ConversionCo Team</p>` },
+];
+
+async function autoNudges(env, settings) {
+  if (!env.GHL_TOKEN || !settings.ghl_location_id) return;
+  const db = env.DB;
+  const dayMs = 86400000;
+  const clients = (await db.prepare(`SELECT * FROM clients WHERE stage NOT IN ('archived','live','prospect')`).all()).results || [];
+  const signedRows = (await db.prepare('SELECT DISTINCT client_id FROM agreements').all()).results || [];
+  const signed = new Set(signedRows.map((r) => r.client_id));
+  for (const cl of clients) {
+    if (!cl.email) continue;
+    const b = getBilling(cl);
+    for (const n of NUDGES) {
+      if (b[n.flag]) continue;
+      if (!n.when(b, cl, signed.has(cl.id))) continue;
+      const sinceIso = n.since(b, cl);
+      if (!sinceIso) continue;
+      const started = Date.parse(String(sinceIso).includes('Z') || String(sinceIso).includes('+') ? sinceIso : sinceIso + 'Z');
+      if (isNaN(started) || Date.now() - started < n.days * dayMs) continue;
+      try {
+        const links = {
+          agr: `${BASE_URL}/agreement/${cl.id}/${await portalToken(env, 'agr', cl.id)}`,
+          dep: b.dep_url || '',
+          form2: settings.form2_link + (settings.form2_link.includes('?') ? '&' : '?') + 'e=' + encodeURIComponent(cl.email),
+        };
+        const first = (cl.name || '').split(' ')[0] || 'there';
+        const biz = cl.business_name || cl.name || 'your business';
+        const ghl = new GHL(env.GHL_TOKEN, settings.ghl_location_id);
+        const contact = await ghl.upsertContact({ email: cl.email, name: cl.name || '' });
+        await ghl.sendEmail({ contactId: contact.id || contact.contactId,
+          subject: n.subject(biz), html: n.body(first, biz, links),
+          emailFrom: settings.email_from || undefined });
+        b[n.flag] = new Date().toISOString();
+        await touchClient(db, cl.id, { billing: JSON.stringify(b) });
+        await logEvent(db, cl.id, 'nudge_sent', `🤖 Auto-nudge sent (${n.flag.replace('n_', '')}) to ${cl.email}`);
+      } catch (e) { await logEvent(db, cl.id, 'error', `Nudge failed: ${String(e.message).slice(0, 120)}`); }
+      break; // at most one nudge per client per pass — never stack emails
+    }
+  }
+}
+
 // Build watchdog (runs every 5 min): a card stuck in "Building" with no progress
 // for 60+ minutes gets re-queued automatically and flagged in the activity feed —
 // a stalled build can never sit silently again.
@@ -2196,6 +2301,9 @@ export default {
     ));
     ctx.waitUntil(buildWatchdog(env, settings).catch((e) =>
       logEvent(env.DB, null, 'error', `Build watchdog failed: ${e.message}`)
+    ));
+    ctx.waitUntil(autoNudges(env, settings).catch((e) =>
+      logEvent(env.DB, null, 'error', `Auto-nudge failed: ${e.message}`)
     ));
   },
 };

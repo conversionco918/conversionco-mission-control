@@ -156,6 +156,11 @@
     <input id="newEmail" type="email" placeholder="client email address">
     <input id="newName" type="text" placeholder="name (optional)">
     <button class="btn btn-primary" id="addBtn" onclick="addClient()">Send Intake 1 →</button>
+    <span style="border-left:1px solid var(--line);align-self:stretch;margin:0 4px;"></span>
+    <b>💡 Prospect demo:</b>
+    <input id="proBiz" type="text" placeholder="business name">
+    <input id="proCity" type="text" placeholder="city, state" style="max-width:150px">
+    <button class="btn btn-ghost" id="proBtn" onclick="addProspect()" title="Builds them a real demo homepage before you've ever talked — send the link as your pitch.">Build demo →</button>
   </div>
 
   <div id="moneyStrip"></div>
@@ -237,6 +242,7 @@
 
 <script>
 const STAGES = {
+  prospect:       { label: '💡 Prospect — demo',  bg:'#fdf4ff', fg:'#a21caf' },
   new:            { label: 'New',                 bg:'#e2e8f0', fg:'#334155' },
   intake1_sent:   { label: 'Intake 1 sent',       bg:'#dbeafe', fg:'#1d4ed8' },
   intake1_done:   { label: '✓ Intake 1 done — call them!', bg:'#fef3c7', fg:'#b45309' },
@@ -308,7 +314,7 @@ function renderOverview() {
   ms.innerHTML = `
     <div class="stat"><b>Cash collected</b><div class="v">$${(m.collected).toLocaleString()}</div><div class="sub">project fees paid</div></div>
     <div class="stat"><b>Outstanding</b><div class="v">$${(m.outstanding).toLocaleString()}</div><div class="sub">invoices awaiting payment</div></div>
-    <div class="stat"><b>Recurring — MRR</b><div class="v">$${m.mrr.toLocaleString()}/mo</div><div class="sub">${m.hostingCount} hosting subscription${m.hostingCount === 1 ? '' : 's'} × $49</div></div>`;
+    <div class="stat"><b>Recurring — MRR</b><div class="v">$${m.mrr.toLocaleString()}/mo</div><div class="sub">${m.hostingCount} active care plan${m.hostingCount === 1 ? '' : 's'}</div></div>`;
   ns.style.display = 'block';
   if (!ov.needs.length) {
     ns.className = 'allgood'; ns.id = 'needsStrip';
@@ -324,6 +330,7 @@ function renderOverview() {
 const BOARD_COLS = ['New', 'Intake 1', 'Call', 'Closing', 'Paid', 'Building', 'Preview', 'Live'];
 function colFor(c) {
   let b = {}; try { b = JSON.parse(c.billing || '{}'); } catch {}
+  if (c.stage === 'prospect') return 'New';
   if (c.stage === 'live') return 'Live';
   if (c.stage === 'preview_ready') return 'Preview';
   if (c.stage === 'generating') return 'Building';
@@ -370,7 +377,30 @@ function renderFeed() {
   if (!STATE.events.length) { f.innerHTML = '<div class="empty">Activity will appear here.</div>'; return; }
   f.innerHTML = STATE.events.map(e => `<div class="item"><b>${esc(e.client_name || e.client_email || 'System')}</b> — ${esc(pretty(e.type))}${e.detail && e.type==='error' ? `<br><span style="color:var(--red);font-size:12px">${esc(e.detail)}</span>`:''}<time>${ago(e.created_at)}</time></div>`).join('');
 }
-function pretty(t){ return ({client_created:'added to pipeline', booking_email_sent:'booking link emailed 📅', intake1_sent:'Intake 1 email sent', intake1_done:'submitted Intake 1 🎉', intake2_sent:'Intake 2 email sent', intake2_done:'submitted Intake 2 🎉', stage_changed:'stage updated', error:'⚠ error', client_deleted:'removed', webhook_received:'webhook ping', build_started:'⚙ build started', build_stalled:'⚠️ build stalled — re-queued', preview_ready:'★ preview is ready', invoice_sent:'invoice sent 💳', invoice_paid:'payment received 💰', agreement_sent:'agreement sent 📄', agreement_signed:'agreement signed ✍️', portal_invited:'portal login sent 🔑', hosting_active:'hosting active 🔒', owner_digest:'weekly digest sent 📊', sms_sent:'text sent 📱', sms_skipped:'text skipped'})[t] || t; }
+function pretty(t){ return ({client_created:'added to pipeline', booking_email_sent:'booking link emailed 📅', intake1_sent:'Intake 1 email sent', intake1_done:'submitted Intake 1 🎉', intake2_sent:'Intake 2 email sent', intake2_done:'submitted Intake 2 🎉', stage_changed:'stage updated', error:'⚠ error', client_deleted:'removed', webhook_received:'webhook ping', build_started:'⚙ build started', build_stalled:'⚠️ build stalled — re-queued', preview_ready:'★ preview is ready', invoice_sent:'invoice sent 💳', invoice_paid:'payment received 💰', agreement_sent:'agreement sent 📄', agreement_signed:'agreement signed ✍️', portal_invited:'portal login sent 🔑', hosting_active:'hosting active 🔒', owner_digest:'weekly digest sent 📊', sms_sent:'text sent 📱', sms_skipped:'text skipped', prospect_created:'💡 prospect added', demo_ready:'💡 demo site ready', nudge_sent:'🤖 auto-nudge sent', build_stalled:'⚠️ build stalled — re-queued'})[t] || t; }
+
+async function addProspect() {
+  const business_name = document.getElementById('proBiz').value.trim();
+  const city = document.getElementById('proCity').value.trim();
+  if (!business_name || !city) return toast('Enter the business name and city first');
+  const btn = document.getElementById('proBtn'); btn.disabled = true;
+  const r = await api('/api/prospects', { method:'POST', body: JSON.stringify({ business_name, city }) });
+  btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error);
+  document.getElementById('proBiz').value = ''; document.getElementById('proCity').value = '';
+  toast('💡 Prospect added — demo builds on the next builder run (within 2h)');
+  refresh();
+}
+
+async function convertProspect(id) {
+  const email = (document.getElementById('convEmail')?.value || '').trim();
+  if (!email || !/.+@.+\..+/.test(email)) return toast('Enter their real email first');
+  await api(`/api/clients/${id}`, { method:'PATCH', body: JSON.stringify({ email, stage: 'new' }) });
+  const r = await api('/api/clients', { method:'POST', body: JSON.stringify({ email }) });
+  if (r.error) return toast('⚠ ' + r.error);
+  toast('🎉 Prospect converted — Intake 1 sent to ' + email);
+  closeDrawer(); refresh();
+}
 
 async function addClient() {
   const email = document.getElementById('newEmail').value.trim();
@@ -412,7 +442,16 @@ function openDrawer(id) {
         ${c.stage === 'new' || c.stage === 'intake1_sent' ? `<button class="btn btn-primary" onclick="resendIntake1('${esc(c.email)}', this)">${c.stage==='intake1_sent'?'Resend Intake 1':'Send Intake 1'}</button>` : ''}
         <button class="btn btn-red" onclick="delClient(${c.id})">Remove</button>
       </div>
-      ${c.preview_url ? `<div class="kv"><b>Preview site</b><a href="${esc(c.preview_url)}" target="_blank">${esc(c.preview_url)}</a></div>` : ''}
+      ${c.stage === 'prospect' ? `<div style="background:#fdf4ff;border:1px solid #f0abfc;border-radius:10px;padding:14px;">
+        <p style="font-size:12.5px;font-weight:600;color:#a21caf;margin-bottom:6px;">💡 Prospect pitch kit</p>
+        ${c.preview_url ? `<p style="font-size:12.5px;margin-bottom:8px;">Demo: <a href="${esc(c.preview_url)}" target="_blank">${esc(c.preview_url)}</a> <button class="btn btn-ghost" style="padding:5px 9px;font-size:11px" onclick="copyText('${esc(c.preview_url)}')">Copy</button></p>` : `<p style="font-size:12.5px;color:#a16207;margin-bottom:8px;">⚙ Demo builds on the next builder run — link appears here.</p>`}
+        <p style="font-size:11.5px;color:#64748b;margin-bottom:8px;">Pitch it: "I already built you a homepage — want to see it?" Then convert them:</p>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;">
+          <input id="convEmail" type="email" placeholder="their real email" style="flex:1;min-width:170px;padding:9px 11px;border:1.5px solid var(--line);border-radius:8px;font-size:13px;">
+          <button class="btn btn-green" onclick="convertProspect(${c.id})">Convert → Intake 1</button>
+        </div>
+      </div>` : ''}
+      ${c.preview_url && c.stage !== 'prospect' ? `<div class="kv"><b>Preview site</b><a href="${esc(c.preview_url)}" target="_blank">${esc(c.preview_url)}</a></div>` : ''}
       <div>
         <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Website tier — set after the pricing call</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap;">
@@ -457,14 +496,23 @@ function openDrawer(id) {
             }
           }
           let host = '';
+          const PLAN_LABEL = { hosting: '🔒 Hosting & Security $49/mo', care199: '🌱 Growth Care $199/mo', care399: '👑 Dominance Care $399/mo' };
           if (b.sub_status === 'active') {
-            host = `<div style="margin-top:10px;"><span class="chip" style="background:#ecfdf5;color:#059669">🔒 Hosting & security $49/mo ACTIVE</span></div>`;
+            host = `<div style="margin-top:10px;"><span class="chip" style="background:#ecfdf5;color:#059669">${PLAN_LABEL[b.sub_plan] || PLAN_LABEL.hosting} ACTIVE</span></div>`;
           } else if (b.sub_link) {
-            host = `<div style="margin-top:10px;"><span class="chip" style="background:#fef9c3;color:#a16207">Hosting link sent — awaiting signup</span> <button class="btn btn-ghost" style="padding:6px 10px;font-size:12px" onclick="copyText('${esc(b.sub_link)}')">Copy link</button></div>`;
+            host = `<div style="margin-top:10px;"><span class="chip" style="background:#fef9c3;color:#a16207">${PLAN_LABEL[b.sub_plan] || 'Care plan'} link sent — awaiting signup</span> <button class="btn btn-ghost" style="padding:6px 10px;font-size:12px" onclick="copyText('${esc(b.sub_link)}')">Copy link</button></div>`;
           } else if (c.stage === 'preview_ready' || c.stage === 'live') {
-            host = `<div style="margin-top:10px;"><button class="btn btn-primary" onclick="startHosting(${c.id}, this)">🔒 Start $49/mo hosting & security</button><p style="font-size:11px;color:#94a3b8;margin-top:4px;">Your end-of-process confirm — creates a Stripe signup link to send the client.</p></div>`;
+            host = `<div style="margin-top:10px;">
+              <p style="font-size:12px;font-weight:600;color:#334155;margin-bottom:6px;">Start their monthly care plan (your end-of-process confirm):</p>
+              <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                <button class="btn btn-ghost" onclick="startHosting(${c.id}, this, 'hosting')">🔒 $49 Hosting</button>
+                <button class="btn btn-primary" onclick="startHosting(${c.id}, this, 'care199')">🌱 $199 Growth</button>
+                <button class="btn btn-primary" style="background:#7c3aed" onclick="startHosting(${c.id}, this, 'care399')">👑 $399 Dominance</button>
+              </div>
+              <p style="font-size:11px;color:#94a3b8;margin-top:4px;">Growth = hosting + monthly content & review management · Dominance = everything + quarterly refresh + priority.</p>
+            </div>`;
           } else {
-            host = `<p style="font-size:11px;color:#94a3b8;margin-top:8px;">$49/mo hosting starts at the end — the button appears when the site is ready.</p>`;
+            host = `<p style="font-size:11px;color:#94a3b8;margin-top:8px;">Care plans ($49/$199/$399) start at the end — buttons appear when the site is ready.</p>`;
           }
           const links = [];
           if (!legacyPaid && b.dep_status !== 'paid') links.push(`<a href="#" onclick="billingBypass(${c.id},'deposit');return false;">mark deposit paid</a>`);
@@ -652,14 +700,16 @@ async function sendStripeInvoice(id, btn, which) {
   toast(`${label[0].toUpperCase() + label.slice(1)} invoice sent — ${r.display} 💳 (Stripe emails the client)`);
   refresh(); setTimeout(() => openDrawer(id), 400);
 }
-async function startHosting(id, btn) {
-  if (!confirm('Create the $49/mo hosting & security signup link for this client?')) return;
+async function startHosting(id, btn, plan) {
+  plan = plan || 'hosting';
+  const names = { hosting: '$49/mo Hosting & Security', care199: '$199/mo Growth Care', care399: '$399/mo Dominance Care' };
+  if (!confirm(`Create the ${names[plan]} signup link for this client?`)) return;
   btn.disabled = true;
-  const r = await api(`/api/clients/${id}/hosting`, { method:'POST', body: '{}' });
+  const r = await api(`/api/clients/${id}/hosting`, { method:'POST', body: JSON.stringify({ plan }) });
   btn.disabled = false;
   if (r.error) return toast('⚠ ' + r.error);
   copyText(r.url);
-  toast('Hosting signup link created & copied 🔒 — text or email it to the client');
+  toast(`${names[plan]} link created & copied 🔒 — text or email it to the client`);
   refresh(); setTimeout(() => openDrawer(id), 400);
 }
 function copyText(t){ navigator.clipboard?.writeText(t).catch(()=>{}); }
