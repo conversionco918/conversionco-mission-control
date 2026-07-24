@@ -392,6 +392,15 @@ function renderFeed() {
 }
 function pretty(t){ return ({client_created:'added to pipeline', booking_email_sent:'booking link emailed 📅', intake1_sent:'Intake 1 email sent', intake1_done:'submitted Intake 1 🎉', intake2_sent:'Intake 2 email sent', intake2_done:'submitted Intake 2 🎉', stage_changed:'stage updated', error:'⚠ error', client_deleted:'removed', webhook_received:'webhook ping', build_started:'⚙ build started', build_stalled:'⚠️ build stalled — re-queued', preview_ready:'★ preview is ready', invoice_sent:'invoice sent 💳', invoice_paid:'payment received 💰', agreement_sent:'agreement sent 📄', agreement_signed:'agreement signed ✍️', portal_invited:'portal login sent 🔑', hosting_active:'hosting active 🔒', owner_digest:'weekly digest sent 📊', sms_sent:'text sent 📱', sms_skipped:'text skipped', prospect_created:'💡 prospect added', demo_ready:'💡 demo site ready', nudge_sent:'🤖 auto-nudge sent', build_stalled:'⚠️ build stalled — re-queued', site_rolled_back:'⏪ site restored to previous version', launched:'🚀 LAUNCHED', launch_emailed:'🚀 launch email sent', page1_celebrated:'🎉 Page 1 celebration sent', first_lead_celebrated:'🎉 first-lead celebration sent', report_notified:'📬 report-ready email sent'})[t] || t; }
 
+async function sendExitPackage(id, btn) {
+  if (!confirm('Send the exit package?\n\nThe client receives a warm goodbye email with a download link to their COMPLETE package: every website file, all reports, Google position history, and their signed agreement.\n\nNothing is deleted or archived — you stay in control of the card afterwards.')) return;
+  btn.disabled = true;
+  const r = await api(`/api/clients/${id}/exit-package`, { method: 'POST', body: '{}' });
+  btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error);
+  copyText(r.url || '');
+  toast('📦 Exit package emailed — download link also copied for you');
+}
 async function rollbackSite(id, btn) {
   if (!confirm('Restore this website to its PREVIOUS version?\n\nSafe: this creates a new version (history is never deleted) and republishes within ~5 minutes. You can roll forward again later.')) return;
   btn.disabled = true;
@@ -573,6 +582,12 @@ function openDrawer(id) {
           <a href="#" onclick="event.preventDefault();copyLink(${c.id}, 'pitch', this)">Copy pitch link</a>
         </div>
         <p style="font-size:11px;color:#94a3b8;margin-top:9px;">Everything opens exactly what the client sees — same links, same live data.</p>
+        <div style="border-top:1px dashed #e2e8f0;margin-top:12px;padding-top:11px;">
+          <div class="actions">
+            <button class="btn btn-ghost" style="color:#b91c1c;border-color:#fecaca;" onclick="sendExitPackage(${c.id}, this)">📦 Client leaving — send them everything</button>
+          </div>
+          <p style="font-size:11px;color:#94a3b8;margin-top:6px;">A warm goodbye email with a download of their complete website files, all reports, rank history, and signed agreement. Deletes nothing — you stay in control.</p>
+        </div>
       </div>
       <div>
         <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Request any revision</label>

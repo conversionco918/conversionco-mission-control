@@ -10,6 +10,7 @@ function depositPaid(b) { return b.dep_status === 'paid' || b.invoice_status ===
 function finalPaid(b) { return b.fin_status === 'paid' || b.invoice_status === 'paid'; }
 import { computeScore } from './score.js';
 import { gscConfigured, gscAddProperty, gscVerifyViaCloudflareDns, gscQueryStats, gscSubmitSitemap, gscGetDnsToken, gscRequestVerify, gscListProperties } from './google.js';
+import { buildZip } from './zipfile.js';
 import dashboardHtml from './ui.html';
 import form1Html from './form1.html';
 import form2Html from './form2.html';
@@ -1011,6 +1012,8 @@ app.get('/portal/:id/:token', async (c) => {
   let gsc = null; try { gsc = JSON.parse(settings[`gsc_data_${id}`] || 'null'); } catch {}
   const hasGsc = gsc && Array.isArray(gsc.queries) && gsc.queries.length > 0;
   let hist = []; try { hist = JSON.parse(settings[`scorehist_${id}`] || '[]'); } catch {}
+  const agrRow = await db.prepare('SELECT * FROM agreements WHERE client_id = ? ORDER BY id DESC LIMIT 1').bind(id).first();
+  const agrTok = agrRow ? await portalToken(c.env, 'agr', id) : '';
   const tiles = [];
   if (hasGsc) {
     tiles.push(`<div class="tile"><div class="v">${Number(gsc.totals?.imp || 0).toLocaleString()}<small>×</small></div><div class="l">Times shown on Google</div></div>`);
@@ -1040,7 +1043,7 @@ app.get('/portal/:id/:token', async (c) => {
   h1{font-family:'Cormorant Garamond',Georgia,serif;font-weight:500;font-size:clamp(24px,5.5vw,32px);color:var(--navy);line-height:1.1}
   .sub{color:var(--muted);font-size:12.5px;letter-spacing:.05em;margin-top:3px}
   .card{background:var(--card);border:1px solid var(--line);border-top:3px solid var(--sec,var(--navy));border-radius:18px;padding:22px 20px;margin:14px 0}
-  .c-goog{--sec:#2F7E76}.c-cust{--sec:#1B7F4B}.c-score{--sec:#7C3AED}.c-health{--sec:#0E8A8A}.c-rep{--sec:#A16207}.c-blog{--sec:#C2410C}.c-act{--sec:#475569}.c-msg{--sec:#0B1D33}
+  .c-goog{--sec:#2F7E76}.c-cust{--sec:#1B7F4B}.c-score{--sec:#7C3AED}.c-health{--sec:#0E8A8A}.c-rep{--sec:#A16207}.c-blog{--sec:#C2410C}.c-act{--sec:#475569}.c-msg{--sec:#0B1D33}.c-doc{--sec:#0B1D33}
   .eyebrow{font-size:11px;letter-spacing:.22em;text-transform:uppercase;color:var(--sec,var(--gold));font-weight:500}
   h2{font-family:'Cormorant Garamond',Georgia,serif;font-weight:400;font-size:21px;margin:5px 0 12px;color:var(--ink)}
   .livebar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:18px 0 4px}
@@ -1126,9 +1129,18 @@ app.get('/portal/:id/:token', async (c) => {
     <div style="display:flex;align-items:baseline;gap:14px"><div style="font-family:'Cormorant Garamond',serif;font-size:52px;line-height:1">${leadsN}</div>
     <p style="color:var(--muted);font-size:14px;max-width:360px">people have contacted you through your website — each one lands in your inbox the moment it happens.</p></div></div>` : ''}
 
-  ${reports.length ? `<div class="card c-rep"><span class="eyebrow">Reports</span><h2>Your reports</h2><ul class="list">
-    ${reports.map((r) => `<li><a href="/portal/${id}/${tok}/report/${r}" target="_blank">${r.replace('.html', '')} →</a></li>`).join('')}
-  </ul></div>` : ''}
+  ${reports.length ? `<div class="card c-rep"><span class="eyebrow">Reports</span><h2>Your latest report</h2>
+    <p style="color:var(--muted);font-size:13.5px;margin-bottom:12px">The full story — where you stand on Google, what we handled, and what it's worth.</p>
+    <a class="btn" href="/portal/${id}/${tok}/report/${reports[0]}" target="_blank">Read your ${reports[0].replace('.html', '')} report →</a>
+    ${reports.length > 1 ? `<div style="margin-top:16px"><div class="note" style="margin:0 0 7px">Earlier reports</div><ul class="list">
+      ${reports.slice(1).map((r) => `<li><a href="/portal/${id}/${tok}/report/${r}" target="_blank">${r.replace('.html', '')} →</a></li>`).join('')}
+    </ul></div>` : ''}
+  </div>` : ''}
+
+  ${agrRow ? `<div class="card c-doc"><span class="eyebrow">Documents</span><h2>Your agreement</h2>
+    <p style="color:var(--muted);font-size:14px">Signed by ${escq(agrRow.signed_name)} on ${String(agrRow.signed_at).slice(0, 10)} — kept right here for your records.</p>
+    <a class="btn" style="margin-top:12px" href="/agreement/${id}/${agrTok}" target="_blank">View your signed agreement →</a>
+  </div>` : ''}
 
   ${blogs.length ? `<div class="card c-blog"><span class="eyebrow">Published For You</span><h2>Fresh on your website</h2><ul class="list">${blogs.map((b) => `<li><a href="/preview/${slug}/${b.path}" target="_blank">${b.path.replace('blog-', '').replace('.html', '').replace(/-/g, ' ')} →</a></li>`).join('')}</ul></div>` : ''}
 
@@ -1968,7 +1980,104 @@ app.get('/api/clients/:id/links', async (c) => {
     pitch: `${BASE_URL}/pitch/${id}/${await portalToken(c.env, 'pitch', id)}`,
     agreement: `${BASE_URL}/agreement/${id}/${await portalToken(c.env, 'agr', id)}`,
     gbp: `${BASE_URL}/gbp/${id}/${await portalToken(c.env, 'gbp', id)}`,
+    exit: `${BASE_URL}/exit/${id}/${await portalToken(c.env, 'exit', id)}`,
   });
+});
+
+// 📦 Exit package (tokenized download): every page of the client's website, their
+// reports, rank history, and signed agreement — one zip, theirs to keep.
+app.get('/exit/:id/:token', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'exit', id)) return c.text('Not found', 404);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.text('Not found', 404);
+  const biz = client.business_name || client.name || 'your business';
+  const slug = await slugForClient(db, id);
+  const enc = new TextEncoder();
+  const entries = [];
+  if (slug) {
+    const rows = (await db.prepare('SELECT path, content, is_base64 FROM site_files WHERE slug = ?').bind(slug).all()).results || [];
+    for (const r of rows) {
+      const data = r.is_base64 ? Uint8Array.from(atob(r.content), (ch) => ch.charCodeAt(0)) : enc.encode(r.content);
+      entries.push({ name: `website/${r.path}`, data });
+    }
+  }
+  // reports + rank history from the repo (best effort, capped)
+  try {
+    if (slug && c.env.GITHUB_TOKEN) {
+      const settings = await getSettings(db);
+      const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+      const r = await fetch(`https://api.github.com/repos/${repo}/contents/reports/${slug}`, {
+        headers: { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' } });
+      if (r.ok) {
+        for (const f of (await r.json()).slice(0, 15)) {
+          const fr = await fetch(f.download_url, { headers: { 'User-Agent': 'conversionco-mission-control' } });
+          if (fr.ok) entries.push({ name: `reports/${f.name}`, data: new Uint8Array(await fr.arrayBuffer()) });
+        }
+      }
+    }
+  } catch { /* reports are a bonus */ }
+  const agr = await db.prepare('SELECT * FROM agreements WHERE client_id = ? ORDER BY id DESC LIMIT 1').bind(id).first();
+  if (agr) entries.push({ name: 'signed-agreement.txt', data: enc.encode(
+`Service agreement — signed copy of record
+
+Business: ${biz}
+Signed by: ${agr.signed_name}
+Date signed: ${agr.signed_at} UTC
+Agreement version: ${agr.version}${agr.package ? `\nPackage: ${agr.package}` : ''}
+`) });
+  entries.push({ name: 'README.txt', data: enc.encode(
+`${biz} — your complete website package
+=========================================
+
+Everything in this folder is yours to keep.
+
+WHAT'S INSIDE
+- website/  — every page and image of your website${slug ? '' : ' (your website was hosted separately, so this folder may be empty)'}
+- reports/  — your performance reports and Google position history
+- signed-agreement.txt — your signed agreement of record
+
+USING YOUR WEBSITE
+The website folder is plain HTML — any web host can serve it exactly as-is.
+Upload the contents of the website folder to the host of your choice and point
+your domain at it. Any web designer will know exactly what to do with these files.
+
+YOUR DETAILS
+- Business: ${biz}
+- Website address: ${client.live_url || client.preview_url || '—'}
+
+It was a pleasure building for ${biz}. If you ever want us back, the door is open.
+
+— The ConversionCo Team · conversionco918.com
+`) });
+  const zip = buildZip(entries);
+  return new Response(zip, { headers: { 'Content-Type': 'application/zip',
+    'Content-Disposition': `attachment; filename="${(slug || 'website')}-complete-package.zip"` } });
+});
+
+// 📦 Offboarding (admin button): emails the departing client a warm goodbye with
+// their complete package link. Deletes nothing, archives nothing — her call after.
+app.post('/api/clients/:id/exit-package', async (c) => {
+  const id = Number(c.req.param('id'));
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'not found' }, 404);
+  const settings = await getSettings(db);
+  const url = `${BASE_URL}/exit/${id}/${await portalToken(c.env, 'exit', id)}`;
+  const first = (client.name || '').split(' ')[0] || 'there';
+  const biz = client.business_name || client.name || 'your business';
+  const sent = await emailClient(c.env, db, client, settings,
+    `Everything we built for ${biz} — yours to keep`,
+    `<p>Hi ${first},</p>
+<p>Thank you for the time we spent working on ${biz} together. Everything we built for you is yours — no strings.</p>
+<p>This link downloads your complete package: every page of your website, your performance reports, your Google position history, and your signed agreement:</p>
+<p><a href="${url}">${url}</a></p>
+<p>Any web host or designer can take it from here — the files are ready to use exactly as they are. And if you ever want us back, just reply to this email. The door is always open.</p>
+<p>Wishing you and ${biz} nothing but growth,<br>The ConversionCo Team</p>`,
+    'exit_package_sent', `📦 Exit package emailed to ${client.email} — full website + reports + agreement`);
+  if (!sent) return c.json({ error: 'Email could not be sent (check GHL settings)' }, 502);
+  return c.json({ ok: true, url });
 });
 
 app.post('/api/billing/poll', async (c) => {
