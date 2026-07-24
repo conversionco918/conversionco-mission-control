@@ -743,6 +743,26 @@ app.get('/api/reset-templates/:key', async (c) => {
   return c.json({ ok: true, cleared: keys });
 });
 
+// Keyed: prove the Google connection works (called right after Tiffany pastes the secrets)
+app.get('/api/gsc-test/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  if (!gscConfigured(c.env)) return c.json({ ok: false, configured: false, hint: 'GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REFRESH_TOKEN not all set yet' });
+  try {
+    const { gscListProperties } = await import('./google.js');
+    const props = await gscListProperties(c.env);
+    return c.json({ ok: true, configured: true, properties: props });
+  } catch (e) { return c.json({ ok: false, configured: true, error: String(e.message).slice(0, 300) }); }
+});
+
+// Keyed: run the Sunday Search Console pull on demand (first-run / catch-up)
+app.get('/api/gsc-now/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  if (!gscConfigured(c.env)) return c.json({ ok: false, configured: false });
+  const settings = await getSettings(c.env.DB);
+  await gscPullAll(c.env, settings);
+  return c.json({ ok: true, ran: true });
+});
+
 // Keyed: fire the weekly owner digest on demand (testing / catch-up)
 app.get('/api/digest-now/:key', async (c) => {
   if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
