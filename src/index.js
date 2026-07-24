@@ -597,7 +597,11 @@ app.post('/api/pushimg/:key', async (c) => {
   corsHeaders(c);
   if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
   if (!c.env.GITHUB_TOKEN) return c.json({ ok: false, error: 'GITHUB_TOKEN secret not set' });
-  const { b64, slug, name, ext = 'png' } = await c.req.json();
+  // accepts JSON or a plain form POST (form navigation is the only route past
+  // some pages' CSP — e.g. pushing a generated image out of the ChatGPT tab)
+  let f = {};
+  try { f = await c.req.json(); } catch { try { f = Object.fromEntries(Object.entries(await c.req.parseBody()).map(([k, v]) => [k, String(v)])); } catch {} }
+  const { b64, slug, name, ext = 'png' } = f;
   if (!b64 || !slug || !name) return c.json({ ok: false, error: 'b64, slug, name required' }, 400);
   if (b64.length > 11_000_000) return c.json({ ok: false, error: 'image too large' });
   const clean = b64.replace(/^data:[^,]+,/, '');
