@@ -568,7 +568,8 @@ app.post('/api/fetchimg/:key', async (c) => {
     const chunk = 0x8000;
     for (let i = 0; i < buf.length; i += chunk) bin += String.fromCharCode.apply(null, buf.subarray(i, i + chunk));
     const b64 = btoa(bin);
-    const path = `sites/${slug}/img/${name}.png`;
+    // slug 'library' targets the shared image library instead of a client site
+    const path = slug === 'library' ? `library/img/${name}.png` : `sites/${slug}/img/${name}.png`;
     const getRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
       headers: { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' },
     });
@@ -605,7 +606,8 @@ app.post('/api/pushimg/:key', async (c) => {
   const settings = await getSettings(c.env.DB);
   const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
   try {
-    const path = `sites/${slug}/img/${name}.${safeExt}`;
+    // slug 'library' targets the shared image library instead of a client site
+    const path = slug === 'library' ? `library/img/${name}.${safeExt}` : `sites/${slug}/img/${name}.${safeExt}`;
     const ghHeaders = { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
     const getRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, { headers: ghHeaders });
     const existing = getRes.ok ? await getRes.json() : null;
