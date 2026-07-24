@@ -621,12 +621,20 @@ app.post('/api/pushimg/:key', async (c) => {
       body: JSON.stringify({ message: `Add ${name}.${safeExt}`, content: clean, ...(existing?.sha ? { sha: existing.sha } : {}) }),
     });
     if (!putRes.ok) return c.json({ ok: false, error: `GitHub ${putRes.status}: ${(await putRes.text()).slice(0, 200)}` });
-    await c.env.DB.prepare(
-      `INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
-       VALUES (?, ?, ?, ?, 1, datetime('now'))
-       ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, content_type=excluded.content_type, is_base64=1, updated_at=datetime('now')`
-    ).bind(slug, `img/${name}.${safeExt}`, clean, mime).run();
-    return c.json({ ok: true, bytes: Math.floor(clean.length * 0.75), path, preview: `${BASE_URL}/preview/${slug}/img/${name}.${safeExt}` });
+    // D1 preview mirror: client sites only, and only when it fits D1's value cap.
+    // Library images live in the repo alone — builders copy them at build time.
+    let mirrored = false;
+    if (slug !== 'library' && clean.length < 1_800_000) {
+      try {
+        await c.env.DB.prepare(
+          `INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
+           VALUES (?, ?, ?, ?, 1, datetime('now'))
+           ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, content_type=excluded.content_type, is_base64=1, updated_at=datetime('now')`
+        ).bind(slug, `img/${name}.${safeExt}`, clean, mime).run();
+        mirrored = true;
+      } catch { /* repo copy is canonical; preview refreshes on next auto-publish */ }
+    }
+    return c.json({ ok: true, bytes: Math.floor(clean.length * 0.75), path, mirrored, preview: slug === 'library' ? null : `${BASE_URL}/preview/${slug}/img/${name}.${safeExt}` });
   } catch (e) {
     return c.json({ ok: false, error: e.message }, 502);
   }
