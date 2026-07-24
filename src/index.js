@@ -944,13 +944,16 @@ app.get('/portal/:id/:token', async (c) => {
     </div></div>
   </div>
 
-  ${ranks && Array.isArray(ranks.keywords) && ranks.keywords.length ? `<div class="card"><h2>Where you stand on Google 🔎</h2>
-    <p style="color:#8EA3BC;font-size:12.5px;margin-bottom:10px">Our weekly spot-check of live Google searches${ranks.checked_at ? ` · last checked ${String(ranks.checked_at).slice(0, 10)}` : ''}. Positions vary a little by searcher location — the trend is what matters.</p>
+  ${ranks && Array.isArray(ranks.keywords) && ranks.keywords.length ? `<div class="card"><h2>What page of Google you're on 🔎</h2>
+    <p style="color:#8EA3BC;font-size:12.5px;margin-bottom:10px">We run these exact searches every week${ranks.checked_at ? ` · last checked ${String(ranks.checked_at).slice(0, 10)}` : ''}. Positions can vary a little by searcher location — the trend is what matters.</p>
     <div style="display:flex;flex-direction:column;gap:10px">
-    ${ranks.keywords.map((k) => `<div style="border-bottom:1px dashed rgba(142,163,188,.25);padding-bottom:8px;">
-      <div style="font-size:13px;color:#8EA3BC;">"${String(k.kw || '').replace(/[<>&]/g, '')}"</div>
-      <div style="font-size:14.5px;margin-top:2px;"><b style="color:#C9A254">You: ${k.you ? '#' + k.you : 'not in top 10 yet'}</b>${k.competitors ? Object.entries(k.competitors).map(([n, p]) => ` · ${String(n).replace(/[<>&]/g, '')}: ${p ? '#' + p : 'not in top 10'}`).join('') : ''}</div>
-    </div>`).join('')}
+    ${ranks.keywords.map((k) => {
+      const spot = (p) => p ? `Page 1, #${p}` : 'not on Page 1 yet';
+      return `<div style="border-bottom:1px dashed rgba(142,163,188,.25);padding-bottom:8px;">
+      <div style="font-size:13px;color:#8EA3BC;">when someone searches "${String(k.kw || '').replace(/[<>&]/g, '')}"</div>
+      <div style="font-size:15px;margin-top:2px;"><b style="color:#C9A254">You: ${k.you ? '📍 ' + spot(k.you) : (k.pending ? 'your spot is waiting — tracking starts at launch' : 'not on Page 1 yet — that\\'s the target')}</b></div>
+      ${k.competitors ? `<div style="font-size:13px;color:#8EA3BC;margin-top:2px;">${Object.entries(k.competitors).map(([n, p]) => `${String(n).replace(/[<>&]/g, '')}: ${spot(p)}`).join(' · ')}</div>` : ''}
+    </div>`; }).join('')}
     </div></div>` : ''}
 
   ${reports.length ? `<div class="card"><h2>Your performance reports</h2><div class="replist" style="display:flex;flex-direction:column;gap:8px">
