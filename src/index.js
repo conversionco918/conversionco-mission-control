@@ -318,7 +318,11 @@ app.get('/preview/:slug/*', async (c) => {
     const isHtml = String(row.content_type || '').includes('text/html');
     const isBot = /bot|crawl|spider|slurp|headless|preview|monitor|lighthouse|pingdom/i.test(ua) || !ua;
     const isFrame = (c.req.header('Sec-Fetch-Dest') || '') === 'iframe';
-    if (isHtml && !isBot && !isFrame) {
+    // Tiffany's own peeks are NOT visitors — an admin session never counts.
+    // ?nocount=1 lets QA/tests view without polluting the numbers.
+    const isAdmin = await checkSession(c.env, c.req.header('Cookie'));
+    const noCount = !!c.req.query('nocount');
+    if (isHtml && !isBot && !isFrame && !isAdmin && !noCount) {
       const day = new Date().toISOString().slice(0, 10);
       c.executionCtx.waitUntil(c.env.DB.prepare(
         `INSERT INTO hits (slug, day, path, n) VALUES (?, ?, ?, 1)
@@ -328,6 +332,15 @@ app.get('/preview/:slug/*', async (c) => {
   } catch { /* counting must never break serving */ }
   const body = row.is_base64 ? Uint8Array.from(atob(row.content), (ch) => ch.charCodeAt(0)) : row.content;
   return new Response(body, { headers: { 'Content-Type': row.content_type, 'Cache-Control': 'no-cache' } });
+});
+
+// Keyed: wipe visit counts for a slug (test pollution cleanup) — true data only
+app.get('/api/clear-hits/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const slug = String(c.req.query('slug') || '');
+  if (!slug) return c.json({ ok: false, error: 'slug required' });
+  const r = await c.env.DB.prepare('DELETE FROM hits WHERE slug = ?').bind(slug).run();
+  return c.json({ ok: true, slug, deleted: r.meta ? r.meta.changes : 0 });
 });
 
 // ---------------- auth ----------------
@@ -453,12 +466,21 @@ app.get('/debug/:key', async (c) => {
     })(),
     visits: await (async () => {
       // First-party visitor counts from the hits table (bot-filtered, iframe-
-      // excluded). Per slug: this week, last 28 days, and the top page. Report
-      // engines use this for the "Visitors this week" glance tile — real numbers.
+      // excluded, admin sessions never counted). TRUE-DATA GATE: a slug only
+      // appears here when its client is GENUINELY live (live_url set) — preview
+      // traffic before launch is internal and must never reach a report.
+      // ext-<id> entries come from the pixel on an already-live external site.
       const out = {};
       try {
+        // slug → live client map
+        const metasV = (await c.env.DB.prepare(`SELECT slug, content FROM site_files WHERE path='site-meta.json'`).all()).results || [];
+        const clientsV = (await c.env.DB.prepare(`SELECT id, live_url FROM clients`).all()).results || [];
+        const liveIds = new Set(clientsV.filter((x) => x.live_url).map((x) => x.id));
+        const liveSlugs = new Set();
+        for (const m of metasV) { try { const cid = JSON.parse(m.content).client_id; if (liveIds.has(cid)) liveSlugs.add(m.slug); } catch {} }
         const rows = (await c.env.DB.prepare(`SELECT slug, day, path, n FROM hits WHERE day > date('now','-28 days')`).all()).results || [];
         for (const h of rows) {
+          if (!h.slug.startsWith('ext-') && !liveSlugs.has(h.slug)) continue;
           const o = (out[h.slug] = out[h.slug] || { week: 0, month: 0, pages: {} });
           o.month += h.n;
           if (h.day > new Date(Date.now() - 7 * 864e5).toISOString().slice(0, 10)) o.week += h.n;
@@ -1231,9 +1253,13 @@ app.get('/portal/:id/:token', async (c) => {
   const histSpanDays = hist.length >= 2 ? Math.round((Date.parse(hist[hist.length - 1].d) - Date.parse(hist[0].d)) / 86400000) : 0;
   let gscFirst = null; try { gscFirst = JSON.parse(settings[`gsc_first_${id}`] || 'null'); } catch {}
   // first-party visitor counts (our-hosted sites use the slug; externally-hosted
-  // sites use the ext-<id> pixel — see /t/:id/t.js)
+  // sites use the ext-<id> pixel — see /t/:id/t.js).
+  // TRUE-DATA GATE (Tiffany 7/24): the tile only exists once the site is genuinely
+  // public — a live domain (or pixel on their own live site). Preview peeks by us
+  // or the client are NOT "visitors"; pre-launch the tile must not appear at all.
   let visits = null;
-  {
+  const publiclyLive = !!(client.live_url) || !slug; // no-slug clients only ever get pixel data (their site is live elsewhere)
+  if (publiclyLive) {
     const hitSlug = slug || `ext-${id}`;
     const v7 = await db.prepare(`SELECT SUM(n) AS n FROM hits WHERE slug = ? AND day > date('now','-7 days')`).bind(hitSlug).first();
     const v28 = await db.prepare(`SELECT SUM(n) AS n FROM hits WHERE slug = ? AND day > date('now','-28 days')`).bind(hitSlug).first();
