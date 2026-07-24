@@ -418,13 +418,18 @@ app.get('/debug/:key', async (c) => {
     })(),
     buildQueue: await (async () => {
       const rows = (await c.env.DB.prepare(`SELECT * FROM clients WHERE stage IN ('intake2_done','generating')`).all()).results || [];
-      return rows.map((r) => {
+      const out = [];
+      for (const r of rows) {
         let b = {}; try { b = JSON.parse(r.billing || '{}'); } catch {}
-        return { id: r.id, email: r.email, name: r.name, business_name: r.business_name,
-          tier: r.tier || 'standard', theme: r.theme || '', vibe: r.vibe || '',
-          paid: depositPaid(b),
-          intake1: r.intake1_data || '', intake2: r.intake2_data || '' };
-      });
+        // ingredients the builder's completeness gate checks before cooking
+        const ph = (await c.env.DB.prepare(`SELECT COUNT(*) AS n FROM site_files WHERE slug=? AND path LIKE 'photo-%'`).bind(`_assets-${r.id}`).first())?.n || 0;
+        const lg = await c.env.DB.prepare(`SELECT 1 AS x FROM site_files WHERE slug=? AND path='logo'`).bind(`_assets-${r.id}`).first();
+        out.push({ id: r.id, email: r.email, name: r.name, business_name: r.business_name,
+          tier: r.tier || 'standard', theme: r.theme || '', vibe: r.vibe || '', vertical: r.vertical || 'iv-therapy',
+          paid: depositPaid(b), photos: ph, hasLogo: !!lg,
+          intake1: r.intake1_data || '', intake2: r.intake2_data || '' });
+      }
+      return out;
     })(),
     demoQueue: await (async () => {
       const rows = (await c.env.DB.prepare(`SELECT * FROM clients WHERE stage = 'prospect'`).all()).results || [];
@@ -2059,6 +2064,13 @@ app.post('/lead/:slug', async (c) => {
   const slug = c.req.param('slug');
   const db = c.env.DB;
   let f = {}; try { f = await c.req.json(); } catch { try { f = Object.fromEntries(Object.entries(await c.req.parseBody()).map(([k, v]) => [k, String(v)])); } catch {} }
+  // 🧪 QA marker: proves the form → worker → client mapping WITHOUT creating a
+  // lead or sending any email. Builders/tests submit name "__qa-test".
+  if (String(f.name || '') === '__qa-test' || f._qa) {
+    const metaQ = await db.prepare(`SELECT content FROM site_files WHERE slug=? AND path='site-meta.json'`).bind(slug).first();
+    let cidQ = null; try { cidQ = JSON.parse(metaQ?.content || '{}').client_id ?? null; } catch {}
+    return c.json({ ok: true, qa: true, slugKnown: !!metaQ, mapped: cidQ != null, client_id: cidQ });
+  }
   // 🛡 spam shields — both answer "ok" so bots learn nothing:
   // 1. honeypot: forms carry a hidden "website" field humans never see; bots fill it
   if (String(f.website || f._hp || '').trim()) return c.json({ ok: true });
@@ -2153,6 +2165,18 @@ app.get('/t/:id/p.gif', async (c) => {
   c.executionCtx.waitUntil(c.env.DB.prepare(`INSERT INTO hits (slug, day, path, n) VALUES (?, ?, ?, 1)
     ON CONFLICT(slug, day, path) DO UPDATE SET n = n + 1`).bind(`ext-${id}`, day, p).run());
   return c.body(GIF, 200, gifHeaders);
+});
+
+// Keyed: lead-form mapping proof for headless builders (GET — they can't POST).
+// Same truth as the __qa-test marker: does this slug accept leads for a client?
+app.get('/api/lead-qa/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const slug = String(c.req.query('slug') || '');
+  if (!slug) return c.json({ ok: false, error: 'slug required' });
+  const meta = await c.env.DB.prepare(`SELECT content FROM site_files WHERE slug=? AND path='site-meta.json'`).bind(slug).first();
+  let cid = null; try { cid = JSON.parse(meta?.content || '{}').client_id ?? null; } catch {}
+  return c.json({ ok: true, slugKnown: !!meta, mapped: cid != null, client_id: cid,
+    note: meta ? (cid != null ? 'form submissions will reach this client' : 'site imported but site-meta has no client_id — leads would be ORPHANED') : 'slug not imported yet — publishes on the next auto-publish cycle' });
 });
 
 // Keyed: Cloudflare token health — identity + zone visibility (read-only)
