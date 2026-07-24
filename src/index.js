@@ -727,6 +727,34 @@ app.get('/api/grabimg/:key', async (c) => {
 });
 
 
+// Keyed server-side file copy WITHIN the sites repo (GET so it's WebFetch-able).
+// Built for the builder: copy library images into a client's img/ folder without
+// the bytes ever leaving GitHub. Handles >1MB files via the git blob API.
+app.get('/api/copyfile/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  if (!c.env.GITHUB_TOKEN) return c.json({ ok: false, error: 'GITHUB_TOKEN secret not set' });
+  const from = String(c.req.query('from') || ''); const to = String(c.req.query('to') || '');
+  if (!from || !to) return c.json({ ok: false, error: 'from + to required' }, 400);
+  const settings = await getSettings(c.env.DB);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  const ghHeaders = { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+  const meta = await fetch(`https://api.github.com/repos/${repo}/contents/${from}`, { headers: ghHeaders });
+  if (!meta.ok) return c.json({ ok: false, error: `source not found: ${from}` }, 404);
+  const mj = await meta.json();
+  const blobRes = await fetch(`https://api.github.com/repos/${repo}/git/blobs/${mj.sha}`, { headers: ghHeaders });
+  if (!blobRes.ok) return c.json({ ok: false, error: 'blob read failed' });
+  const blob = await blobRes.json();
+  const content = String(blob.content || '').replace(/\n/g, '');
+  const destRes = await fetch(`https://api.github.com/repos/${repo}/contents/${to}`, { headers: ghHeaders });
+  const dest = destRes.ok ? await destRes.json() : null;
+  const putRes = await fetch(`https://api.github.com/repos/${repo}/contents/${to}`, {
+    method: 'PUT', headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: `copy ${from} → ${to}`, content, ...(dest && dest.sha ? { sha: dest.sha } : {}) }) });
+  if (!putRes.ok) { const out = await putRes.json().catch(() => ({}));
+    return c.json({ ok: false, error: JSON.stringify(out).slice(0, 200) }); }
+  return c.json({ ok: true, to, bytes: mj.size });
+});
+
 // Revision runner callbacks (keyed; GET so headless sessions can call via WebFetch)
 app.get('/api/revision-done/:key', async (c) => {
   if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
