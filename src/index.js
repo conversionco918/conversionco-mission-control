@@ -72,6 +72,15 @@ async function ensureSchema(db) {
   try { await db.prepare(`CREATE TABLE IF NOT EXISTS hits (
     slug TEXT NOT NULL, day TEXT NOT NULL, path TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (slug, day, path))`).run(); } catch {}
+  // email delivery log: every client-facing send recorded; failed ones retried by the cron
+  try { await db.prepare(`CREATE TABLE IF NOT EXISTS email_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER, to_email TEXT DEFAULT '',
+    subject TEXT DEFAULT '', html TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'sent',
+    attempts INTEGER NOT NULL DEFAULT 1, error TEXT DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')), sent_at TEXT DEFAULT '')`).run(); } catch {}
+  // fixed-window rate limiting for the public endpoints (lead form, portal boxes)
+  try { await db.prepare(`CREATE TABLE IF NOT EXISTS ratelimit (
+    k TEXT PRIMARY KEY, n INTEGER NOT NULL DEFAULT 0, win TEXT NOT NULL DEFAULT '')`).run(); } catch {}
   schemaReady = true;
 }
 
@@ -736,8 +745,52 @@ async function emailClient(env, db, client, settings, subject, html, eventType, 
     const contact = await ghl.upsertContact({ email: client.email, name: client.name || '' });
     await ghl.sendEmail({ contactId: contact.id || contact.contactId, subject, html, emailFrom: settings.email_from || undefined });
     if (eventType) await logEvent(db, client.id, eventType, eventDetail || subject);
+    try { await db.prepare(`INSERT INTO email_log (client_id, to_email, subject, status, sent_at) VALUES (?, ?, ?, 'sent', datetime('now'))`)
+      .bind(client.id || null, client.email, String(subject).slice(0, 200)).run(); } catch {}
     return true;
-  } catch { return false; }
+  } catch (e) {
+    // record the failure WITH the html so the cron can retry it — silence is how clients get lost
+    try { await db.prepare(`INSERT INTO email_log (client_id, to_email, subject, html, status, error) VALUES (?, ?, ?, ?, 'failed', ?)`)
+      .bind(client.id || null, client.email, String(subject).slice(0, 200), String(html).slice(0, 60000), String(e && e.message || e).slice(0, 300)).run(); } catch {}
+    try { await logEvent(db, client.id, 'email_failed', `📧⚠️ Email to ${client.email} failed ("${String(subject).slice(0, 60)}") — will retry automatically`); } catch {}
+    return false;
+  }
+}
+
+// Retry failed client emails (runs every 5 minutes; up to 4 total attempts each)
+async function retryFailedEmails(env, settings) {
+  const db = env.DB;
+  if (!env.GHL_TOKEN || !settings.ghl_location_id) return;
+  const rows = (await db.prepare(`SELECT * FROM email_log WHERE status = 'failed' AND attempts < 4 ORDER BY id LIMIT 5`).all()).results || [];
+  for (const r of rows) {
+    try {
+      const ghl = new GHL(env.GHL_TOKEN, settings.ghl_location_id);
+      const contact = await ghl.upsertContact({ email: r.to_email, name: '' });
+      await ghl.sendEmail({ contactId: contact.id || contact.contactId, subject: r.subject, html: r.html, emailFrom: settings.email_from || undefined });
+      await db.prepare(`UPDATE email_log SET status='sent', sent_at=datetime('now'), attempts=attempts+1, html='' WHERE id=?`).bind(r.id).run();
+      await logEvent(db, r.client_id, 'email_retried', `📧✅ Delivered on retry: "${String(r.subject).slice(0, 70)}" to ${r.to_email}`);
+    } catch (e) {
+      const done = (r.attempts || 1) + 1 >= 4;
+      await db.prepare(`UPDATE email_log SET attempts=attempts+1, error=?, status=? WHERE id=?`)
+        .bind(String(e && e.message || e).slice(0, 300), done ? 'dead' : 'failed', r.id).run();
+      if (done) await logEvent(db, r.client_id, 'email_failed', `📧⛔ Could not deliver after 4 tries: "${String(r.subject).slice(0, 70)}" to ${r.to_email} — needs a human look`);
+    }
+  }
+}
+
+// Fixed-window rate limit: true = allowed. Window resets every windowSec.
+async function rlOk(db, key, max, windowSec) {
+  try {
+    const win = String(Math.floor(Date.now() / (windowSec * 1000)));
+    const row = await db.prepare('SELECT n, win FROM ratelimit WHERE k = ?').bind(key).first();
+    if (!row || row.win !== win) {
+      await db.prepare(`INSERT INTO ratelimit (k, n, win) VALUES (?, 1, ?) ON CONFLICT(k) DO UPDATE SET n=1, win=excluded.win`).bind(key, win).run();
+      return true;
+    }
+    if (row.n >= max) return false;
+    await db.prepare('UPDATE ratelimit SET n = n + 1 WHERE k = ?').bind(key).run();
+    return true;
+  } catch { return true; /* never let the limiter break a real submission */ }
 }
 
 // Keyed: 🎉 Page 1 celebration — the engines call this the moment a keyword newly lands on Page 1
@@ -1124,12 +1177,14 @@ app.get('/portal/:id/:token', async (c) => {
   // 30-day before/after — only when real history spans 25+ days
   const histSpanDays = hist.length >= 2 ? Math.round((Date.parse(hist[hist.length - 1].d) - Date.parse(hist[0].d)) / 86400000) : 0;
   let gscFirst = null; try { gscFirst = JSON.parse(settings[`gsc_first_${id}`] || 'null'); } catch {}
-  // first-party visitor counts (our-hosted sites)
+  // first-party visitor counts (our-hosted sites use the slug; externally-hosted
+  // sites use the ext-<id> pixel — see /t/:id/t.js)
   let visits = null;
-  if (slug) {
-    const v7 = await db.prepare(`SELECT SUM(n) AS n FROM hits WHERE slug = ? AND day > date('now','-7 days')`).bind(slug).first();
-    const v28 = await db.prepare(`SELECT SUM(n) AS n FROM hits WHERE slug = ? AND day > date('now','-28 days')`).bind(slug).first();
-    const topP = await db.prepare(`SELECT path, SUM(n) AS n FROM hits WHERE slug = ? AND day > date('now','-28 days') AND path != 'index.html' GROUP BY path ORDER BY n DESC LIMIT 1`).bind(slug).first();
+  {
+    const hitSlug = slug || `ext-${id}`;
+    const v7 = await db.prepare(`SELECT SUM(n) AS n FROM hits WHERE slug = ? AND day > date('now','-7 days')`).bind(hitSlug).first();
+    const v28 = await db.prepare(`SELECT SUM(n) AS n FROM hits WHERE slug = ? AND day > date('now','-28 days')`).bind(hitSlug).first();
+    const topP = await db.prepare(`SELECT path, SUM(n) AS n FROM hits WHERE slug = ? AND day > date('now','-28 days') AND path != 'index.html' GROUP BY path ORDER BY n DESC LIMIT 1`).bind(hitSlug).first();
     if (v28 && Number(v28.n) > 0) visits = { w: Number(v7?.n || 0), m: Number(v28.n), top: topP ? String(topP.path).replace('.html', '').replace(/-/g, ' ') : null };
   }
   // lead inbox + client-confirmed bookings (real revenue)
@@ -1567,6 +1622,8 @@ app.post('/portal-msg/:id/:token', async (c) => {
   const id = Number(c.req.param('id'));
   if (c.req.param('token') !== await portalToken(c.env, 'portal', id)) return c.text('nope', 403);
   const db = c.env.DB;
+  if (!(await rlOk(db, `pmsg:${id}:${c.req.header('CF-Connecting-IP') || 'noip'}`, 8, 3600)))
+    return c.json({ error: "We got your earlier notes — give us a little while and we'll reply to everything at once." }, 429);
   const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
   if (!client) return c.json({ error: 'not found' }, 404);
   let f = {}; try { f = await c.req.json(); } catch {}
@@ -1626,6 +1683,8 @@ app.post('/portal-req/:id/:token', async (c) => {
   const id = Number(c.req.param('id'));
   if (c.req.param('token') !== await portalToken(c.env, 'portal', id)) return c.text('nope', 403);
   const db = c.env.DB;
+  if (!(await rlOk(db, `preq:${id}:${c.req.header('CF-Connecting-IP') || 'noip'}`, 8, 3600)))
+    return c.json({ error: "We've queued your earlier requests — give us a little while to work through those first." }, 429);
   const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
   if (!client) return c.json({ error: 'not found' }, 404);
   let f = {}; try { f = await c.req.json(); } catch {}
@@ -1653,6 +1712,8 @@ app.post('/portal-photo/:id/:token', async (c) => {
   const id = Number(c.req.param('id'));
   if (c.req.param('token') !== await portalToken(c.env, 'portal', id)) return c.text('nope', 403);
   const db = c.env.DB;
+  if (!(await rlOk(db, `pphoto:${id}:${c.req.header('CF-Connecting-IP') || 'noip'}`, 12, 3600)))
+    return c.json({ error: 'That is a lot of photos at once — give it an hour and send the rest.' }, 429);
   const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
   if (!client) return c.json({ error: 'not found' }, 404);
   let f = {}; try { f = await c.req.json(); } catch {}
@@ -1915,6 +1976,12 @@ app.post('/lead/:slug', async (c) => {
   const slug = c.req.param('slug');
   const db = c.env.DB;
   let f = {}; try { f = await c.req.json(); } catch { try { f = Object.fromEntries(Object.entries(await c.req.parseBody()).map(([k, v]) => [k, String(v)])); } catch {} }
+  // 🛡 spam shields — both answer "ok" so bots learn nothing:
+  // 1. honeypot: forms carry a hidden "website" field humans never see; bots fill it
+  if (String(f.website || f._hp || '').trim()) return c.json({ ok: true });
+  // 2. rate limit: max 5 submissions per hour per visitor per site
+  const ipL = c.req.header('CF-Connecting-IP') || 'noip';
+  if (!(await rlOk(db, `lead:${slug}:${ipL}`, 5, 3600))) return c.json({ ok: true });
   const meta = await db.prepare(`SELECT content FROM site_files WHERE slug=? AND path='site-meta.json'`).bind(slug).first();
   let clientId = null; try { clientId = JSON.parse(meta?.content || '{}').client_id ?? null; } catch {}
   // lead-source tag: explicit field (utm/?s= from the form) beats referrer sniffing
@@ -1928,6 +1995,29 @@ app.post('/lead/:slug', async (c) => {
   await db.prepare(`INSERT INTO leads (client_id, slug, name, email, phone, message, source) VALUES (?, ?, ?, ?, ?, ?, ?)`)
     .bind(clientId, slug, String(f.name || '').slice(0, 120), String(f.email || '').slice(0, 160), String(f.phone || '').slice(0, 40), String(f.message || '').slice(0, 1500), source).run();
   await logEvent(db, clientId, 'lead_received', `🔥 New lead on ${slug} (via ${source}): ${f.name || 'no name'} ${f.phone || f.email || ''}`);
+  // 📨 FORWARD EVERY LEAD TO THE CLIENT INSTANTLY — the lead is the product; it
+  // should reach the nurse's inbox in seconds, not sit in the portal unseen.
+  if (clientId) {
+    const clientFwd = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(clientId).first();
+    if (clientFwd && clientFwd.email) {
+      const settingsFwd = await getSettings(db);
+      const escF = (s) => String(s || '').replace(/[<>&]/g, '');
+      const firstFwd = (clientFwd.name || '').split(' ')[0] || 'there';
+      const purlFwd = `${BASE_URL}/portal/${clientId}/${await portalToken(c.env, 'portal', clientId)}`;
+      const nmF = escF(f.name) || 'Someone';
+      const phF = escF(f.phone); const emF = escF(f.email); const msgF = escF(String(f.message || '').slice(0, 800));
+      c.executionCtx.waitUntil(emailClient(c.env, db, clientFwd, settingsFwd,
+        `🔥 New inquiry from your website — ${nmF}`,
+        `<p>${firstFwd} — someone just reached out through your website:</p>
+<p style="font-size:17px"><b>${nmF}</b>${phF ? ` · <a href="tel:${phF}">${phF}</a>` : ''}${emF ? ` · <a href="mailto:${emF}">${emF}</a>` : ''}</p>
+${msgF ? `<blockquote style="border-left:3px solid #C9A254;padding-left:12px;color:#444">${msgF}</blockquote>` : ''}
+<p>Reaching out while it's warm makes all the difference — most people book with whoever answers first.</p>
+<p>When they book, tap <b>Booked ✓</b> next to their name in your portal so your reports count the real revenue:</p>
+<p><a href="${purlFwd}">${purlFwd}</a></p>
+<p>— The ConversionCo Team</p>`,
+        'lead_forwarded', `📨 Lead forwarded to ${clientFwd.email} in real time (${nmF})`));
+    }
+  }
   // 🎉 FIRST-LEAD CELEBRATION: the moment their website earns its first potential customer
   if (clientId) {
     const n = (await db.prepare('SELECT COUNT(*) AS n FROM leads WHERE client_id = ?').bind(clientId).first())?.n || 0;
@@ -1957,6 +2047,47 @@ app.post('/lead/:slug', async (c) => {
     } catch {}
   }
   return c.json({ ok: true });
+});
+
+// 🔎 Visitor counting for sites we DON'T host: one line pasted into their site —
+// <script defer src="<BASE>/t/<clientId>/t.js"></script> — sends a 1px beacon per
+// page view into the same hits table (slug ext-<id>), bot-filtered like /preview.
+app.get('/t/:id/t.js', (c) => {
+  const id = Number(c.req.param('id')) || 0;
+  const js = "(function(){try{var p=encodeURIComponent(location.pathname||'/');(new Image()).src='" + BASE_URL + "/t/" + id + "/p.gif?p='+p+'&r='+Date.now();}catch(e){}})();";
+  return c.body(js, 200, { 'Content-Type': 'application/javascript', 'Cache-Control': 'public, max-age=86400', 'Access-Control-Allow-Origin': '*' });
+});
+app.get('/t/:id/p.gif', async (c) => {
+  const id = Number(c.req.param('id')) || 0;
+  const GIF = Uint8Array.from(atob('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'), (ch) => ch.charCodeAt(0));
+  const gifHeaders = { 'Content-Type': 'image/gif', 'Cache-Control': 'no-store, private' };
+  const ua = c.req.header('User-Agent') || '';
+  if (!id || !ua || /bot|crawl|spider|slurp|headless|preview|monitor|lighthouse|pingdom/i.test(ua)) return c.body(GIF, 200, gifHeaders);
+  let p = String(c.req.query('p') || '/');
+  try { p = decodeURIComponent(p); } catch {}
+  p = p.replace(/^\/+/, '').replace(/\/$/, '').slice(0, 80) || 'index.html';
+  const day = new Date().toISOString().slice(0, 10);
+  c.executionCtx.waitUntil(c.env.DB.prepare(`INSERT INTO hits (slug, day, path, n) VALUES (?, ?, ?, 1)
+    ON CONFLICT(slug, day, path) DO UPDATE SET n = n + 1`).bind(`ext-${id}`, day, p).run());
+  return c.body(GIF, 200, gifHeaders);
+});
+
+// Keyed: run the nightly backup on demand (verification / before risky changes)
+app.get('/api/backup-now/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const out = await backupDatabase(c.env);
+  return c.json(out);
+});
+
+// Keyed: one-line owner alert — lets the engines (and reminders) email Tiffany
+app.get('/api/notify-owner/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const subject = String(c.req.query('subject') || '').slice(0, 150);
+  const msg = String(c.req.query('msg') || '').slice(0, 2000);
+  if (!subject) return c.json({ ok: false, error: 'subject required' });
+  const settings = await getSettings(c.env.DB);
+  const ok = await notifyOwner(c.env, settings, subject, `<p>${msg.replace(/[<>&]/g, '')}</p>`);
+  return c.json({ ok });
 });
 
 // Public portfolio feed (for the ConversionCo showcase page)
@@ -2046,6 +2177,10 @@ async function computeOverview(db, clients, settings) {
     health[cl.id] = { dot, why: why.join(' · ') || 'all good' };
   }
   for (const l of newLeads) needs.push({ id: l.client_id, sev: 3, kind: 'lead', msg: `🔥 New lead for ${l.cbiz || l.cname || 'client'}: ${l.name || l.email || l.phone || 'someone'} (${ago2(l.created_at)})` });
+  // undelivered client emails — silence here is how clients quietly get lost
+  const emailBad = (await db.prepare(`SELECT client_id, to_email, subject, status FROM email_log WHERE status IN ('failed','dead') AND created_at > datetime('now','-7 days') ORDER BY id DESC LIMIT 10`).all()).results || [];
+  for (const eb of emailBad) needs.push({ id: eb.client_id, sev: eb.status === 'dead' ? 1 : 2, kind: 'email',
+    msg: `📧 ${eb.status === 'dead' ? 'GAVE UP after 4 tries' : 'Delivery failed (auto-retrying)'} — "${String(eb.subject).slice(0, 60)}" to ${eb.to_email}` });
   needs.sort((a, b2) => a.sev - b2.sev);
   const buildProgress = {};
   for (const cl of clients) {
@@ -2398,7 +2533,7 @@ async function pollBilling(env) {
 // Manual bypass: mark paid / hosting active when handled outside Stripe (cash, Venmo, comp)
 app.post('/api/clients/:id/billing-bypass', async (c) => {
   const id = Number(c.req.param('id'));
-  const { what } = await c.req.json();
+  const { what, quiet } = await c.req.json();
   const db = c.env.DB;
   const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
   if (!client) return c.json({ error: 'client not found' }, 404);
@@ -2411,9 +2546,11 @@ app.post('/api/clients/:id/billing-bypass', async (c) => {
     await logEvent(db, id, 'invoice_paid', 'Final balance marked PAID manually (bypass — paid outside Stripe) 🔓💰');
   } else {
     billing.dep_status = 'paid'; billing.dep_bypass = true; billing.dep_paid_at = new Date().toISOString();
-    await logEvent(db, id, 'invoice_paid', '50% deposit marked PAID manually (bypass — paid outside Stripe) 🔓💰 — build unlocked');
-    const settingsB = await getSettings(db);
-    await sendPortalEmail(c.env, db, client, settingsB);
+    await logEvent(db, id, 'invoice_paid', `50% deposit marked PAID manually (bypass — paid outside Stripe) 🔓💰 — build unlocked${quiet ? ' (quiet: no portal email)' : ''}`);
+    if (!quiet) {
+      const settingsB = await getSettings(db);
+      await sendPortalEmail(c.env, db, client, settingsB);
+    }
   }
   await touchClient(db, id, { billing: JSON.stringify(billing) });
   return c.json({ ok: true });
@@ -3180,6 +3317,124 @@ async function pollForms(env, settings) {
 
 
 // ---------------- daily uptime monitoring (runs on the daily cron) ----------------
+// One-line email to Tiffany (notify_email) — used by alerts across the system
+async function notifyOwner(env, settings, subject, html) {
+  if (!settings.notify_email || !env.GHL_TOKEN || !settings.ghl_location_id) return false;
+  try {
+    const ghl = new GHL(env.GHL_TOKEN, settings.ghl_location_id);
+    const contact = await ghl.upsertContact({ email: settings.notify_email, name: 'ConversionCo Notifications' });
+    await ghl.sendEmail({ contactId: contact.id || contact.contactId, subject, html, emailFrom: settings.email_from || undefined });
+    return true;
+  } catch { return false; }
+}
+
+// 🗄 NIGHTLY BACKUP: every core table → backups/db-latest.json in the worker's own
+// repo. Git history keeps every day's version, so any date can be restored.
+async function backupDatabase(env) {
+  const db = env.DB;
+  if (!env.GITHUB_TOKEN) return { ok: false, error: 'no GITHUB_TOKEN' };
+  const dump = { at: new Date().toISOString(), tables: {} };
+  const grab = async (name, sql) => {
+    try { dump.tables[name] = (await db.prepare(sql).all()).results || []; } catch (e) { dump.tables[name] = { error: String(e.message).slice(0, 120) }; }
+  };
+  await grab('clients', 'SELECT * FROM clients');
+  await grab('settings', 'SELECT * FROM settings');
+  await grab('leads', 'SELECT * FROM leads');
+  await grab('revisions', 'SELECT * FROM revisions');
+  await grab('agreements', 'SELECT * FROM agreements');
+  await grab('events', 'SELECT * FROM events ORDER BY id DESC LIMIT 5000');
+  await grab('hits', `SELECT * FROM hits WHERE day > date('now','-90 days')`);
+  await grab('email_log', `SELECT id, client_id, to_email, subject, status, attempts, error, created_at, sent_at FROM email_log ORDER BY id DESC LIMIT 2000`);
+  // client asset library (logos + photos live ONLY in D1 — everything else is rebuildable from the sites repo)
+  await grab('site_files_assets', `SELECT * FROM site_files WHERE slug LIKE '_assets-%'`);
+  const bytes = new TextEncoder().encode(JSON.stringify(dump));
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 8192) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+  const content = btoa(bin);
+  const repo = 'conversionco918/conversionco-mission-control';
+  const api = `https://api.github.com/repos/${repo}/contents/backups/db-latest.json`;
+  const ghHeaders = { Authorization: `Bearer ${env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+  const getRes = await fetch(api, { headers: ghHeaders });
+  const existing = getRes.ok ? await getRes.json() : null;
+  const putRes = await fetch(api, { method: 'PUT', headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: `Nightly backup ${dump.at.slice(0, 10)}`, content, ...(existing && existing.sha ? { sha: existing.sha } : {}) }) });
+  if (!putRes.ok) {
+    const err = await putRes.text();
+    await logEvent(db, null, 'error', `🗄⛔ Nightly backup FAILED: HTTP ${putRes.status} ${err.slice(0, 120)}`);
+    return { ok: false, error: `HTTP ${putRes.status}` };
+  }
+  await logEvent(db, null, 'backup_done', `🗄 Nightly backup saved (${Math.round(bytes.length / 1024)} KB, ${Object.keys(dump.tables).length} tables)`);
+  return { ok: true, bytes: bytes.length };
+}
+
+// 🔑 GITHUB KEY HEALTH: runs daily. Checks the worker's token is alive, reads its
+// expiry header when GitHub provides one, and reminds about the engines' key
+// (minted ~7/22, ~90 days) starting Oct 6 — BEFORE anything silently breaks.
+async function githubTokenHealth(env) {
+  const db = env.DB;
+  const settings = await getSettings(db);
+  if (env.GITHUB_TOKEN) {
+    try {
+      const r = await fetch('https://api.github.com/user', { headers: { Authorization: `Bearer ${env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control' } });
+      if (r.status === 401 || r.status === 403) {
+        await logEvent(db, null, 'error', `🔑⛔ The worker's GitHub key is being rejected (HTTP ${r.status}) — publishing, rollback, photos, and backups are all stopped until it's replaced`);
+        await notifyOwner(env, settings, '⛔ ACTION NEEDED: Mission Control GitHub key rejected',
+          `<p>The GitHub key inside Mission Control is being rejected. Publishing, rollbacks, client photos, and nightly backups are paused until it's replaced.</p><p>Fix: GitHub → Settings → Developer settings → Personal access tokens → generate a new token for the two conversionco repos → paste it as the GITHUB_TOKEN secret in the Cloudflare worker.</p>`);
+      } else {
+        const exp = r.headers.get('github-authentication-token-expiration');
+        if (exp) {
+          const days = Math.round((Date.parse(exp) - Date.now()) / 86400000);
+          if (days <= 14 && days >= 0 && settings.gh_exp_warned !== exp) {
+            await setSetting(db, 'gh_exp_warned', exp);
+            await notifyOwner(env, settings, `🔑 Heads up: Mission Control's GitHub key expires in ${days} days`,
+              `<p>The worker's GitHub key expires <b>${exp}</b>. Two-minute fix before then: generate a replacement token on GitHub and paste it as the GITHUB_TOKEN secret in the Cloudflare worker.</p>`);
+          }
+        }
+      }
+    } catch { /* network blip — next daily run catches it */ }
+  }
+  // the report/blog engines' key (embedded in the scheduled tasks) — date-based reminder
+  const today = new Date().toISOString().slice(0, 10);
+  if (today >= '2026-10-06' && !settings.pat_reminder_sent) {
+    await setSetting(db, 'pat_reminder_sent', '1');
+    await logEvent(db, null, 'error', "🔑⏰ The engines' GitHub key (blogs/reports/rank checks) was minted ~July 22 and expires around Oct 20 — rotate it now, before the engines silently stop");
+    await notifyOwner(env, settings, "🔑 ACTION NEEDED SOON: the engines' GitHub key expires around Oct 20",
+      `<p>The GitHub key your weekly blogs, rank checks, and reports use was created around July 22 and expires around <b>October 20</b>. When it dies, those runs stop silently.</p><p>Ask Claude to "rotate the engines' GitHub key" — it knows the 5-minute procedure (new token on GitHub, then update the four scheduled tasks).</p>`);
+  }
+}
+
+// ⛑ DOWN WATCH: every 5 minutes, quick check of every LIVE client domain.
+// 2 consecutive fails (~10 min down) → one immediate alert. Recovery → one all-clear.
+async function downWatch(env, settings) {
+  const db = env.DB;
+  const clients = (await db.prepare(`SELECT * FROM clients WHERE stage = 'live' AND live_url != ''`).all()).results || [];
+  for (const client of clients) {
+    let up = true;
+    try { const r = await fetch(client.live_url, { method: 'GET', redirect: 'follow', cf: { cacheTtl: 0 } }); up = r.ok; } catch { up = false; }
+    const key = `downwatch_${client.id}`;
+    let st = {}; try { st = JSON.parse(settings[key] || '{}'); } catch {}
+    const biz = client.business_name || client.name || client.email;
+    if (up) {
+      if (st.alerted) {
+        const mins = st.since ? Math.max(5, Math.round((Date.now() - Date.parse(st.since)) / 60000)) : 0;
+        await logEvent(db, client.id, 'site_recovered', `✅ ${biz} is BACK UP after ~${mins} min`);
+        await notifyOwner(env, settings, `✅ Back up: ${biz}`, `<p><b>${biz}</b> (${client.live_url}) is reachable again after ~${mins} minutes down.</p>`);
+      }
+      if (st.fails || st.alerted) await setSetting(db, key, JSON.stringify({}));
+    } else {
+      st.fails = (st.fails || 0) + 1;
+      if (!st.since) st.since = new Date().toISOString();
+      if (st.fails >= 2 && !st.alerted) {
+        st.alerted = true;
+        await logEvent(db, client.id, 'site_down', `⛔ ${biz} has failed 2 checks in a row (~10 min) — alert sent`);
+        await notifyOwner(env, settings, `⛔ SITE DOWN: ${biz}`,
+          `<p><b>${biz}</b> (${client.live_url}) has failed two checks in a row — it has likely been unreachable for ~10 minutes.</p><p><a href="${BASE_URL}">Open Mission Control</a> · You'll get one more email when it recovers.</p>`);
+      }
+      await setSetting(db, key, JSON.stringify(st));
+    }
+  }
+}
+
 async function dailyUptime(env) {
   const db = env.DB;
   const settings = await getSettings(db);
@@ -3475,6 +3730,12 @@ export default {
       ctx.waitUntil(dailyUptime(env).catch((e) =>
         logEvent(env.DB, null, 'error', `Uptime check failed: ${e.message}`)
       ));
+      ctx.waitUntil(backupDatabase(env).catch((e) =>
+        logEvent(env.DB, null, 'error', `Backup failed: ${e.message}`)
+      ));
+      ctx.waitUntil(githubTokenHealth(env).catch((e) =>
+        logEvent(env.DB, null, 'error', `Token health check failed: ${e.message}`)
+      ));
       if (new Date(event.scheduledTime || Date.now()).getUTCDay() === 1) {
         ctx.waitUntil(weeklyOwnerDigest(env).catch((e) =>
           logEvent(env.DB, null, 'error', `Owner digest failed: ${e.message}`)
@@ -3504,6 +3765,12 @@ export default {
     ));
     ctx.waitUntil(autoNudges(env, settings).catch((e) =>
       logEvent(env.DB, null, 'error', `Auto-nudge failed: ${e.message}`)
+    ));
+    ctx.waitUntil(downWatch(env, settings).catch((e) =>
+      logEvent(env.DB, null, 'error', `Down watch failed: ${e.message}`)
+    ));
+    ctx.waitUntil(retryFailedEmails(env, settings).catch((e) =>
+      logEvent(env.DB, null, 'error', `Email retry failed: ${e.message}`)
     ));
   },
 };
