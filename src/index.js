@@ -435,6 +435,44 @@ app.get('/debug/:key', async (c) => {
   });
 });
 
+// ---- Keyed file commit → client-sites repo via the worker's own GitHub token ----
+// Two modes: {path, message, b64} writes full content; {path, message, replaces:
+// [[find, replaceWith], ...]} patches the existing file (each find must match).
+app.post('/api/commit-file/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  if (!c.env.GITHUB_TOKEN) return c.json({ ok: false, error: 'GITHUB_TOKEN secret not set' });
+  let f = {}; try { f = await c.req.json(); } catch {}
+  const path = String(f.path || '');
+  const message = String(f.message || '');
+  if (!path || !message) return c.json({ ok: false, error: 'path + message required' }, 400);
+  const settings = await getSettings(c.env.DB);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  const ghHeaders = { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+  const api = `https://api.github.com/repos/${repo}/contents/${path}`;
+  const getRes = await fetch(api, { headers: ghHeaders });
+  const existing = getRes.ok ? await getRes.json() : null;
+  let content = String(f.b64 || '');
+  if (!content && Array.isArray(f.replaces)) {
+    if (!existing || !existing.content) return c.json({ ok: false, error: 'file not found for replace mode' }, 404);
+    let text = new TextDecoder().decode(Uint8Array.from(atob(String(existing.content).replace(/\n/g, '')), (ch) => ch.charCodeAt(0)));
+    for (const pair of f.replaces) {
+      const find = String(pair[0] || ''); const repl = String(pair[1] || '');
+      if (!find || !text.includes(find)) return c.json({ ok: false, error: 'target text not found: ' + find.slice(0, 80) }, 400);
+      text = text.split(find).join(repl);
+    }
+    const bytes = new TextEncoder().encode(text);
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += 8192) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+    content = btoa(bin);
+  }
+  if (!content) return c.json({ ok: false, error: 'b64 or replaces required' }, 400);
+  const putRes = await fetch(api, { method: 'PUT', headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message, content, ...(existing && existing.sha ? { sha: existing.sha } : {}) }) });
+  const out = await putRes.json();
+  if (!putRes.ok) return c.json({ ok: false, error: JSON.stringify(out).slice(0, 300) });
+  return c.json({ ok: true, commit: (out.commit && out.commit.sha || '').slice(0, 10), path });
+});
+
 // ---- AI image generation (OpenAI) → commits PNG into the client-sites repo ----
 // Keyed endpoint so the builder can trigger it without a browser session.
 app.post('/api/genimage/:key', async (c) => {
