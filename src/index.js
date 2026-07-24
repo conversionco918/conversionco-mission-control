@@ -1177,6 +1177,10 @@ app.get('/portal/:id/:token', async (c) => {
   const score = await computeScore(db, client, settings);
   let up = null; try { up = JSON.parse(settings[`uptime_${id}`] || 'null'); } catch {}
   let billing = {}; try { billing = JSON.parse(client.billing || '{}'); } catch {}
+  // APPROVAL GATE: while the preview is held (built but Tiffany hasn't approved),
+  // the portal must not reveal it — no link, no "preview ready" stage, no events.
+  const previewHeld = client.stage === 'preview_ready' && billing.preview_hold && !billing.preview_approved;
+  const HELD_TYPES = ['preview_ready', 'auto_published', 'revision_done', 'theme_changed'];
   const slug = await slugForClient(db, id);
   const blogs = slug ? ((await db.prepare(`SELECT path FROM site_files WHERE slug=? AND path LIKE 'blog-%' ORDER BY updated_at DESC LIMIT 5`).bind(slug).all()).results || []) : [];
   const leadsN = (await db.prepare(`SELECT COUNT(*) AS n FROM leads WHERE client_id = ? AND slug != 'portal-message'`).bind(id).first())?.n || 0;
@@ -1186,7 +1190,8 @@ app.get('/portal/:id/:token', async (c) => {
     lead_received: '🔥 New lead captured from your website', preview_ready: '👀 A new version was published', hosting_active: '🛡 Hosting & security activated',
     build_started: '⚙️ Your website build is underway', invoice_paid: '💳 Payment received — thank you!',
     launched: '🚀 Your website went LIVE', page1_celebrated: '🎉 You hit Page 1 of Google', first_lead_celebrated: '🎉 Your first lead arrived' };
-  const evRows = (await db.prepare(`SELECT type, created_at FROM events WHERE client_id = ? AND type IN ('auto_published','revision_done','theme_changed','logo_uploaded','photo_uploaded','lead_received','preview_ready','hosting_active','build_started','invoice_paid','launched','page1_celebrated','first_lead_celebrated') ORDER BY id DESC LIMIT 8`).bind(id).all()).results || [];
+  let evRows = (await db.prepare(`SELECT type, created_at FROM events WHERE client_id = ? AND type IN ('auto_published','revision_done','theme_changed','logo_uploaded','photo_uploaded','lead_received','preview_ready','hosting_active','build_started','invoice_paid','launched','page1_celebrated','first_lead_celebrated') ORDER BY id DESC LIMIT 8`).bind(id).all()).results || [];
+  if (previewHeld) evRows = evRows.filter((e) => !HELD_TYPES.includes(e.type));
   // reports list + rank spot-check from GitHub (best effort)
   let reports = [], ranks = null;
   if (slug && c.env.GITHUB_TOKEN) {
@@ -1206,9 +1211,10 @@ app.get('/portal/:id/:token', async (c) => {
     } catch {}
   }
   const biz = client.business_name || client.name || 'Your Business';
-  const stageIdx = PORTAL_STAGES.findIndex(([k]) => k === client.stage);
-  const doneIdx = stageIdx === -1 ? (client.stage === 'intake2_sent' ? 2 : 0) : stageIdx;
-  const siteUrl = client.live_url || client.preview_url || '';
+  const portalStage = previewHeld ? 'generating' : client.stage;
+  const stageIdx = PORTAL_STAGES.findIndex(([k]) => k === portalStage);
+  const doneIdx = stageIdx === -1 ? (portalStage === 'intake2_sent' ? 2 : 0) : stageIdx;
+  const siteUrl = client.live_url || (previewHeld ? '' : client.preview_url) || '';
   const upPct = up && up.total ? Math.round(100 * (up.total - (up.fails || 0)) / up.total) : null;
   const tok = c.req.param('token');
   const isPremium = client.tier === 'premium';
@@ -1252,7 +1258,8 @@ app.get('/portal/:id/:token', async (c) => {
   const MILES = { client_created: 'The day we met', agreement_signed: 'You made it official', build_started: 'We started building',
     preview_ready: 'Your website took its first breath', launched: 'You went live on the web', gsc_verified: 'Google began measuring you',
     page1_celebrated: 'You reached Page 1 of Google', first_lead_celebrated: 'Your first lead arrived' };
-  const storyRows = (await db.prepare(`SELECT type, MIN(created_at) AS at FROM events WHERE client_id = ? AND type IN ('client_created','agreement_signed','build_started','preview_ready','launched','gsc_verified','page1_celebrated','first_lead_celebrated') GROUP BY type ORDER BY at`).bind(id).all()).results || [];
+  let storyRows = (await db.prepare(`SELECT type, MIN(created_at) AS at FROM events WHERE client_id = ? AND type IN ('client_created','agreement_signed','build_started','preview_ready','launched','gsc_verified','page1_celebrated','first_lead_celebrated') GROUP BY type ORDER BY at`).bind(id).all()).results || [];
+  if (previewHeld) storyRows = storyRows.filter((s) => s.type !== 'preview_ready');
   // fresh real win → one-time confetti (client-side localStorage gate)
   const winRow = await db.prepare(`SELECT type, created_at FROM events WHERE client_id = ? AND type IN ('page1_celebrated','first_lead_celebrated') AND created_at > datetime('now','-14 days') ORDER BY id DESC LIMIT 1`).bind(id).first();
   // Page One certificate — earliest genuine Page-1 event, forever
@@ -2276,6 +2283,9 @@ app.get('/portfolio.json', async (c) => {
   const settings = await getSettings(db);
   const out = [];
   for (const cl of clients) {
+    // approval gate: held previews stay out of the public portfolio too
+    let bP = {}; try { bP = JSON.parse(cl.billing || '{}'); } catch {}
+    if (cl.stage === 'preview_ready' && bP.preview_hold && !bP.preview_approved) continue;
     const score = await computeScore(db, cl, settings).catch(() => null);
     let up = null; try { up = JSON.parse(settings[`uptime_${cl.id}`] || 'null'); } catch {}
     out.push({ business: cl.business_name || cl.name, url: cl.live_url || cl.preview_url,
@@ -2353,6 +2363,10 @@ async function computeOverview(db, clients, settings) {
       if (cl.stage !== 'intake2_sent') needs.push({ id: cl.id, sev: 2, kind: 'intake2', msg: `🚀 ${label} — deposit PAID and ready: send Intake 2 to start their build` });
     }
     if (cl.stage === 'intake1_done') needs.push({ id: cl.id, sev: 3, kind: 'call', msg: `📞 ${label} — Intake 1 done, book/hold the pricing call` });
+    if (cl.stage === 'preview_ready' && b.preview_hold && !b.preview_approved) {
+      if (dot === 'green') dot = 'yellow'; why.push('preview held — awaiting your review');
+      needs.push({ id: cl.id, sev: 2, kind: 'preview', msg: `⏸ ${label} — website is BUILT and waiting on you: review the preview, then hit Send` });
+    }
     health[cl.id] = { dot, why: why.join(' · ') || 'all good' };
   }
   for (const l of newLeads) needs.push({ id: l.client_id, sev: 3, kind: 'lead', msg: `🔥 New lead for ${l.cbiz || l.cname || 'client'}: ${l.name || l.email || l.phone || 'someone'} (${ago2(l.created_at)})` });
@@ -2852,6 +2866,49 @@ app.get('/api/clients/:id/score', async (c) => {
   const settings = await getSettings(db);
   const score = await computeScore(db, client, settings);
   return c.json(score || { error: 'no site yet' });
+});
+
+// 📤 APPROVE PREVIEW — Tiffany's send button. Until this is called, the client
+// knows nothing: no reveal email, no final invoice, portal still shows "building".
+app.post('/api/clients/:id/approve-preview', async (c) => {
+  const db = c.env.DB;
+  const id = Number(c.req.param('id'));
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ ok: false, error: 'not found' }, 404);
+  if (!client.preview_url) return c.json({ ok: false, error: 'no preview to send yet' }, 400);
+  const settings = await getSettings(db);
+  const b = getBilling(client);
+  if (b.preview_approved) return c.json({ ok: true, already: true });
+  b.preview_approved = new Date().toISOString();
+  await touchClient(db, id, { billing: JSON.stringify(b) });
+  await logEvent(db, id, 'preview_approved', '📤 Tiffany approved the preview — sending it to the client now');
+  // 1) final balance invoice (was auto at publish; now rides on her approval)
+  let invoiceSent = false;
+  try {
+    if (c.env.STRIPE_SECRET_KEY && b.dep_status === 'paid' && !b.fin_id && !b.fin_status && b.invoice_status !== 'paid') {
+      const tierKey = b.invoice_tier || (client.tier === 'premium' ? 'premium' : 'standard');
+      const custId = b.customer_id || (await ensureCustomer(c.env.STRIPE_SECRET_KEY, client.email, client.name || client.business_name || '')).id;
+      const inv = await sendInvoice(c.env.STRIPE_SECRET_KEY, custId, tierKey, client.business_name || '', 'final');
+      b.customer_id = custId; b.fin_id = inv.id; b.fin_status = inv.status; b.fin_url = inv.url;
+      await touchClient(db, id, { billing: JSON.stringify(b) });
+      await logEvent(db, id, 'invoice_sent', `Preview approved — final balance invoice sent (${halfDisplay(tierKey)}) 💳`);
+      invoiceSent = true;
+    }
+  } catch (e) { await logEvent(db, id, 'error', `Final invoice send failed: ${e.message}`); }
+  // 2) the reveal email — their first look at their own website
+  const first = (client.name || '').split(' ')[0] || 'there';
+  const biz = client.business_name || client.name || 'your business';
+  const purl = `${BASE_URL}/portal/${id}/${await portalToken(c.env, 'portal', id)}`;
+  const emailed = await emailClient(c.env, db, client, settings,
+    `${biz} — your new website is ready to see 👀`,
+    `<p>Hi ${first},</p>
+     <p>It's here. Your new website for <b>${biz}</b> is built and waiting for you:</p>
+     <p style="font-size:16px;"><a href="${client.preview_url}"><b>${client.preview_url}</b></a></p>
+     <p>Click through every page — on your phone too, since that's where most of your clients will see it. If anything isn't exactly how you want it (a price, a photo, a word), just reply to this email and we'll change it. Revisions at this stage are included.</p>
+     <p>Your client portal has the full picture any time: <a href="${purl}">${purl}</a></p>
+     <p>Talk soon,<br>The ConversionCo Team</p>`,
+    'preview_sent', `📤 Preview reveal email sent to ${client.email}`);
+  return c.json({ ok: true, emailed, invoiceSent });
 });
 
 // 🛠 BUILDER HEARTBEAT — "is the machine coming for my queued builds?"
@@ -3420,19 +3477,21 @@ async function importSite(env, settings, slug, clientId, treeFiles) {
     }
     await touchClient(db, Number(clientId), { stage: 'preview_ready', preview_url: previewUrl });
     await logEvent(db, Number(clientId), 'preview_ready', previewUrl);
-    // 50/50 billing: the build is done — auto-send the final balance invoice
+    // APPROVAL GATE (Tiffany 7/24): nothing reaches the client until she approves.
+    // The final invoice + the reveal email are sent by /api/clients/:id/approve-preview.
+    // Re-publishes of an already-approved site (revisions etc.) don't re-hold.
     try {
-      const clientF = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(Number(clientId)).first();
-      const bF = getBilling(clientF);
-      if (env.STRIPE_SECRET_KEY && bF.dep_status === 'paid' && !bF.fin_id && !bF.fin_status && bF.invoice_status !== 'paid') {
-        const tierKeyF = bF.invoice_tier || (clientF.tier === 'premium' ? 'premium' : 'standard');
-        const custId = bF.customer_id || (await ensureCustomer(env.STRIPE_SECRET_KEY, clientF.email, clientF.name || clientF.business_name || '')).id;
-        const invF = await sendInvoice(env.STRIPE_SECRET_KEY, custId, tierKeyF, clientF.business_name || '', 'final');
-        bF.customer_id = custId; bF.fin_id = invF.id; bF.fin_status = invF.status; bF.fin_url = invF.url;
-        await touchClient(db, Number(clientId), { billing: JSON.stringify(bF) });
-        await logEvent(db, Number(clientId), 'invoice_sent', `Build done — final balance invoice auto-sent (${halfDisplay(tierKeyF)}) 💳`);
+      const clientH = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(Number(clientId)).first();
+      const bH = getBilling(clientH);
+      const wasLive = clP && clP.stage === 'live';
+      if (!bH.preview_approved && !wasLive) {
+        if (!bH.preview_hold) {
+          bH.preview_hold = new Date().toISOString();
+          await touchClient(db, Number(clientId), { billing: JSON.stringify(bH) });
+        }
+        await logEvent(db, Number(clientId), 'preview_held', `⏸ Preview is HELD — the client has not been told. Review it, then hit "Send preview to client" on the dashboard.`);
       }
-    } catch (e) { await logEvent(db, Number(clientId), 'error', `Final invoice auto-send failed: ${e.message}`); }
+    } catch (e) { await logEvent(db, Number(clientId), 'error', `Preview-hold flag failed: ${e.message}`); }
     if (settings.notify_email && settings.ghl_location_id) {
       try {
         const ghl = new GHL(env.GHL_TOKEN, settings.ghl_location_id);
@@ -3442,8 +3501,9 @@ async function importSite(env, settings, slug, clientId, treeFiles) {
           contactId: contact.id || contact.contactId,
           subject: `🎉 Website ready: ${client?.business_name || client?.name || slug}`,
           html: `<p>The site for <b>${client?.name || slug}</b> (${client?.email || ''}) is built and ready for your review.</p>
+                 <p><b>The client has NOT been told.</b> Nothing goes to them — no preview link, no final invoice, no portal reveal — until you approve it.</p>
                  <p><a href="${previewUrl}">View the preview</a> &middot; <a href="${BASE_URL}">Open Mission Control</a></p>
-                 <p>When you approve it, we connect the domain and go live.</p>`,
+                 <p>Happy with it? Open their card and hit <b>📤 Send preview to client</b> — that sends the reveal email and the final-balance invoice in one go.</p>`,
           emailFrom: settings.email_from || undefined,
         });
         await logEvent(db, Number(clientId), 'notified', `Notification sent to ${settings.notify_email}`);

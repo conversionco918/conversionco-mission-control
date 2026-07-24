@@ -390,7 +390,7 @@ function renderFeed() {
   if (!STATE.events.length) { f.innerHTML = '<div class="empty">Activity will appear here.</div>'; return; }
   f.innerHTML = STATE.events.map(e => `<div class="item"><b>${esc(e.client_name || e.client_email || 'System')}</b> — ${esc(pretty(e.type))}${e.detail && e.type==='error' ? `<br><span style="color:var(--red);font-size:12px">${esc(e.detail)}</span>`:''}<time>${ago(e.created_at)}</time></div>`).join('');
 }
-function pretty(t){ return ({client_created:'added to pipeline', booking_email_sent:'booking link emailed 📅', intake1_sent:'Intake 1 email sent', intake1_done:'submitted Intake 1 🎉', intake2_sent:'Intake 2 email sent', intake2_done:'submitted Intake 2 🎉', stage_changed:'stage updated', error:'⚠ error', client_deleted:'removed', webhook_received:'webhook ping', build_started:'⚙ build started', build_stalled:'⚠️ build stalled — re-queued', preview_ready:'★ preview is ready', invoice_sent:'invoice sent 💳', invoice_paid:'payment received 💰', agreement_sent:'agreement sent 📄', agreement_signed:'agreement signed ✍️', portal_invited:'portal login sent 🔑', hosting_active:'hosting active 🔒', owner_digest:'weekly digest sent 📊', sms_sent:'text sent 📱', sms_skipped:'text skipped', prospect_created:'💡 prospect added', demo_ready:'💡 demo site ready', nudge_sent:'🤖 auto-nudge sent', build_stalled:'⚠️ build stalled — re-queued', site_rolled_back:'⏪ site restored to previous version', launched:'🚀 LAUNCHED', launch_emailed:'🚀 launch email sent', page1_celebrated:'🎉 Page 1 celebration sent', first_lead_celebrated:'🎉 first-lead celebration sent', report_notified:'📬 report-ready email sent'})[t] || t; }
+function pretty(t){ return ({client_created:'added to pipeline', booking_email_sent:'booking link emailed 📅', intake1_sent:'Intake 1 email sent', intake1_done:'submitted Intake 1 🎉', intake2_sent:'Intake 2 email sent', intake2_done:'submitted Intake 2 🎉', stage_changed:'stage updated', error:'⚠ error', client_deleted:'removed', webhook_received:'webhook ping', build_started:'⚙ build started', build_stalled:'⚠️ build stalled — re-queued', preview_ready:'★ preview is ready', preview_held:'⏸ preview HELD — awaiting your approval', preview_approved:'📤 preview approved & sent', preview_sent:'📤 reveal email sent to client', invoice_sent:'invoice sent 💳', invoice_paid:'payment received 💰', agreement_sent:'agreement sent 📄', agreement_signed:'agreement signed ✍️', portal_invited:'portal login sent 🔑', hosting_active:'hosting active 🔒', owner_digest:'weekly digest sent 📊', sms_sent:'text sent 📱', sms_skipped:'text skipped', prospect_created:'💡 prospect added', demo_ready:'💡 demo site ready', nudge_sent:'🤖 auto-nudge sent', build_stalled:'⚠️ build stalled — re-queued', site_rolled_back:'⏪ site restored to previous version', launched:'🚀 LAUNCHED', launch_emailed:'🚀 launch email sent', page1_celebrated:'🎉 Page 1 celebration sent', first_lead_celebrated:'🎉 first-lead celebration sent', report_notified:'📬 report-ready email sent'})[t] || t; }
 
 async function sendExitPackage(id, btn) {
   if (!confirm('Send the exit package?\n\nThe client receives a warm goodbye email with a download link to their COMPLETE package: every website file, all reports, Google position history, and their signed agreement.\n\nNothing is deleted or archived — you stay in control of the card afterwards.')) return;
@@ -490,7 +490,16 @@ function openDrawer(id) {
         <p style="font-size:12.5px;font-weight:600;color:#0B7A6F;margin-bottom:6px;">🛠 Builder status</p>
         <div id="bstat"><button class="btn btn-ghost" style="padding:6px 12px;font-size:12px" onclick="builderStatus(${c.id})">Check the builder now</button></div>
       </div>` : ''}
-      ${c.preview_url && c.stage !== 'prospect' ? `<div class="kv"><b>Preview site</b><a href="${esc(c.preview_url)}" target="_blank">${esc(c.preview_url)}</a></div>` : ''}
+      ${c.stage === 'preview_ready' && getBillingUI(c).preview_hold && !getBillingUI(c).preview_approved ? `<div style="background:#FFFBEB;border:1.5px solid #F59E0B;border-radius:10px;padding:14px;">
+        <p style="font-size:13px;font-weight:700;color:#92400E;margin-bottom:6px;">⏸ Preview ready — HELD. The client has no idea yet.</p>
+        <p style="font-size:12px;color:#78350F;margin-bottom:10px;">No email, no invoice, and their portal still says "Designing &amp; building." Review it first, then send when you're happy.</p>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <a class="btn btn-ghost" style="padding:7px 12px;font-size:12px;text-decoration:none;" href="${esc(c.preview_url)}" target="_blank">👀 Review the preview</a>
+          <button class="btn btn-green" style="padding:7px 12px;font-size:12px;" onclick="sendPreview(${c.id}, this)">📤 Send preview to client</button>
+        </div>
+        <p style="font-size:11px;color:#a16207;margin-top:8px;">Sending = reveal email with the preview link + the final-balance invoice, together.</p>
+      </div>` : ''}
+      ${c.preview_url && c.stage !== 'prospect' ? `<div class="kv"><b>Preview site</b><a href="${esc(c.preview_url)}" target="_blank">${esc(c.preview_url)}</a>${c.stage === 'preview_ready' && getBillingUI(c).preview_approved ? ' <span style="font-size:11px;color:#15803d;font-weight:600;">📤 sent to client</span>' : ''}</div>` : ''}
       <div>
         <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Website tier — set after the pricing call</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap;">
@@ -838,6 +847,15 @@ async function billingBypass(id, what) {
   const r = await api(`/api/clients/${id}/billing-bypass`, { method:'POST', body: JSON.stringify({ what }) });
   if (r.error) return toast('⚠ ' + r.error);
   toast('Bypassed ✓ — logged in the activity feed');
+  refresh(); setTimeout(() => openDrawer(id), 400);
+}
+async function sendPreview(id, btn) {
+  if (!confirm('Send the preview to the client NOW?\n\nThis sends the reveal email with their preview link AND the final-balance invoice. Make sure you have reviewed the site first.')) return;
+  if (btn) btn.disabled = true;
+  const r = await api(`/api/clients/${id}/approve-preview`, { method:'POST' });
+  if (btn) btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error);
+  toast(r.already ? 'Already sent to the client ✓' : ('Preview sent to the client 📤' + (r.invoiceSent ? ' + final invoice 💳' : '')));
   refresh(); setTimeout(() => openDrawer(id), 400);
 }
 async function applyVibe(id, btn) {
