@@ -915,7 +915,7 @@ app.get('/portal/:id/:token', async (c) => {
   </div></div>
 
   <div class="two">
-    <div class="card"><h2>Your plan${billing.sub_status === 'active' ? ` <span class="chipA">🛡 ${billing.sub_plan === 'care399' ? 'DOMINANCE CARE' : billing.sub_plan === 'care199' ? 'GROWTH CARE' : 'PROTECTED'}</span>` : ''}</h2>
+    <div class="card"><h2>Your plan${billing.sub_status === 'active' ? ' <span class="chipA">🛡 PROTECTED</span>' : ''}</h2>
       <ul class="plan">${plan.map((p) => `<li>${p}</li>`).join('')}</ul>
     </div>
     <div class="card"><h2>Recent activity</h2><div class="feed">

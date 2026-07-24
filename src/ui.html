@@ -314,7 +314,7 @@ function renderOverview() {
   ms.innerHTML = `
     <div class="stat"><b>Cash collected</b><div class="v">$${(m.collected).toLocaleString()}</div><div class="sub">project fees paid</div></div>
     <div class="stat"><b>Outstanding</b><div class="v">$${(m.outstanding).toLocaleString()}</div><div class="sub">invoices awaiting payment</div></div>
-    <div class="stat"><b>Recurring — MRR</b><div class="v">$${m.mrr.toLocaleString()}/mo</div><div class="sub">${m.hostingCount} active care plan${m.hostingCount === 1 ? '' : 's'}</div></div>`;
+    <div class="stat"><b>Recurring — MRR</b><div class="v">$${m.mrr.toLocaleString()}/mo</div><div class="sub">${m.hostingCount} hosting subscription${m.hostingCount === 1 ? '' : 's'} × $49</div></div>`;
   ns.style.display = 'block';
   if (!ov.needs.length) {
     ns.className = 'allgood'; ns.id = 'needsStrip';
@@ -496,23 +496,14 @@ function openDrawer(id) {
             }
           }
           let host = '';
-          const PLAN_LABEL = { hosting: '🔒 Hosting & Security $49/mo', care199: '🌱 Growth Care $199/mo', care399: '👑 Dominance Care $399/mo' };
           if (b.sub_status === 'active') {
-            host = `<div style="margin-top:10px;"><span class="chip" style="background:#ecfdf5;color:#059669">${PLAN_LABEL[b.sub_plan] || PLAN_LABEL.hosting} ACTIVE</span></div>`;
+            host = `<div style="margin-top:10px;"><span class="chip" style="background:#ecfdf5;color:#059669">🔒 Hosting & security $49/mo ACTIVE</span></div>`;
           } else if (b.sub_link) {
-            host = `<div style="margin-top:10px;"><span class="chip" style="background:#fef9c3;color:#a16207">${PLAN_LABEL[b.sub_plan] || 'Care plan'} link sent — awaiting signup</span> <button class="btn btn-ghost" style="padding:6px 10px;font-size:12px" onclick="copyText('${esc(b.sub_link)}')">Copy link</button></div>`;
+            host = `<div style="margin-top:10px;"><span class="chip" style="background:#fef9c3;color:#a16207">Hosting link sent — awaiting signup</span> <button class="btn btn-ghost" style="padding:6px 10px;font-size:12px" onclick="copyText('${esc(b.sub_link)}')">Copy link</button></div>`;
           } else if (c.stage === 'preview_ready' || c.stage === 'live') {
-            host = `<div style="margin-top:10px;">
-              <p style="font-size:12px;font-weight:600;color:#334155;margin-bottom:6px;">Start their monthly care plan (your end-of-process confirm):</p>
-              <div style="display:flex;gap:6px;flex-wrap:wrap;">
-                <button class="btn btn-ghost" onclick="startHosting(${c.id}, this, 'hosting')">🔒 $49 Hosting</button>
-                <button class="btn btn-primary" onclick="startHosting(${c.id}, this, 'care199')">🌱 $199 Growth</button>
-                <button class="btn btn-primary" style="background:#7c3aed" onclick="startHosting(${c.id}, this, 'care399')">👑 $399 Dominance</button>
-              </div>
-              <p style="font-size:11px;color:#94a3b8;margin-top:4px;">Growth = hosting + monthly content & review management · Dominance = everything + quarterly refresh + priority.</p>
-            </div>`;
+            host = `<div style="margin-top:10px;"><button class="btn btn-primary" onclick="startHosting(${c.id}, this)">🔒 Start $49/mo hosting & security</button><p style="font-size:11px;color:#94a3b8;margin-top:4px;">Your end-of-process confirm — creates a Stripe signup link to send the client.</p></div>`;
           } else {
-            host = `<p style="font-size:11px;color:#94a3b8;margin-top:8px;">Care plans ($49/$199/$399) start at the end — buttons appear when the site is ready.</p>`;
+            host = `<p style="font-size:11px;color:#94a3b8;margin-top:8px;">$49/mo hosting starts at the end — the button appears when the site is ready.</p>`;
           }
           const links = [];
           if (!legacyPaid && b.dep_status !== 'paid') links.push(`<a href="#" onclick="billingBypass(${c.id},'deposit');return false;">mark deposit paid</a>`);
@@ -700,16 +691,14 @@ async function sendStripeInvoice(id, btn, which) {
   toast(`${label[0].toUpperCase() + label.slice(1)} invoice sent — ${r.display} 💳 (Stripe emails the client)`);
   refresh(); setTimeout(() => openDrawer(id), 400);
 }
-async function startHosting(id, btn, plan) {
-  plan = plan || 'hosting';
-  const names = { hosting: '$49/mo Hosting & Security', care199: '$199/mo Growth Care', care399: '$399/mo Dominance Care' };
-  if (!confirm(`Create the ${names[plan]} signup link for this client?`)) return;
+async function startHosting(id, btn) {
+  if (!confirm('Create the $49/mo hosting & security signup link for this client?')) return;
   btn.disabled = true;
-  const r = await api(`/api/clients/${id}/hosting`, { method:'POST', body: JSON.stringify({ plan }) });
+  const r = await api(`/api/clients/${id}/hosting`, { method:'POST', body: '{}' });
   btn.disabled = false;
   if (r.error) return toast('⚠ ' + r.error);
   copyText(r.url);
-  toast(`${names[plan]} link created & copied 🔒 — text or email it to the client`);
+  toast('Hosting signup link created & copied 🔒 — text or email it to the client');
   refresh(); setTimeout(() => openDrawer(id), 400);
 }
 function copyText(t){ navigator.clipboard?.writeText(t).catch(()=>{}); }
