@@ -852,14 +852,22 @@ app.get('/portal/:id/:token', async (c) => {
     lead_received: '🔥 New lead captured from your website', preview_ready: '👀 A new version was published', hosting_active: '🛡 Hosting & security activated',
     build_started: '⚙️ Your website build is underway', invoice_paid: '💳 Payment received — thank you!' };
   const evRows = (await db.prepare(`SELECT type, created_at FROM events WHERE client_id = ? AND type IN ('auto_published','revision_done','theme_changed','logo_uploaded','photo_uploaded','lead_received','preview_ready','hosting_active','build_started','invoice_paid') ORDER BY id DESC LIMIT 8`).bind(id).all()).results || [];
-  // reports list from GitHub (best effort)
-  let reports = [];
+  // reports list + rank spot-check from GitHub (best effort)
+  let reports = [], ranks = null;
   if (slug && c.env.GITHUB_TOKEN) {
     try {
       const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
       const r = await fetch(`https://api.github.com/repos/${repo}/contents/reports/${slug}`, {
         headers: { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' } });
-      if (r.ok) reports = (await r.json()).filter((f) => f.name.endsWith('.html')).map((f) => f.name).sort().reverse().slice(0, 6);
+      if (r.ok) {
+        const files = await r.json();
+        reports = files.filter((f) => f.name.endsWith('.html')).map((f) => f.name).sort().reverse().slice(0, 6);
+        const rj = files.find((f) => f.name === 'ranks.json');
+        if (rj) {
+          const rr = await fetch(rj.download_url, { headers: { 'User-Agent': 'conversionco-mission-control' } });
+          if (rr.ok) { try { ranks = await rr.json(); } catch {} }
+        }
+      }
     } catch {}
   }
   const biz = client.business_name || client.name || 'Your Business';
@@ -935,6 +943,15 @@ app.get('/portal/:id/:token', async (c) => {
       ${evRows.length ? evRows.map((e) => `<div>${FRIENDLY[e.type] || e.type}<time>${e.created_at} UTC</time></div>`).join('') : '<p style="color:#8EA3BC;font-size:13.5px">Activity appears here as we work.</p>'}
     </div></div>
   </div>
+
+  ${ranks && Array.isArray(ranks.keywords) && ranks.keywords.length ? `<div class="card"><h2>Where you stand on Google 🔎</h2>
+    <p style="color:#8EA3BC;font-size:12.5px;margin-bottom:10px">Our weekly spot-check of live Google searches${ranks.checked_at ? ` · last checked ${String(ranks.checked_at).slice(0, 10)}` : ''}. Positions vary a little by searcher location — the trend is what matters.</p>
+    <div style="display:flex;flex-direction:column;gap:10px">
+    ${ranks.keywords.map((k) => `<div style="border-bottom:1px dashed rgba(142,163,188,.25);padding-bottom:8px;">
+      <div style="font-size:13px;color:#8EA3BC;">"${String(k.kw || '').replace(/[<>&]/g, '')}"</div>
+      <div style="font-size:14.5px;margin-top:2px;"><b style="color:#C9A254">You: ${k.you ? '#' + k.you : 'not in top 10 yet'}</b>${k.competitors ? Object.entries(k.competitors).map(([n, p]) => ` · ${String(n).replace(/[<>&]/g, '')}: ${p ? '#' + p : 'not in top 10'}`).join('') : ''}</div>
+    </div>`).join('')}
+    </div></div>` : ''}
 
   ${reports.length ? `<div class="card"><h2>Your performance reports</h2><div class="replist" style="display:flex;flex-direction:column;gap:8px">
     ${reports.map((r) => `<a href="/portal/${id}/${tok}/report/${r}" target="_blank">📊 ${r.replace('.html', '')}</a>`).join('')}
