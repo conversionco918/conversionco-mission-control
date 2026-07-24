@@ -2125,16 +2125,26 @@ app.get('/t/:id/p.gif', async (c) => {
   return c.body(GIF, 200, gifHeaders);
 });
 
-// Keyed: Cloudflare token health — can it list zones? (read-only, mutates nothing)
+// Keyed: Cloudflare token health — identity + zone visibility (read-only)
 app.get('/api/cf-check/:key', async (c) => {
   if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
   if (!c.env.CLOUDFLARE_API_TOKEN) return c.json({ ok: false, error: 'no token set' });
-  try {
-    const res = await fetch('https://api.cloudflare.com/client/v4/zones?per_page=50', {
+  const cfGet = async (p) => {
+    const res = await fetch(`https://api.cloudflare.com/client/v4${p}`, {
       headers: { Authorization: `Bearer ${c.env.CLOUDFLARE_API_TOKEN}` } });
-    const data = await res.json();
-    if (!data.success) return c.json({ ok: false, canListZones: false, error: JSON.stringify(data.errors || []).slice(0, 200) });
-    return c.json({ ok: true, canListZones: true, zones: (data.result || []).map((z) => ({ name: z.name, status: z.status })) });
+    return res.json().catch(() => ({}));
+  };
+  try {
+    const verify = await cfGet('/user/tokens/verify');
+    const accounts = await cfGet('/accounts');
+    const zones = await cfGet('/zones?per_page=50');
+    return c.json({
+      ok: true,
+      tokenId: verify && verify.result ? verify.result.id : null,
+      tokenStatus: verify && verify.result ? verify.result.status : (verify.errors ? JSON.stringify(verify.errors).slice(0, 150) : 'unknown'),
+      accounts: accounts && accounts.success ? (accounts.result || []).map((a) => ({ name: a.name, id: a.id })) : 'cannot list',
+      zones: zones && zones.success ? (zones.result || []).map((z) => ({ name: z.name, status: z.status, account: z.account && z.account.name })) : 'cannot list: ' + JSON.stringify(zones.errors || []).slice(0, 150),
+    });
   } catch (e) { return c.json({ ok: false, error: String(e.message).slice(0, 150) }); }
 });
 
