@@ -1042,7 +1042,7 @@ app.get('/portal/:id/:token', async (c) => {
   let billing = {}; try { billing = JSON.parse(client.billing || '{}'); } catch {}
   const slug = await slugForClient(db, id);
   const blogs = slug ? ((await db.prepare(`SELECT path FROM site_files WHERE slug=? AND path LIKE 'blog-%' ORDER BY updated_at DESC LIMIT 5`).bind(slug).all()).results || []) : [];
-  const leadsN = (await db.prepare('SELECT COUNT(*) AS n FROM leads WHERE client_id = ?').bind(id).first())?.n || 0;
+  const leadsN = (await db.prepare(`SELECT COUNT(*) AS n FROM leads WHERE client_id = ? AND slug != 'portal-message'`).bind(id).first())?.n || 0;
   const revsN = (await db.prepare(`SELECT COUNT(*) AS n FROM revisions WHERE client_id = ? AND status = 'done'`).bind(id).first())?.n || 0;
   const FRIENDLY = { auto_published: '🚀 Website updated & republished', revision_done: '✅ A requested change was completed',
     theme_changed: '🎨 Fresh look applied to your site', logo_uploaded: '🖼 Your logo was added', photo_uploaded: '📷 New photo added to your site',
@@ -1133,7 +1133,7 @@ app.get('/portal/:id/:token', async (c) => {
     if (v28 && Number(v28.n) > 0) visits = { w: Number(v7?.n || 0), m: Number(v28.n), top: topP ? String(topP.path).replace('.html', '').replace(/-/g, ' ') : null };
   }
   // lead inbox + client-confirmed bookings (real revenue)
-  const leadRows = (await db.prepare(`SELECT id AS lid, name, email, phone, message, source, status, created_at FROM leads WHERE client_id = ? ORDER BY id DESC LIMIT 12`).bind(id).all()).results || [];
+  const leadRows = (await db.prepare(`SELECT id AS lid, name, email, phone, message, source, status, created_at FROM leads WHERE client_id = ? AND slug != 'portal-message' ORDER BY id DESC LIMIT 12`).bind(id).all()).results || [];
   const bookedN = Number((await db.prepare(`SELECT COUNT(*) AS n FROM leads WHERE client_id = ? AND status = 'booked'`).bind(id).first())?.n || 0);
   let avgPrice = 0;
   if (slug) {
@@ -1722,7 +1722,7 @@ app.post('/portal-lead/:id/:token', async (c) => {
   if (!lid) return c.json({ error: 'no lead' }, 400);
   const raw = String(f.status || '');
   const status = raw === 'booked' ? 'booked' : raw === 'no' ? 'no' : '';
-  const res = await db.prepare('UPDATE leads SET status = ? WHERE id = ? AND client_id = ?').bind(status, lid, id).run();
+  const res = await db.prepare(`UPDATE leads SET status = ? WHERE id = ? AND client_id = ? AND slug != 'portal-message'`).bind(status, lid, id).run();
   if (!res.meta || res.meta.changes === 0) return c.json({ error: 'not found' }, 404);
   if (status === 'booked') {
     await logEvent(db, id, 'lead_booked', `💰 Client marked a lead as BOOKED (lead #${lid})`);
