@@ -2430,7 +2430,8 @@ async function computeOverview(db, clients, settings) {
   for (const cl of clients) {
     if (cl.stage !== 'generating') continue;
     let prog = {}; try { prog = JSON.parse(settings[`buildprog_${cl.id}`] || '{}'); } catch {}
-    buildProgress[cl.id] = { pct: prog.pct || 5, step: prog.step || 'Build started', started_at: prog.started_at || cl.updated_at };
+    buildProgress[cl.id] = { pct: prog.pct || 5, step: prog.step || 'Build started', started_at: prog.started_at || cl.updated_at,
+      updated_at: prog.updated_at || prog.started_at || cl.updated_at };
   }
   return { money: { collected, outstanding, hostingCount, mrr: Math.round(mrrTotal) }, needs: needs.slice(0, 12), health, buildProgress };
 }
@@ -2965,27 +2966,35 @@ app.post('/api/clients/:id/approve-preview', async (c) => {
 // 🔥 FIRE ANYWAY — Tiffany's manual override. Writes a fire-request flag into the
 // sites repo; Claude's standing watch sees the commit within ~a minute and kicks
 // the builder immediately instead of waiting for the next hourly alarm.
-app.post('/api/fire-builder', async (c) => {
-  const db = c.env.DB;
-  if (!c.env.GITHUB_TOKEN) return c.json({ ok: false, error: 'GITHUB_TOKEN secret not set' });
+// Shared fire-cord: commit a fire-request flag to the mission-control repo's
+// fire-signal branch (NOT main — no deploys). Claude's standing watch sees the
+// branch move within ~a minute and kicks/does the build. Used by the dashboard
+// button AND by queueWatch's automatic stall recovery.
+async function fireSignal(env, db, by) {
+  if (!env.GITHUB_TOKEN) return { ok: false, error: 'GITHUB_TOKEN secret not set' };
   const rows = (await db.prepare(`SELECT id, business_name, name, stage FROM clients WHERE stage IN ('intake2_done','generating')`).all()).results || [];
-  const payload = { requested_at: new Date().toISOString(), by: 'dashboard fire button',
+  const payload = { requested_at: new Date().toISOString(), by,
     waiting: rows.map((r) => ({ id: r.id, biz: r.business_name || r.name, stage: r.stage })) };
-  // Flag lives on the mission-control repo's fire-signal branch (NOT main — no
-  // deploys) because Claude's sandbox can watch this repo but not the sites repo.
-  const ghHeaders = { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+  const ghHeaders = { Authorization: `Bearer ${env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
   const api = `https://api.github.com/repos/conversionco918/conversionco-mission-control/contents/fire-requests/latest.json`;
   const getRes = await fetch(api + '?ref=fire-signal', { headers: ghHeaders });
   const existing = getRes.ok ? await getRes.json() : null;
   const bytes = new TextEncoder().encode(JSON.stringify(payload, null, 2));
   let bin = ''; for (let i = 0; i < bytes.length; i += 8192) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
   const putRes = await fetch(api, { method: 'PUT', headers: { ...ghHeaders, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message: `🔥 FIRE BUILDER requested from dashboard (${payload.waiting.length} waiting)`,
+    body: JSON.stringify({ message: `🔥 FIRE BUILDER — ${by} (${payload.waiting.length} waiting)`,
       branch: 'fire-signal', content: btoa(bin), ...(existing && existing.sha ? { sha: existing.sha } : {}) }) });
   if (!putRes.ok) { const out = await putRes.json().catch(() => ({}));
-    return c.json({ ok: false, error: ('flag commit failed: ' + JSON.stringify(out)).slice(0, 200) }); }
-  await logEvent(db, null, 'fire_requested', `🔥 Manual builder fire requested from the dashboard (${payload.waiting.length} client(s) waiting)`);
-  return c.json({ ok: true, waiting: payload.waiting.length });
+    return { ok: false, error: ('flag commit failed: ' + JSON.stringify(out)).slice(0, 200) }; }
+  return { ok: true, waiting: payload.waiting.length };
+}
+
+app.post('/api/fire-builder', async (c) => {
+  const db = c.env.DB;
+  const r = await fireSignal(c.env, db, 'dashboard fire button');
+  if (!r.ok) return c.json(r);
+  await logEvent(db, null, 'fire_requested', `🔥 Manual builder fire requested from the dashboard (${r.waiting} client(s) waiting)`);
+  return c.json(r);
 });
 
 // 🛠 BUILDER HEARTBEAT — "is the machine coming for my queued builds?"
@@ -3817,11 +3826,13 @@ async function queueWatch(env, settings) {
   const now = Date.now();
   // paid + intake2_done clients waiting on a build for 90+ minutes
   const waiting = (await db.prepare(`SELECT * FROM clients WHERE stage = 'intake2_done'`).all()).results || [];
+  let anyStalled = false;
   for (const cl of waiting) {
     let b = {}; try { b = JSON.parse(cl.billing || '{}'); } catch {}
     if (!depositPaid(b)) continue;
     const readyAt = Date.parse((cl.updated_at || '').replace(' ', 'T') + 'Z') || now;
     if (now - readyAt < 90 * 60 * 1000) continue;
+    anyStalled = true;
     const last = Number(settings[`qw_build_${cl.id}`] || 0);
     if (now - last < 12 * 60 * 60 * 1000) continue;
     await setSetting(db, `qw_build_${cl.id}`, String(now));
@@ -3829,7 +3840,19 @@ async function queueWatch(env, settings) {
     const hrs = Math.round((now - readyAt) / 3600000 * 10) / 10;
     await logEvent(db, cl.id, 'error', `🚨 BUILD STALLED: ${biz} has been paid + build-ready for ~${hrs}h with no build started — the builder task may not be running`);
     await notifyOwner(env, settings, `🚨 Build stalled: ${biz} is waiting`,
-      `<p><b>${biz}</b> paid their deposit and finished intake ~${hrs} hours ago, but no build has started. The scheduled builder may be stuck.</p><p>Fast fixes: open the auto-builder scheduled task in your Claude app and check its last run — or open a Claude session and say "build client ${cl.id} now".</p>`);
+      `<p><b>${biz}</b> paid their deposit and finished intake ~${hrs} hours ago, but no build has started. The scheduled builder may be stuck.</p><p>The system is auto-pulling the fire cord every hour until it builds. Backup: open a Claude session and say "build client ${cl.id} now".</p>`);
+  }
+  // SELF-HEALING (7/25): a stalled paid build auto-pulls the fire cord hourly —
+  // same signal as the dashboard 🔥 button — until someone picks it up.
+  if (anyStalled) {
+    const lastFire = Number(settings.qw_autofire || 0);
+    if (now - lastFire > 55 * 60 * 1000) {
+      await setSetting(db, 'qw_autofire', String(now));
+      const r = await fireSignal(env, db, 'AUTO: stalled build recovery').catch((e) => ({ ok: false, error: e.message }));
+      await logEvent(db, null, 'fire_requested', r.ok
+        ? `🔥 AUTO-FIRE: stalled build detected — fire cord pulled automatically (${r.waiting} waiting)`
+        : `⚠️ Auto-fire failed: ${r.error}`);
+    }
   }
   // revisions pending for 2+ hours (the runner fires hourly — 2h late = stalled)
   const oldRevs = (await db.prepare(`SELECT r.*, c.business_name FROM revisions r LEFT JOIN clients c ON c.id = r.client_id WHERE r.status = 'pending' AND r.created_at < datetime('now','-2 hours')`).all()).results || [];

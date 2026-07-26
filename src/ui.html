@@ -310,6 +310,13 @@ function buildBar(c) {
   const pct = Math.round(Math.min(97, Math.max(p.pct || 5, timePct)));
   const left = Math.ceil(BUILD_MINUTES - elapsedMin);
   const eta = elapsedMin >= BUILD_MINUTES ? 'finishing up…' : `~${Math.max(1, left)} min left`;
+  // HONESTY GUARD: a dead build must never look like it's "finishing up".
+  const lastBeat = Date.parse((p.updated_at || p.started_at || '') + (String(p.updated_at || p.started_at || '').includes('Z') ? '' : 'Z'));
+  const quietMin = isNaN(lastBeat) ? null : Math.round((Date.now() - lastBeat) / 60000);
+  if (quietMin !== null && quietMin >= 20) {
+    return `<div class="bprog"><div class="track"><div class="fill" style="width:${pct}%;background:#F59E0B;"></div></div>
+      <div class="blabel"><span style="color:#B45309;font-weight:600;">⚠️ Builder went quiet ${quietMin} min ago</span><span>auto-requeue + re-fire is coming</span></div></div>`;
+  }
   return `<div class="bprog"><div class="track"><div class="fill" style="width:${pct}%"></div></div>
     <div class="blabel"><span>⚙ ${esc(p.step || 'Building')}</span><span>${pct}% · ${eta}</span></div></div>`;
 }
