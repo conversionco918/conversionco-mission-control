@@ -69,6 +69,7 @@ async function ensureSchema(db) {
   try { await db.prepare(`ALTER TABLE leads ADD COLUMN status TEXT DEFAULT ''`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN competitors TEXT DEFAULT ''`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN vertical TEXT DEFAULT ''`).run(); } catch {}
+  try { await db.prepare(`ALTER TABLE site_files ADD COLUMN gh_sha TEXT DEFAULT ''`).run(); } catch {}
   // first-party visitor counting: one row per site/day/page (HTML views only, bots skipped)
   try { await db.prepare(`CREATE TABLE IF NOT EXISTS hits (
     slug TEXT NOT NULL, day TEXT NOT NULL, path TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0,
@@ -638,8 +639,12 @@ app.post('/api/fetchimg/:key', async (c) => {
     const chunk = 0x8000;
     for (let i = 0; i < buf.length; i += chunk) bin += String.fromCharCode.apply(null, buf.subarray(i, i + chunk));
     const b64 = btoa(bin);
-    // slug 'library' targets the shared image library instead of a client site
-    const path = slug === 'library' ? `library/img/${name}.png` : `sites/${slug}/img/${name}.png`;
+    // slug 'library' targets the shared image library instead of a client site.
+    // Respect an extension the caller already provided (jpg/webp/etc); default .png.
+    const extMatch = name.match(/\.(png|jpe?g|webp|gif|svg)$/i);
+    const fname = extMatch ? name : `${name}.png`;
+    const fmime = extMatch ? (MIME[extMatch[1].toLowerCase() === 'jpg' ? 'jpg' : extMatch[1].toLowerCase()] || 'image/png') : 'image/png';
+    const path = slug === 'library' ? `library/img/${fname}` : `sites/${slug}/img/${fname}`;
     const getRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
       headers: { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' },
     });
@@ -647,14 +652,14 @@ app.post('/api/fetchimg/:key', async (c) => {
     const putRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
       method: 'PUT',
       headers: { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: `Add ${name}.png`, content: b64, ...(existing?.sha ? { sha: existing.sha } : {}) }),
+      body: JSON.stringify({ message: `Add ${fname}`, content: b64, ...(existing?.sha ? { sha: existing.sha } : {}) }),
     });
     if (!putRes.ok) return c.json({ ok: false, error: `GitHub ${putRes.status}` });
     await c.env.DB.prepare(
       `INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
-       VALUES (?, ?, ?, 'image/png', 1, datetime('now'))
+       VALUES (?, ?, ?, ?, 1, datetime('now'))
        ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, is_base64=1, updated_at=datetime('now')`
-    ).bind(slug, `img/${name}.png`, b64).run();
+    ).bind(slug, `img/${fname}`, b64, fmime).run();
     return c.json({ ok: true, bytes: buf.length, path });
   } catch (e) {
     return c.json({ ok: false, error: e.message }, 502);
@@ -748,6 +753,30 @@ app.get('/api/readfile/:key', async (c) => {
   }
   const text = new TextDecoder().decode(Uint8Array.from(atob(content.replace(/\n/g, '')), (ch) => ch.charCodeAt(0)));
   return c.text(text.slice(0, 200000));
+});
+
+// Keyed file DELETE from the sites repo (GET, WebFetch-able) — repo hygiene:
+// removes stray/retired files so imports stay lean. Also cleans the D1 mirror.
+app.get('/api/deletefile/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  if (!c.env.GITHUB_TOKEN) return c.json({ ok: false, error: 'GITHUB_TOKEN secret not set' });
+  const path = String(c.req.query('path') || '');
+  if (!path || path.includes('..')) return c.json({ ok: false, error: 'valid path required' }, 400);
+  if (/site-meta\.json$|^tools\/|^reports\/_template\//.test(path)) return c.json({ ok: false, error: 'protected path' }, 400);
+  const settings = await getSettings(c.env.DB);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  const ghHeaders = { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+  const meta = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, { headers: ghHeaders });
+  if (!meta.ok) return c.json({ ok: false, error: `not found: ${path}` }, 404);
+  const mj = await meta.json();
+  const delRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+    method: 'DELETE', headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: `🧹 remove ${path}`, sha: mj.sha }) });
+  if (!delRes.ok) { const out = await delRes.json().catch(() => ({}));
+    return c.json({ ok: false, error: JSON.stringify(out).slice(0, 200) }); }
+  const m2 = path.match(/^sites\/([^/]+)\/(.+)$/);
+  if (m2) await c.env.DB.prepare('DELETE FROM site_files WHERE slug = ? AND path = ?').bind(m2[1], m2[2]).run();
+  return c.json({ ok: true, deleted: path });
 });
 
 // Keyed server-side file copy WITHIN the sites repo (GET so it's WebFetch-able).
@@ -3534,8 +3563,22 @@ async function importSite(env, settings, slug, clientId, treeFiles) {
   }
   if (!files.length) throw new Error(`No files for ${slug}`);
   const prefix = `sites/${slug}/`;
+  // SHA-AWARE INCREMENTAL IMPORT (7/26): only fetch blobs that actually changed,
+  // cap the per-invocation blob fetches (CF subrequest budget), and let the */5
+  // cron finish big imports across ticks. Returns {complete} so callers only
+  // mark the site published when every file is in.
+  const BLOB_BUDGET = 25;
+  const existingRows = (await db.prepare('SELECT path, gh_sha FROM site_files WHERE slug = ?').bind(slug).all()).results || [];
+  const haveSha = {}; for (const r of existingRows) haveSha[r.path] = r.gh_sha || '';
+  const wantPaths = new Set(files.map((f) => f.path.slice(prefix.length)));
+  // remove D1 rows for files deleted from the repo (cheap — no subrequests)
+  for (const r of existingRows) if (!wantPaths.has(r.path)) {
+    await db.prepare('DELETE FROM site_files WHERE slug = ? AND path = ?').bind(slug, r.path).run();
+  }
+  const changed = files.filter((f) => haveSha[f.path.slice(prefix.length)] !== f.sha);
+  const batch = changed.slice(0, BLOB_BUDGET);
   let count = 0;
-  for (const f of files) {
+  for (const f of batch) {
     const blob = await gh(`/repos/${repo}/git/blobs/${f.sha}`);
     const rel = f.path.slice(prefix.length);
     const ext = (rel.split('.').pop() || '').toLowerCase();
@@ -3545,12 +3588,18 @@ async function importSite(env, settings, slug, clientId, treeFiles) {
       ? new TextDecoder().decode(Uint8Array.from(atob(blob.content.replace(/\n/g, '')), (ch) => ch.charCodeAt(0)))
       : blob.content.replace(/\n/g, '');
     await db.prepare(
-      `INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
-       VALUES (?, ?, ?, ?, ?, datetime('now'))
+      `INSERT INTO site_files (slug, path, content, content_type, is_base64, gh_sha, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
        ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, content_type=excluded.content_type,
-       is_base64=excluded.is_base64, updated_at=datetime('now')`
-    ).bind(slug, rel, content, ctype, isText ? 0 : 1).run();
+       is_base64=excluded.is_base64, gh_sha=excluded.gh_sha, updated_at=datetime('now')`
+    ).bind(slug, rel, content, ctype, isText ? 0 : 1, f.sha).run();
     count++;
+  }
+  const remaining = changed.length - batch.length;
+  if (remaining > 0) {
+    await logEvent(db, clientId ? Number(clientId) : null, 'import_progress',
+      `📦 ${slug}: imported ${count} changed file(s) this pass — ${remaining} to go (continues automatically within 5 min)`);
+    return { files: count, remaining, complete: false, preview_url: `${BASE_URL}/preview/${slug}/` };
   }
   const previewUrl = `${BASE_URL}/preview/${slug}/`;
   if (clientId) {
@@ -3598,7 +3647,7 @@ async function importSite(env, settings, slug, clientId, treeFiles) {
       }
     }
   }
-  return { files: count, preview_url: previewUrl };
+  return { files: count, complete: true, preview_url: previewUrl };
 }
 
 // Cron: auto-publish any new/updated site pushed to the client-sites repo
@@ -3622,7 +3671,8 @@ async function autoPublish(env, settings) {
       const meta = JSON.parse(new TextDecoder().decode(
         Uint8Array.from(atob(metaBlob.content.replace(/\n/g, '')), (ch) => ch.charCodeAt(0))));
       const files = blobs.filter((t) => t.path.startsWith(`sites/${slug}/`));
-      await importSite(env, settings, slug, meta.client_id, files);
+      const r = await importSite(env, settings, slug, meta.client_id, files);
+      if (!r.complete) continue; // partial pass — the next cron tick resumes; only mark seen when done
       await setSetting(db, seenKey, m.sha);
       await logEvent(db, meta.client_id || null, 'auto_published', `${slug} auto-published from GitHub`);
     } catch (e) {
