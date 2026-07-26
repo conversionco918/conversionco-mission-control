@@ -401,6 +401,13 @@ app.get('/debug/:key', async (c) => {
       for (const r of rows) { try { out[r.key] = JSON.parse(r.value); } catch {} }
       return out;
     })(),
+    // which-drip quiz taps per site (market demand signal for the copy retro)
+    quiz: await (async () => {
+      const rows = (await c.env.DB.prepare(`SELECT key, value FROM settings WHERE key LIKE 'qz_%'`).all()).results || [];
+      const out = {};
+      for (const r of rows) { try { out[r.key.slice(3)] = JSON.parse(r.value); } catch {} }
+      return out;
+    })(),
     tiers: await (async () => {
       const rows = (await c.env.DB.prepare('SELECT id, email, business_name, tier, stage, billing, competitors, live_url FROM clients').all()).results || [];
       const out = [];
@@ -2251,6 +2258,26 @@ app.get('/t/:id/p.gif', async (c) => {
   const day = new Date().toISOString().slice(0, 10);
   c.executionCtx.waitUntil(c.env.DB.prepare(`INSERT INTO hits (slug, day, path, n) VALUES (?, ?, ?, 1)
     ON CONFLICT(slug, day, path) DO UPDATE SET n = n + 1`).bind(`ext-${id}`, day, p).run());
+  return c.body(GIF, 200, gifHeaders);
+});
+
+// Quiz beacon: which-drip quiz taps → market-demand counters (no PII, bot-filtered).
+// Sites call GET /qz/<slug>/<state> (state = short token like wrecked/sick/depleted/longgame).
+app.get('/qz/:slug/:state', async (c) => {
+  const GIF = Uint8Array.from(atob('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'), (ch) => ch.charCodeAt(0));
+  const gifHeaders = { 'Content-Type': 'image/gif', 'Cache-Control': 'no-store, private', 'Access-Control-Allow-Origin': '*' };
+  const ua = c.req.header('User-Agent') || '';
+  const slug = String(c.req.param('slug') || '').replace(/[^a-z0-9-]/gi, '').slice(0, 60);
+  const state = String(c.req.param('state') || '').replace(/[^a-z0-9-]/gi, '').slice(0, 30);
+  if (!slug || !state || !ua || /bot|crawl|spider|slurp|headless|preview|monitor|lighthouse|pingdom/i.test(ua)) return c.body(GIF, 200, gifHeaders);
+  // admin sessions never count (same true-data gate as visits)
+  if (await checkSession(c.env, c.req.header('Cookie'))) return c.body(GIF, 200, gifHeaders);
+  c.executionCtx.waitUntil((async () => {
+    const db = c.env.DB;
+    let counts = {}; try { counts = JSON.parse((await db.prepare('SELECT value FROM settings WHERE key = ?').bind(`qz_${slug}`).first())?.value || '{}'); } catch {}
+    counts[state] = (counts[state] || 0) + 1;
+    await setSetting(db, `qz_${slug}`, JSON.stringify(counts));
+  })());
   return c.body(GIF, 200, gifHeaders);
 });
 
