@@ -683,11 +683,16 @@ app.post('/api/pushimg/:key', async (c) => {
   // some pages' CSP — e.g. pushing a generated image out of the ChatGPT tab)
   let f = {};
   try { f = await c.req.json(); } catch { try { f = Object.fromEntries(Object.entries(await c.req.parseBody()).map(([k, v]) => [k, String(v)])); } catch {} }
-  const { b64, slug, name, ext = 'png' } = f;
-  if (!b64 || !slug || !name) return c.json({ ok: false, error: 'b64, slug, name required' }, 400);
+  const { b64, slug, name: rawName, ext = 'png' } = f;
+  if (!b64 || !slug || !rawName) return c.json({ ok: false, error: 'b64, slug, name required' }, 400);
   if (b64.length > 11_000_000) return c.json({ ok: false, error: 'image too large' });
   const clean = b64.replace(/^data:[^,]+,/, '');
-  const safeExt = ext === 'webp' ? 'webp' : ext === 'jpg' ? 'jpg' : 'png';
+  // A name that already carries an extension WINS (callers send "photo.jpg");
+  // otherwise the ext field (default png). Never produce name.jpg.png again.
+  const nameExtM = String(rawName).match(/\.(png|jpe?g|webp)$/i);
+  const name = nameExtM ? String(rawName).replace(/\.(png|jpe?g|webp)$/i, '') : String(rawName);
+  const extEff = nameExtM ? (nameExtM[1].toLowerCase() === 'jpeg' ? 'jpg' : nameExtM[1].toLowerCase()) : ext;
+  const safeExt = extEff === 'webp' ? 'webp' : extEff === 'jpg' ? 'jpg' : 'png';
   const mime = safeExt === 'webp' ? 'image/webp' : safeExt === 'jpg' ? 'image/jpeg' : 'image/png';
   const settings = await getSettings(c.env.DB);
   const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
