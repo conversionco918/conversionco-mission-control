@@ -496,7 +496,8 @@ function openDrawer(id) {
       ${['intake2_done','generating'].includes(c.stage) ? `<div style="background:#F0FDFA;border:1px solid #99E5DC;border-radius:10px;padding:14px;">
         <p style="font-size:12.5px;font-weight:600;color:#0B7A6F;margin-bottom:6px;">🛠 Builder status</p>
         <div id="bstat"><button class="btn btn-ghost" style="padding:6px 12px;font-size:12px" onclick="builderStatus(${c.id})">Check the builder now</button>
-        <button class="btn" style="padding:6px 12px;font-size:12px;background:#FEF2F2;border:1px solid #FCA5A5;color:#B91C1C;" onclick="fireBuilder(this)" title="Don't wait for the hourly alarm — signal Claude to kick the builder immediately.">🔥 Fire anyway</button></div>
+        <button class="btn" style="padding:6px 12px;font-size:12px;background:#FEF2F2;border:1px solid #FCA5A5;color:#B91C1C;" onclick="fireBuilder(this)" title="Don't wait for the hourly alarm — signal Claude to kick the builder immediately.">🔥 Fire anyway</button>
+        ${c.stage === 'intake2_done' && !(getBillingUI(c).dep_status === 'paid' || getBillingUI(c).invoice_status === 'paid') ? `<button class="btn" style="padding:6px 12px;font-size:12px;background:#FFF7ED;border:1px solid #FDBA74;color:#C2410C;" onclick="forceBuild(${c.id}, this)" title="Skip the Stripe payment gate: marks the deposit as paid (bypass, no client email) and fires the builder immediately.">🔨 Build without payment</button>` : ''}</div>
       </div>` : ''}
       ${c.stage === 'preview_ready' && getBillingUI(c).preview_hold && !getBillingUI(c).preview_approved ? `<div style="background:#FFFBEB;border:1.5px solid #F59E0B;border-radius:10px;padding:14px;">
         <p style="font-size:13px;font-weight:700;color:#92400E;margin-bottom:6px;">⏸ Preview ready — HELD. The client has no idea yet.</p>
@@ -855,6 +856,17 @@ async function billingBypass(id, what) {
   const r = await api(`/api/clients/${id}/billing-bypass`, { method:'POST', body: JSON.stringify({ what }) });
   if (r.error) return toast('⚠ ' + r.error);
   toast('Bypassed ✓ — logged in the activity feed');
+  refresh(); setTimeout(() => openDrawer(id), 400);
+}
+async function forceBuild(id, btn) {
+  if (!confirm('Build WITHOUT Stripe payment?\n\nThis marks the 50% deposit as PAID (bypass — no client email, logged in the feed) and fires the builder immediately. Use when payment happened outside Stripe or for your own/internal sites.')) return;
+  if (btn) btn.disabled = true;
+  const b = await api(`/api/clients/${id}/billing-bypass`, { method:'POST', body: JSON.stringify({ what:'deposit', quiet:true }) });
+  if (b.error) { if (btn) btn.disabled = false; return toast('⚠ ' + b.error); }
+  const r = await api('/api/fire-builder', { method:'POST' });
+  if (btn) btn.disabled = false;
+  if (r.error) return toast('Deposit bypassed ✓ but fire failed: ' + r.error);
+  toast('🔨 Deposit bypassed + builder fired — ' + r.waiting + ' client(s) in the queue');
   refresh(); setTimeout(() => openDrawer(id), 400);
 }
 async function fireBuilder(btn) {
