@@ -1,10 +1,10 @@
 {
-  "requested_at": "2026-07-25T14:26:46.439Z",
+  "requested_at": "2026-07-27T16:14:24.502Z",
   "by": "dashboard fire button",
   "waiting": [
     {
-      "id": 18,
-      "biz": "Golden Hour IV Co.",
+      "id": 23,
+      "biz": "",
       "stage": "intake2_done"
     }
   ]
