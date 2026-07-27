@@ -3210,7 +3210,7 @@ app.get('/api/builder-status', async (c) => {
     const readyAt = Date.parse(String(cl.updated_at || '').replace(' ', 'T') + 'Z') || Date.now();
     const waitingMins = Math.max(0, Math.round((Date.now() - readyAt) / 60000));
     waiting.push({ id: cl.id, biz: cl.business_name || cl.name || cl.email, stage: cl.stage,
-      paid: depositPaid(b), waitingMins, overdue: cl.stage === 'intake2_done' && depositPaid(b) && waitingMins > 90 });
+      paid: depositPaid(b), waitingMins, overdue: cl.stage === 'intake2_done' && depositPaid(b) && waitingMins > 45 });
   }
   return c.json({
     nextRunAt: next ? next.toISOString() : null,
@@ -4047,7 +4047,7 @@ async function queueWatch(env, settings) {
     let b = {}; try { b = JSON.parse(cl.billing || '{}'); } catch {}
     if (!depositPaid(b)) continue;
     const readyAt = Date.parse((cl.updated_at || '').replace(' ', 'T') + 'Z') || now;
-    if (now - readyAt < 90 * 60 * 1000) continue;
+    if (now - readyAt < 40 * 60 * 1000) continue;
     anyStalled = true;
     const last = Number(settings[`qw_build_${cl.id}`] || 0);
     if (now - last < 12 * 60 * 60 * 1000) continue;
@@ -4062,7 +4062,7 @@ async function queueWatch(env, settings) {
   // same signal as the dashboard 🔥 button — until someone picks it up.
   if (anyStalled) {
     const lastFire = Number(settings.qw_autofire || 0);
-    if (now - lastFire > 55 * 60 * 1000) {
+    if (now - lastFire > 20 * 60 * 1000) {
       await setSetting(db, 'qw_autofire', String(now));
       const r = await fireSignal(env, db, 'AUTO: stalled build recovery').catch((e) => ({ ok: false, error: e.message }));
       await logEvent(db, null, 'fire_requested', r.ok
@@ -4247,11 +4247,15 @@ async function buildWatchdog(env, settings) {
   for (const cl of gen) {
     let prog = {}; try { prog = JSON.parse(settings[`buildprog_${cl.id}`] || '{}'); } catch {}
     const lastBeat = Date.parse(prog.updated_at || prog.started_at || cl.updated_at || 0);
-    if (!lastBeat || Date.now() - lastBeat < 60 * 60000) continue;
+    // 25 min (was 60): builders are required to ping at least every ~15-20 min,
+    // so 25 min of silence = dead with confidence. Faster detection → faster retry.
+    if (!lastBeat || Date.now() - lastBeat < 25 * 60000) continue;
     const mins = Math.round((Date.now() - lastBeat) / 60000);
     await touchClient(db, cl.id, { stage: cl.intake2_data ? 'intake2_done' : 'intake2_sent' });
     await setSetting(db, `buildprog_${cl.id}`, '');
-    await logEvent(db, cl.id, 'build_stalled', `⚠️ Build showed no progress for ${mins} min — automatically re-queued for the next builder run (${cl.business_name || cl.name || cl.email})`);
+    await logEvent(db, cl.id, 'build_stalled', `⚠️ Build silent for ${mins} min — re-queued automatically; the fire cord re-pulls within minutes (${cl.business_name || cl.name || cl.email})`);
+    // pull the fire cord IMMEDIATELY on requeue (don't wait for the next queueWatch pass)
+    try { await fireSignal(env, db, `AUTO: build watchdog requeued client ${cl.id}`); } catch {}
   }
 }
 
