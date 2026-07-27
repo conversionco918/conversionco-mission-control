@@ -1078,6 +1078,29 @@ app.get('/api/send-agreement/:key', async (c) => {
   } catch (e) { return c.json({ ok: false, error: String(e.message || e).slice(0, 200) }); }
 });
 
+// Keyed test: run the after-call calendar poll's query once and report what it sees
+app.get('/api/appt-test/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const settings = await getSettings(c.env.DB);
+  if (!c.env.GHL_TOKEN || !settings.ghl_location_id) return c.json({ ok: false, error: 'GHL not configured' });
+  const calId = settings.booking_calendar_id || 'kfZNB7wOmwHcy769nGh3';
+  const now = Date.now();
+  const url = new URL('https://services.leadconnectorhq.com/calendars/events');
+  url.searchParams.set('locationId', settings.ghl_location_id);
+  url.searchParams.set('calendarId', calId);
+  url.searchParams.set('startTime', String(now - 7 * 24 * 3600 * 1000));
+  url.searchParams.set('endTime', String(now + 7 * 24 * 3600 * 1000));
+  const res = await fetch(url.toString(), { headers: {
+    Authorization: `Bearer ${c.env.GHL_TOKEN}`, Version: '2021-04-15', Accept: 'application/json' } });
+  const body = await res.json().catch(() => ({}));
+  const events = (body.events || body.data || []).map((ev) => ({
+    id: ev.id || ev.eventId, start: ev.startTime, end: ev.endTime,
+    status: ev.appointmentStatus || ev.status, contactId: ev.contactId || ev.contact_id,
+    handled: Boolean(settings[`appt_done_${ev.id || ev.eventId}`]) }));
+  return c.json({ ok: res.ok, status: res.status, calendar: calId, count: events.length, events: events.slice(0, 20),
+    ...(res.ok ? {} : { error: JSON.stringify(body).slice(0, 300) }) });
+});
+
 // Keyed: clear stored email-template overrides so the code defaults (personal style) apply
 app.get('/api/reset-templates/:key', async (c) => {
   if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
@@ -2723,28 +2746,6 @@ async function pollAppointments(env, settings) {
   }
 }
 
-// Keyed test: run the after-call poll once and report what it sees (dry insight)
-app.get('/api/appt-test/:key', async (c) => {
-  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
-  const settings = await getSettings(c.env.DB);
-  if (!c.env.GHL_TOKEN || !settings.ghl_location_id) return c.json({ ok: false, error: 'GHL not configured' });
-  const calId = settings.booking_calendar_id || 'kfZNB7wOmwHcy769nGh3';
-  const now = Date.now();
-  const url = new URL('https://services.leadconnectorhq.com/calendars/events');
-  url.searchParams.set('locationId', settings.ghl_location_id);
-  url.searchParams.set('calendarId', calId);
-  url.searchParams.set('startTime', String(now - 7 * 24 * 3600 * 1000));
-  url.searchParams.set('endTime', String(now + 7 * 24 * 3600 * 1000));
-  const res = await fetch(url.toString(), { headers: {
-    Authorization: `Bearer ${c.env.GHL_TOKEN}`, Version: '2021-04-15', Accept: 'application/json' } });
-  const body = await res.json().catch(() => ({}));
-  const events = (body.events || body.data || []).map((ev) => ({
-    id: ev.id || ev.eventId, start: ev.startTime, end: ev.endTime,
-    status: ev.appointmentStatus || ev.status, contactId: ev.contactId || ev.contact_id,
-    handled: Boolean(settings[`appt_done_${ev.id || ev.eventId}`]) }));
-  return c.json({ ok: res.ok, status: res.status, calendar: calId, count: events.length, events: events.slice(0, 20),
-    ...(res.ok ? {} : { error: JSON.stringify(body).slice(0, 300) }) });
-});
 
 // Manual stage change / notes / delete
 app.patch('/api/clients/:id', async (c) => {
