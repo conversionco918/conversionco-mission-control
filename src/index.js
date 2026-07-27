@@ -257,6 +257,39 @@ app.post('/intake/:n', async (c) => {
     await logEvent(db, null, 'error', `Intake ${n} submission had no email: ${JSON.stringify(stored).slice(0, 500)}`);
   }
 
+  // ⛓ CHAIN (Tiffany 7/27): Intake 2 submitted → the agreement goes out IMMEDIATELY
+  // (unless already signed or already sent). Signature then auto-fires the deposit invoice.
+  if (n === 2 && clientId) {
+    const chain = (async () => {
+      try {
+        const cl = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(clientId).first();
+        if (!cl || !cl.email) return;
+        const signed = await db.prepare('SELECT id FROM agreements WHERE client_id = ? LIMIT 1').bind(clientId).first();
+        if (signed) return;
+        const bC = getBilling(cl);
+        if (bC.agr_sent) return; // already out — the nudges chase it
+        const settingsC = await getSettings(db);
+        if (!c.env.GHL_TOKEN || !settingsC.ghl_location_id) return;
+        const url = `${BASE_URL}/agreement/${clientId}/${await portalToken(c.env, 'agr', clientId)}`;
+        const biz = cl.business_name || cl.name || 'your business';
+        const ghl = ghlFor(c.env, settingsC);
+        const contact = await ghl.upsertContact({ email: cl.email, name: cl.name || '' });
+        await ghl.sendEmail({ contactId: contact.id || contact.contactId,
+          subject: `One quick signature before we begin — ${biz}`,
+          html: `<p>Hi ${(cl.name || '').split(' ')[0] || 'there'},</p>
+<p>Your vision form just landed — thank you, it's exactly what the design team needs. One quick signature and we're officially building: our service agreement is plain English, about two minutes to read, and it protects both of us. The short version: your domain and your website are yours.</p>
+<p><a href="${url}">${url}</a></p>
+<p>Your invoice arrives right after you sign, and the build starts the moment it's settled. Questions about anything in it? Just reply.</p>
+<p>Talk soon,<br>The ConversionCo Team</p>`,
+          emailFrom: settingsC.email_from || undefined });
+        bC.agr_sent = new Date().toISOString();
+        await touchClient(db, clientId, { billing: JSON.stringify(bC) });
+        await logEvent(db, clientId, 'agreement_sent', `⛓ Intake 2 received — agreement sent automatically to ${cl.email}`);
+      } catch (e) { await logEvent(db, clientId, 'error', `Auto-agreement after Intake 2 failed: ${String(e.message).slice(0, 140)}`); }
+    })();
+    c.executionCtx.waitUntil(chain);
+  }
+
   // After a first-time Intake 1: automatically email the booking link (best effort)
   if (n === 1 && email && firstTime) {
     const settings = await getSettings(db);
@@ -1223,6 +1256,21 @@ app.post('/agreement-sign/:id/:token', async (c) => {
     .bind(id, AGREEMENT_VERSION, pkg, name, (c.req.header('User-Agent') || '').slice(0, 200)).run();
   await logEvent(db, id, 'agreement_signed', `✍️ Agreement signed by ${name} (${pkg})`);
   const settings = await getSettings(db);
+  // ⛓ CHAIN (Tiffany 7/27): the SECOND the signature lands, the 50% deposit
+  // invoice fires — no manual step. Guards: Stripe configured, nothing already
+  // sent/paid. Uses the card's current tier (set on the pricing call).
+  try {
+    const bS = getBilling(client);
+    if (c.env.STRIPE_SECRET_KEY && !bS.dep_id && bS.dep_status !== 'paid' && bS.invoice_status !== 'paid' && !bS.fin_id) {
+      const tierKeyS = (client.tier === 'premium') ? 'premium' : 'standard';
+      const custS = await ensureCustomer(c.env.STRIPE_SECRET_KEY, client.email, client.name || client.business_name || '');
+      const invS = await sendInvoice(c.env.STRIPE_SECRET_KEY, custS.id, tierKeyS, client.business_name || '', 'deposit');
+      bS.customer_id = custS.id; bS.invoice_tier = tierKeyS;
+      bS.dep_id = invS.id; bS.dep_status = invS.status; bS.dep_url = invS.url; bS.dep_created = new Date().toISOString();
+      await touchClient(db, id, { billing: JSON.stringify(bS) });
+      await logEvent(db, id, 'invoice_sent', `⛓ Signature landed — 50% deposit invoice auto-sent (${halfDisplay(tierKeyS)}) 💳`);
+    }
+  } catch (e) { await logEvent(db, id, 'error', `Auto-invoice after signature failed: ${String(e.message).slice(0, 140)} — send it manually from the card`); }
   if (c.env.GHL_TOKEN && settings.ghl_location_id) {
     const url = `${BASE_URL}/agreement/${id}/${await portalToken(c.env, 'agr', id)}`;
     try {
@@ -2578,39 +2626,124 @@ app.post('/api/prospects', async (c) => {
 });
 
 // Approve after pricing call -> send Intake 2
+// Shared: send Intake 2 (used by the dashboard button AND the after-call automation)
+async function sendIntake2Flow(env, db, client, settings) {
+  const ghl = ghlFor(env, settings);
+  let contactId = client.ghl_contact_id;
+  if (!contactId) {
+    const contact = await ghl.upsertContact({ email: client.email, name: client.name });
+    contactId = contact.id || contact.contactId;
+  }
+  const firstName = (client.name || '').split(' ')[0] || 'there';
+  // carry the client's email in the form link so their submission auto-matches
+  const link2 = settings.form2_link + (settings.form2_link.includes('?') ? '&' : '?') +
+    'e=' + encodeURIComponent(client.email);
+  await ghl.sendEmail({
+    contactId,
+    subject: renderTemplate(settings.intake2_subject, { name: firstName }),
+    html: renderTemplate(settings.intake2_body, { name: firstName, form_link: link2 }),
+    emailFrom: settings.email_from || undefined,
+  });
+  await trySMS(ghl, db, client.id, contactId,
+    `Hi ${firstName}! ConversionCo here — last step before design starts: your Website Vision form. ${link2}`);
+  await touchClient(db, client.id, { stage: 'intake2_sent', ghl_contact_id: contactId });
+  await logEvent(db, client.id, 'intake2_sent', `Sent to ${client.email}`);
+}
+
 app.post('/api/clients/:id/send-intake2', async (c) => {
   const db = c.env.DB;
   const id = Number(c.req.param('id'));
   const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
   if (!client) return c.json({ error: 'Client not found' }, 404);
-
   const settings = await getSettings(db);
-  const ghl = ghlFor(c.env, settings);
   try {
-    let contactId = client.ghl_contact_id;
-    if (!contactId) {
-      const contact = await ghl.upsertContact({ email: client.email, name: client.name });
-      contactId = contact.id || contact.contactId;
-    }
-    const firstName = (client.name || '').split(' ')[0] || 'there';
-    // carry the client's email in the form link so their submission auto-matches
-    const link2 = settings.form2_link + (settings.form2_link.includes('?') ? '&' : '?') +
-      'e=' + encodeURIComponent(client.email);
-    await ghl.sendEmail({
-      contactId,
-      subject: renderTemplate(settings.intake2_subject, { name: firstName }),
-      html: renderTemplate(settings.intake2_body, { name: firstName, form_link: link2 }),
-      emailFrom: settings.email_from || undefined,
-    });
-    await trySMS(ghl, db, id, contactId,
-      `Hi ${firstName}! ConversionCo here — last step before design starts: your Website Vision form. ${link2}`);
-    await touchClient(db, id, { stage: 'intake2_sent', ghl_contact_id: contactId });
-    await logEvent(db, id, 'intake2_sent', `Sent to ${client.email}`);
+    await sendIntake2Flow(c.env, db, client, settings);
     return c.json({ ok: true });
   } catch (e) {
     await logEvent(db, id, 'error', `Intake 2 send failed: ${e.message}`);
     return c.json({ error: e.message }, 502);
   }
+});
+
+// 📅 AFTER-CALL AUTOPILOT (Tiffany 7/27): the moment the planning call ends,
+// Intake 2 goes out automatically — no waiting on a manual send.
+// Polls the GHL booking calendar every 5 min for recently-ended appointments.
+async function pollAppointments(env, settings) {
+  if (!env.GHL_TOKEN || !settings.ghl_location_id) return;
+  const db = env.DB;
+  const calId = settings.booking_calendar_id || 'kfZNB7wOmwHcy769nGh3';
+  const now = Date.now();
+  const url = new URL('https://services.leadconnectorhq.com/calendars/events');
+  url.searchParams.set('locationId', settings.ghl_location_id);
+  url.searchParams.set('calendarId', calId);
+  url.searchParams.set('startTime', String(now - 48 * 3600 * 1000));
+  url.searchParams.set('endTime', String(now));
+  const res = await fetch(url.toString(), { headers: {
+    Authorization: `Bearer ${env.GHL_TOKEN}`, Version: '2021-04-15', Accept: 'application/json' } });
+  if (!res.ok) {
+    const last = Number(settings.appt_poll_err || 0);
+    if (now - last > 6 * 3600 * 1000) {
+      await setSetting(db, 'appt_poll_err', String(now));
+      await logEvent(db, null, 'error', `After-call autopilot: calendar poll failed (${res.status}) — Intake 2 auto-send paused; manual send still works`);
+    }
+    return;
+  }
+  const data = await res.json().catch(() => ({}));
+  const events = data.events || data.data || [];
+  for (const ev of events) {
+    const evId = ev.id || ev.eventId || '';
+    const endT = Date.parse(ev.endTime || ev.end_time || 0) || Number(ev.endTime) || 0;
+    const status = String(ev.appointmentStatus || ev.appoinmentStatus || ev.status || '').toLowerCase();
+    if (!evId || !endT || endT > now) continue; // only ENDED appointments
+    if (['cancelled', 'canceled', 'noshow', 'no-show', 'invalid'].includes(status)) continue;
+    if (settings[`appt_done_${evId}`]) continue; // handled already
+    await setSetting(db, `appt_done_${evId}`, new Date().toISOString());
+    // match the appointment to a client: contact id first, then email lookup
+    let client = null;
+    const contactId = ev.contactId || ev.contact_id || '';
+    if (contactId) client = await db.prepare('SELECT * FROM clients WHERE ghl_contact_id = ?').bind(contactId).first();
+    if (!client && contactId) {
+      try {
+        const ghl = ghlFor(env, settings);
+        const contact = await ghl.getContact(contactId);
+        const cEmail = (contact?.contact?.email || contact?.email || '').toLowerCase().trim();
+        if (cEmail) client = await db.prepare('SELECT * FROM clients WHERE lower(email) = ?').bind(cEmail).first();
+      } catch { /* contact lookup best-effort */ }
+    }
+    if (!client) continue;
+    // only clients who haven't gotten/done Intake 2 yet
+    if (!['new', 'intake1_sent', 'intake1_done'].includes(client.stage)) continue;
+    if (client.intake2_data && client.intake2_data.length > 2) continue;
+    try {
+      await sendIntake2Flow(env, db, client, settings);
+      await logEvent(db, client.id, 'intake2_sent', `🤖 Planning call ended — Intake 2 sent automatically to ${client.email}`);
+    } catch (e) {
+      await logEvent(db, client.id, 'error', `After-call Intake 2 auto-send failed: ${String(e.message).slice(0, 140)}`);
+    }
+  }
+}
+
+// Keyed test: run the after-call poll once and report what it sees (dry insight)
+app.get('/api/appt-test/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const settings = await getSettings(c.env.DB);
+  if (!c.env.GHL_TOKEN || !settings.ghl_location_id) return c.json({ ok: false, error: 'GHL not configured' });
+  const calId = settings.booking_calendar_id || 'kfZNB7wOmwHcy769nGh3';
+  const now = Date.now();
+  const url = new URL('https://services.leadconnectorhq.com/calendars/events');
+  url.searchParams.set('locationId', settings.ghl_location_id);
+  url.searchParams.set('calendarId', calId);
+  url.searchParams.set('startTime', String(now - 7 * 24 * 3600 * 1000));
+  url.searchParams.set('endTime', String(now + 7 * 24 * 3600 * 1000));
+  const res = await fetch(url.toString(), { headers: {
+    Authorization: `Bearer ${c.env.GHL_TOKEN}`, Version: '2021-04-15', Accept: 'application/json' } });
+  const body = await res.json().catch(() => ({}));
+  const events = (body.events || body.data || []).map((ev) => ({
+    id: ev.id || ev.eventId, start: ev.startTime, end: ev.endTime,
+    status: ev.appointmentStatus || ev.status, contactId: ev.contactId || ev.contact_id,
+    handled: Boolean(settings[`appt_done_${ev.id || ev.eventId}`]) }));
+  return c.json({ ok: res.ok, status: res.status, calendar: calId, count: events.length, events: events.slice(0, 20),
+    ...(res.ok ? {} : { error: JSON.stringify(body).slice(0, 300) }) });
 });
 
 // Manual stage change / notes / delete
@@ -4321,5 +4454,6 @@ export default {
     ctx.waitUntil(queueWatch(env, settings).catch((e) =>
       logEvent(env.DB, null, 'error', `Queue watch failed: ${e.message}`)
     ));
+    ctx.waitUntil(pollAppointments(env, settings).catch(() => { /* self-throttled error logging inside */ }));
   },
 };
