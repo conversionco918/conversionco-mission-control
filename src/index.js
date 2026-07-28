@@ -91,6 +91,29 @@ app.use('*', async (c, next) => {
   return next();
 });
 
+// 🌉 SAME-ORIGIN PUSH BRIDGE: a tiny receiver page opened as a popup from an
+// authenticated tool tab (e.g. ChatGPT). That tab cannot POST here directly
+// (its CSP blocks cross-origin fetch), so it postMessages {type:'push', path,
+// body, id} to this page, which runs the POST same-origin and replies to the
+// opener. No secret is baked in — the caller supplies the keyed path per push.
+app.get('/__bridge', (c) => c.html(`<!doctype html><meta charset=utf-8><title>bridge</title>
+<body style="font:14px system-ui;padding:12px">push bridge ready
+<script>
+var OPENER_ORIGIN='https://chatgpt.com';
+addEventListener('message', function(e){
+  if(e.origin!==OPENER_ORIGIN) return;
+  var m=e.data||{};
+  if(m.type!=='push') return;
+  var reply=function(o){ try{ e.source.postMessage(Object.assign({id:m.id,type:'push-result'},o), e.origin); }catch(x){} };
+  try{
+    fetch(m.path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(m.body)})
+      .then(function(r){ return r.text().then(function(t){ var j; try{j=JSON.parse(t)}catch(_){j=t} reply({ok:r.ok,status:r.status,r:j}); }); })
+      .catch(function(err){ reply({ok:false,err:String(err)}); });
+  }catch(err){ reply({ok:false,err:String(err)}); }
+});
+try{ if(window.opener) window.opener.postMessage({type:'bridge-ready'}, OPENER_ORIGIN); }catch(x){}
+</script>`));
+
 // 🌐 DIRECT LIVE HOSTING: when a client's custom domain points at this worker,
 // serve their site straight from storage — no separate hosting anywhere.
 // Mapping lives in settings: livehost_<hostname> = slug (set by golive-domain).
