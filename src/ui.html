@@ -159,6 +159,7 @@
   <h1>ConversionCo</h1><span class="tag">Mission Control</span>
   <span class="spacer"></span>
   <button onclick="pollNow(this)">↻ Check for submissions</button>
+  <button onclick="location.href='/activity'" title="Every site edit and publish, across all clients, newest first.">📜 Site activity</button>
   <button onclick="openSettings()">⚙ Settings</button>
 </header>
 
@@ -385,7 +386,7 @@ function renderClients() {
     const st = STAGES[c.stage] || STAGES.new;
     return `<tr class="rowclick" onclick="openDrawer(${c.id})">
       <td>${dot(c)}<b>${esc(c.name || c.email)}</b>${c.name ? `<br><span style="color:var(--muted);font-size:12px;margin-left:16px;">${esc(c.email)}</span>` : ''}</td>
-      <td><span class="chip" style="background:${st.bg};color:${st.fg}">${st.label}</span>${buildBar(c)}</td>
+      <td><span class="chip" style="background:${st.bg};color:${st.fg}">${st.label}</span>${editChip(c)}${buildBar(c)}</td>
       <td style="color:var(--muted);font-size:13px">${ago(c.updated_at)}</td>
       <td><button class="peek" style="position:static" title="Open their portal — admin view" onclick="event.stopPropagation();openLink(${c.id}, 'portal', this)">👁</button> ${c.stage === 'intake1_done' ? `<button class="btn btn-green" onclick="event.stopPropagation();sendIntake2(${c.id}, this)">Approve → Intake 2</button>` : ''}</td>
     </tr>`;
@@ -395,9 +396,27 @@ function renderClients() {
 function renderFeed() {
   const f = document.getElementById('feed');
   if (!STATE.events.length) { f.innerHTML = '<div class="empty">Activity will appear here.</div>'; return; }
-  f.innerHTML = STATE.events.map(e => `<div class="item"><b>${esc(e.client_name || e.client_email || 'System')}</b> — ${esc(pretty(e.type))}${e.detail && e.type==='error' ? `<br><span style="color:var(--red);font-size:12px">${esc(e.detail)}</span>`:''}<time>${ago(e.created_at)}</time></div>`).join('');
+  const DETAIL_TYPES = ['error','site_edit','published','auto_published'];
+  f.innerHTML = STATE.events.map(e => `<div class="item"><b>${esc(e.client_name || e.client_email || 'System')}</b> — ${esc(pretty(e.type))}${e.detail && DETAIL_TYPES.includes(e.type) ? `<br><span style="color:${e.type==='error'?'var(--red)':'#64748b'};font-size:12px">${esc(e.detail)}</span>`:''}<time>${ago(e.created_at)}</time></div>`).join('');
 }
-function pretty(t){ return ({client_created:'added to pipeline', booking_email_sent:'booking link emailed 📅', intake1_sent:'Intake 1 email sent', intake1_done:'submitted Intake 1 🎉', intake2_sent:'Intake 2 email sent', intake2_done:'submitted Intake 2 🎉', stage_changed:'stage updated', error:'⚠ error', client_deleted:'removed', webhook_received:'webhook ping', build_started:'⚙ build started', build_stalled:'⚠️ build stalled — re-queued', fire_requested:'🔥 manual builder fire requested', preview_ready:'★ preview is ready', preview_held:'⏸ preview HELD — awaiting your approval', preview_approved:'📤 preview approved & sent', preview_sent:'📤 reveal email sent to client', invoice_sent:'invoice sent 💳', invoice_paid:'payment received 💰', agreement_sent:'agreement sent 📄', agreement_signed:'agreement signed ✍️', portal_invited:'portal login sent 🔑', hosting_active:'hosting active 🔒', owner_digest:'weekly digest sent 📊', sms_sent:'text sent 📱', sms_skipped:'text skipped', prospect_created:'💡 prospect added', demo_ready:'💡 demo site ready', nudge_sent:'🤖 auto-nudge sent', build_stalled:'⚠️ build stalled — re-queued', site_rolled_back:'⏪ site restored to previous version', launched:'🚀 LAUNCHED', launch_emailed:'🚀 launch email sent', page1_celebrated:'🎉 Page 1 celebration sent', first_lead_celebrated:'🎉 first-lead celebration sent', report_notified:'📬 report-ready email sent'})[t] || t; }
+
+// EDIT VISIBILITY: amber badge data from /api/state (STATE.edits, keyed by slug)
+function editFor(c) { return (STATE.edits || []).find(e => e.client_id === c.id); }
+function editChip(c) {
+  const e = editFor(c); if (!e) return '';
+  return `<br><span class="chip" style="background:#fffbeb;color:#92400e;border:1px solid #fde68a;margin-top:4px;" title="${esc((e.files||[]).join(', '))}">📝 ${e.n} file${e.n===1?'':'s'} not yet published (${ago(e.since)})</span>`;
+}
+async function publishNow(slug, id, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Publishing…'; }
+  const r = await api('/api/sites/publish-now', { method:'POST', body: JSON.stringify({ slug, client_id: id }) });
+  if (btn) { btn.disabled = false; btn.textContent = '🚀 Publish now'; }
+  if (r.error) return toast('⚠ ' + r.error);
+  if (r.complete) toast('✅ Published — ' + r.files + ' file(s) updated on ' + slug);
+  else toast('📦 Publishing ' + slug + '… ' + r.remaining + ' file(s) to go — finishes automatically within ~5 min');
+  await refresh();
+  if (id) setTimeout(() => openDrawer(id), 300);
+}
+function pretty(t){ return ({client_created:'added to pipeline', booking_email_sent:'booking link emailed 📅', intake1_sent:'Intake 1 email sent', intake1_done:'submitted Intake 1 🎉', intake2_sent:'Intake 2 email sent', intake2_done:'submitted Intake 2 🎉', stage_changed:'stage updated', error:'⚠ error', client_deleted:'removed', webhook_received:'webhook ping', build_started:'⚙ build started', build_stalled:'⚠️ build stalled — re-queued', fire_requested:'🔥 manual builder fire requested', preview_ready:'★ preview is ready', preview_held:'⏸ preview HELD — awaiting your approval', preview_approved:'📤 preview approved & sent', preview_sent:'📤 reveal email sent to client', invoice_sent:'invoice sent 💳', invoice_paid:'payment received 💰', agreement_sent:'agreement sent 📄', agreement_signed:'agreement signed ✍️', portal_invited:'portal login sent 🔑', hosting_active:'hosting active 🔒', owner_digest:'weekly digest sent 📊', sms_sent:'text sent 📱', sms_skipped:'text skipped', prospect_created:'💡 prospect added', demo_ready:'💡 demo site ready', nudge_sent:'🤖 auto-nudge sent', build_stalled:'⚠️ build stalled — re-queued', site_rolled_back:'⏪ site restored to previous version', launched:'🚀 LAUNCHED', launch_emailed:'🚀 launch email sent', page1_celebrated:'🎉 Page 1 celebration sent', first_lead_celebrated:'🎉 first-lead celebration sent', report_notified:'📬 report-ready email sent', site_edit:'📝 site files edited', published:'✅ edits published', auto_published:'🚀 site republished', import_progress:'📦 importing site files'})[t] || t; }
 
 async function sendExitPackage(id, btn) {
   if (!confirm('Send the exit package?\n\nThe client receives a warm goodbye email with a download link to their COMPLETE package: every website file, all reports, Google position history, and their signed agreement.\n\nNothing is deleted or archived — you stay in control of the card afterwards.')) return;
@@ -482,6 +501,12 @@ function openDrawer(id) {
         ${(c.preview_url || c.live_url) && c.stage !== 'prospect' ? `<button class="btn btn-ghost" onclick="rollbackSite(${c.id}, this)" title="Restore the site to its previous version — safe, creates a new version, never deletes history.">⏪ Undo last change</button>` : ''}
         <button class="btn btn-red" onclick="delClient(${c.id})">Remove</button>
       </div>
+      ${(() => { const ed = editFor(c); if (!ed) return ''; return `<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:10px;padding:14px;">
+        <p style="font-size:12.5px;font-weight:600;color:#92400e;margin-bottom:6px;">📝 Edits not yet published — ${ed.n} file${ed.n===1?'':'s'}, first seen ${ago(ed.since)}</p>
+        <p style="font-size:11.5px;color:#a16207;margin-bottom:10px;word-break:break-word;">${esc((ed.files||[]).join(' · '))}${ed.n > (ed.files||[]).length ? ' · +' + (ed.n - ed.files.length) + ' more' : ''}</p>
+        <button class="btn" style="background:#d97706;color:#fff;" onclick="publishNow('${esc(ed.slug)}', ${c.id}, this)">🚀 Publish now</button>
+        <span style="font-size:11px;color:#a16207;margin-left:8px;">no version bump needed — pushes these straight to the served copy</span>
+      </div>`; })()}
       ${c.stage === 'prospect' ? `<div style="background:#fdf4ff;border:1px solid #f0abfc;border-radius:10px;padding:14px;">
         <p style="font-size:12.5px;font-weight:600;color:#a21caf;margin-bottom:6px;">💡 Prospect pitch kit${c.vertical && c.vertical !== 'iv-therapy' ? ` <span style="background:#a21caf;color:#fff;border-radius:99px;padding:2px 9px;font-size:10.5px;margin-left:6px;">${esc(c.vertical)}</span>` : ''}</p>
         ${(() => { try { const i1 = JSON.parse(c.intake1_data || '{}'); return i1._hunted ? `<p style="font-size:11.5px;color:#7c3aed;margin-bottom:6px;">🎯 Found by the prospector${i1._evidence ? ` — ${esc(i1._evidence)}` : ''}${i1._their_site ? ` · <a href="${esc(i1._their_site)}" target="_blank">their current site</a>` : ''}</p>` : ''; } catch(e) { return ''; } })()}

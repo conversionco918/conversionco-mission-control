@@ -2602,7 +2602,51 @@ app.get('/api/state', async (c) => {
   let overview = null;
   try { overview = await computeOverview(db, clients, settings); } catch { /* dashboard still renders without it */ }
   const webhookSecret = (await hmac(c.env.SESSION_SECRET, 'webhook')).slice(0, 16);
-  return c.json({ clients, events, settings, overview, webhook_path: `/webhooks/ghl/${webhookSecret}` });
+  // EDIT VISIBILITY: unpublished-edit badges, keyed by slug (editpending_<slug> is
+  // maintained by the edit-watcher cron and cleared by importSite on completion)
+  const edits = [];
+  for (const k of Object.keys(settings)) {
+    if (!k.startsWith('editpending_') || !settings[k]) continue;
+    try { const p = JSON.parse(settings[k]); if (p && p.n) edits.push({ slug: k.slice(12), ...p }); } catch {}
+  }
+  return c.json({ clients, events, settings, overview, edits, webhook_path: `/webhooks/ghl/${webhookSecret}` });
+});
+
+// 📜 SITE ACTIVITY (session-protected): the "what actually happened" page —
+// every edit, publish, import and rollback across all clients, newest first.
+app.get('/activity', async (c) => {
+  const db = c.env.DB;
+  const rows = (await db.prepare(
+    `SELECT e.*, c.business_name AS biz, c.name AS cname FROM events e LEFT JOIN clients c ON c.id = e.client_id
+     WHERE e.type IN ('site_edit','published','auto_published','import_progress','preview_ready','site_rolled_back','revision_done','revision_failed','build_started','demo_ready')
+     ORDER BY e.id DESC LIMIT 300`).all()).results || [];
+  const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const ICON = { site_edit: '📝', published: '✅', auto_published: '🚀', import_progress: '📦', preview_ready: '★', site_rolled_back: '⏪', revision_done: '✅', revision_failed: '⚠️', build_started: '⚙️', demo_ready: '💡' };
+  const LABEL = { site_edit: 'Edited', published: 'Published', auto_published: 'Auto-published', import_progress: 'Importing', preview_ready: 'Preview ready', site_rolled_back: 'Rolled back', revision_done: 'Revision done', revision_failed: 'Revision failed', build_started: 'Build started', demo_ready: 'Demo ready' };
+  const items = rows.map((e) => {
+    const who = e.biz || e.cname || '';
+    return '<div class="ev"><span class="ic">' + (ICON[e.type] || '•') + '</span><div class="body"><div class="top"><b>'
+      + esc(LABEL[e.type] || e.type) + '</b>' + (who ? ' <span class="who">' + esc(who) + '</span>' : '')
+      + '<time>' + esc(ago2(e.created_at)) + ' · ' + esc(String(e.created_at).replace('T', ' ').slice(0, 16)) + ' UTC</time></div>'
+      + '<div class="det">' + esc(e.detail || '') + '</div></div></div>';
+  }).join('');
+  return c.html('<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+    + '<title>Site activity — Mission Control</title><style>'
+    + 'body{font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;background:#f1f5f9;margin:0;color:#0f172a}'
+    + 'header{background:#071B33;color:#fff;padding:14px 24px;display:flex;align-items:center;gap:14px;position:sticky;top:0}'
+    + 'header h1{font-size:16px;margin:0}header a{color:#93c5fd;font-size:13px;text-decoration:none;margin-left:auto}'
+    + 'main{max-width:860px;margin:22px auto;padding:0 16px}'
+    + '.ev{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:12px 16px;margin-bottom:10px;display:flex;gap:12px}'
+    + '.ic{font-size:18px;line-height:1.4}.body{flex:1;min-width:0}'
+    + '.top{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;font-size:13.5px}'
+    + '.who{color:#334155;background:#eef2f7;border-radius:99px;padding:1px 9px;font-size:11.5px}'
+    + 'time{margin-left:auto;color:#94a3b8;font-size:11.5px}'
+    + '.det{color:#475569;font-size:12.5px;margin-top:3px;word-break:break-word}'
+    + '.empty{color:#94a3b8;text-align:center;padding:40px}'
+    + '</style></head><body><header><h1>📜 Site activity</h1><span style="font-size:12px;color:#94a3b8">every edit &amp; publish, newest first</span>'
+    + '<a href="/">&larr; Back to Mission Control</a></header><main>'
+    + (items || '<div class="empty">No edit or publish activity yet — it starts logging from now.</div>')
+    + '</main></body></html>');
 });
 
 // Add client + send Intake 1
@@ -3738,7 +3782,9 @@ function ghFetcher(env) {
   };
 }
 
-async function importSite(env, settings, slug, clientId, treeFiles) {
+async function importSite(env, settings, slug, clientId, treeFiles, opts = {}) {
+  // opts.quiet: republish of an existing site (Publish now / edit-watcher continuation) —
+  // import the files + clear the unpublished badge, but do NOT touch stage/hold/notify.
   const db = env.DB;
   const gh = ghFetcher(env);
   const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
@@ -3784,14 +3830,24 @@ async function importSite(env, settings, slug, clientId, treeFiles) {
     ).bind(slug, rel, content, ctype, isText ? 0 : 1, f.sha).run();
     count++;
   }
+  const metaEntry = files.find((f) => f.path === prefix + 'site-meta.json');
   const remaining = changed.length - batch.length;
   if (remaining > 0) {
     await logEvent(db, clientId ? Number(clientId) : null, 'import_progress',
       `📦 ${slug}: imported ${count} changed file(s) this pass — ${remaining} to go (continues automatically within 5 min)`);
-    return { files: count, remaining, complete: false, preview_url: `${BASE_URL}/preview/${slug}/` };
+    return { files: count, remaining, complete: false, preview_url: `${BASE_URL}/preview/${slug}/`, meta_sha: metaEntry ? metaEntry.sha : '' };
   }
+  // EDIT VISIBILITY: import is complete — repo and served copy now match, so the
+  // "📝 edits not yet published" badge (if any) clears and the feed gets a ✅.
+  try {
+    if (settings[`editpending_${slug}`]) {
+      await setSetting(db, `editpending_${slug}`, '');
+      await logEvent(db, clientId ? Number(clientId) : null, 'published',
+        `✅ ${slug} published — the edited files are now on the served copy (${BASE_URL}/preview/${slug}/)`);
+    }
+  } catch { /* badge cleanup must never block an import */ }
   const previewUrl = `${BASE_URL}/preview/${slug}/`;
-  if (clientId) {
+  if (clientId && !opts.quiet) {
     // prospects keep their stage — the demo just attaches to the card
     const clP = await db.prepare('SELECT stage FROM clients WHERE id = ?').bind(Number(clientId)).first();
     if (clP && clP.stage === 'prospect') {
@@ -3836,7 +3892,7 @@ async function importSite(env, settings, slug, clientId, treeFiles) {
       }
     }
   }
-  return { files: count, complete: true, preview_url: previewUrl };
+  return { files: count, complete: true, preview_url: previewUrl, meta_sha: metaEntry ? metaEntry.sha : '' };
 }
 
 // Cron: auto-publish any new/updated site pushed to the client-sites repo
@@ -3870,6 +3926,148 @@ async function autoPublish(env, settings) {
   }
 }
 
+// ============================ EDIT VISIBILITY (8/5) ============================
+// Tiffany's law: "I want to SEE edits, not guess."
+// 1) editWatch (cron */5): every new commit touching a client's site folder becomes
+//    a feed event + an owner email — files, message, source, published-or-pending.
+// 2) editpending_<slug> setting powers the amber "📝 edits not yet published" badge
+//    (cleared inside importSite the moment an import completes).
+// 3) continuePublish: finishes multi-pass "Publish now" imports across cron ticks
+//    (autoPublish only resumes on site-meta changes; publish-now must self-drive).
+
+function editSource(cm) {
+  const an = (cm.commit && cm.commit.author && cm.commit.author.name) || '';
+  const cn = (cm.commit && cm.commit.committer && cm.commit.committer.name) || '';
+  const login = (cm.author && cm.author.login) || '';
+  if (cn === 'GitHub' && /conversionco/i.test(an + login)) return 'Claude bridge / builder';
+  if (cn === 'GitHub') return (an || login || 'someone') + ' (web edit)';
+  if (/conversionco|mission-control/i.test(an + login)) return 'Claude bridge / builder';
+  return (an || login || 'unknown') + ' (git push)';
+}
+
+async function slugClientId(db, slug) {
+  try {
+    const row = await db.prepare(`SELECT content FROM site_files WHERE slug = ? AND path = 'site-meta.json'`).bind(slug).first();
+    if (row && row.content) { const m = JSON.parse(row.content); if (m.client_id) return Number(m.client_id); }
+  } catch { /* fall through */ }
+  return null;
+}
+
+async function editWatch(env, settings) {
+  if (!env.GITHUB_TOKEN) return;
+  const db = env.DB;
+  const gh = ghFetcher(env);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  const ref = await gh(`/repos/${repo}/git/ref/heads/main`);
+  const headSha = ref.object.sha;
+  if (settings.editwatch_head === headSha) return; // nothing new anywhere in the repo
+  const commit = await gh(`/repos/${repo}/git/commits/${headSha}`);
+  const tree = await gh(`/repos/${repo}/git/trees/${commit.tree.sha}?recursive=1`);
+  const entries = tree.tree || [];
+  const slugDirs = entries.filter((t) => t.type === 'tree' && /^sites\/[^/]+$/.test(t.path));
+  let mailShas = []; try { mailShas = JSON.parse(settings.editmail_shas || '[]'); } catch {}
+  let mailDirty = false;
+  for (const d of slugDirs) {
+    const slug = d.path.split('/')[1];
+    const key = `editwatch_${slug}`;
+    let st = {}; try { st = JSON.parse(settings[key] || '{}'); } catch {}
+    const folderChanged = st.tree !== d.sha;
+    const clientId = await slugClientId(db, slug);
+    // ---- recompute the unpublished badge (repo shas vs imported shas) ----
+    let staleCount = -1; // -1 = unknown / never imported
+    try {
+      const prefix = `sites/${slug}/`;
+      const repoFiles = entries.filter((t) => t.type === 'blob' && t.path.startsWith(prefix));
+      const dbRows = (await db.prepare('SELECT path, gh_sha FROM site_files WHERE slug = ?').bind(slug).all()).results || [];
+      if (dbRows.length) { // only badge sites that have been imported at least once
+        const have = {}; for (const r of dbRows) have[r.path] = r.gh_sha || '';
+        const stale = repoFiles.filter((f) => have[f.path.slice(prefix.length)] !== f.sha);
+        staleCount = stale.length;
+        let pend = {}; try { pend = JSON.parse(settings[`editpending_${slug}`] || '{}'); } catch {}
+        if (stale.length) {
+          const next = {
+            n: stale.length,
+            since: pend.since || new Date().toISOString(),
+            files: stale.slice(0, 8).map((f) => f.path.slice(prefix.length)),
+            head: headSha.slice(0, 10),
+            client_id: clientId,
+          };
+          await setSetting(db, `editpending_${slug}`, JSON.stringify(next));
+        } else if (pend.n) {
+          await setSetting(db, `editpending_${slug}`, '');
+        }
+      }
+    } catch { /* badge is best-effort; the watcher must keep walking */ }
+    if (!folderChanged) continue;
+    // ---- new commits touching this folder ----
+    if (!st.sha) {
+      // first run: baseline silently so we never spam history as "new edits"
+      await setSetting(db, key, JSON.stringify({ sha: headSha, tree: d.sha, at: new Date().toISOString() }));
+      continue;
+    }
+    let fresh = [];
+    try {
+      const list = await gh(`/repos/${repo}/commits?path=${encodeURIComponent('sites/' + slug)}&per_page=15&sha=${headSha}`);
+      for (const cm of list) { if (cm.sha === st.sha) break; fresh.push(cm); }
+    } catch (e) { await logEvent(db, clientId, 'error', `Edit-watcher commit list failed for ${slug}: ${e.message}`); continue; }
+    // mark seen FIRST — a crash mid-loop must never produce duplicate emails
+    await setSetting(db, key, JSON.stringify({ sha: headSha, tree: d.sha, at: new Date().toISOString() }));
+    fresh.reverse(); // oldest first so the feed reads chronologically
+    for (const cm of fresh) {
+      const short = cm.sha.slice(0, 7);
+      // event dedupe by sha (survives marker resets)
+      const dup = await db.prepare(`SELECT id FROM events WHERE type = 'site_edit' AND detail LIKE ? LIMIT 1`).bind(`%[${short}]%`).first();
+      if (dup) continue;
+      let filesChanged = [], msg = (cm.commit && cm.commit.message) || '';
+      try {
+        const detail = await gh(`/repos/${repo}/commits/${cm.sha}`);
+        filesChanged = (detail.files || []).map((f) => f.filename).filter((p) => p.startsWith(`sites/${slug}/`)).map((p) => p.split('/').slice(2).join('/'));
+        msg = (detail.commit && detail.commit.message) || msg;
+      } catch { /* files list is nice-to-have */ }
+      const src = editSource(cm);
+      const when = (cm.commit && cm.commit.author && cm.commit.author.date) || new Date().toISOString();
+      const fileLine = filesChanged.length ? `${filesChanged.length} file(s): ${filesChanged.slice(0, 6).join(', ')}${filesChanged.length > 6 ? ' +' + (filesChanged.length - 6) + ' more' : ''}` : 'files unavailable';
+      const msgLine = String(msg).split('\n')[0].slice(0, 120);
+      await logEvent(db, clientId, 'site_edit',
+        `📝 ${slug} edited — ${fileLine} — "${msgLine}" — by ${src} [${short}]`);
+      // ---- email (deduped by full sha, rolling window) ----
+      if (mailShas.includes(cm.sha)) continue;
+      mailShas.push(cm.sha); mailDirty = true;
+      const published = staleCount === 0;
+      const filesHtml = filesChanged.length ? filesChanged.slice(0, 12).map((p) => `<li><code>${p.replace(/[<>&]/g, '')}</code></li>`).join('') : '<li>(file list unavailable)</li>';
+      await notifyOwner(env, settings, `📝 Site edited: ${slug} — ${filesChanged.length || '?'} file(s)`,
+        `<p><b>${slug}</b> was just edited by <b>${src.replace(/[<>&]/g, '')}</b> (${new Date(when).toUTCString()}).</p>` +
+        `<ul>${filesHtml}</ul>` +
+        `<p>Commit note: "${msgLine.replace(/[<>&]/g, '')}" <span style="color:#94a3b8">[${short}]</span></p>` +
+        `<p>${published ? '✅ Already published — the served copy matches the repo.' : '⏳ NOT yet published — the live/preview copy does not have this yet. Open the card and hit <b>🚀 Publish now</b>, or it publishes with the next version bump.'}</p>` +
+        `<p><a href="${BASE_URL}/activity">See all site activity</a> · <a href="${BASE_URL}">Open Mission Control</a></p>`);
+    }
+  }
+  if (mailDirty) await setSetting(db, 'editmail_shas', JSON.stringify(mailShas.slice(-120)));
+  await setSetting(db, 'editwatch_head', headSha);
+}
+
+// Cron: finish "Publish now" imports that needed more than one 25-blob pass
+async function continuePublish(env, settings) {
+  if (!env.GITHUB_TOKEN) return;
+  const db = env.DB;
+  const rows = (await db.prepare(`SELECT key, value FROM settings WHERE key LIKE 'pubq_%' AND value != ''`).all()).results || [];
+  for (const row of rows) {
+    const slug = row.key.slice(5);
+    let q = {}; try { q = JSON.parse(row.value || '{}'); } catch {}
+    try {
+      const r = await importSite(env, settings, slug, q.client_id || null, undefined, { quiet: true });
+      if (r.complete) {
+        if (r.meta_sha) await setSetting(db, `site_sha_${slug}`, r.meta_sha);
+        await setSetting(db, row.key, '');
+      }
+    } catch (e) {
+      await setSetting(db, row.key, '');
+      await logEvent(db, q.client_id || null, 'error', `Publish-now continuation failed for ${slug}: ${e.message}`);
+    }
+  }
+}
+
 // Manual import endpoint (session-protected)
 app.post('/api/sites/import', async (c) => {
   const { slug, client_id } = await c.req.json();
@@ -3879,6 +4077,31 @@ app.post('/api/sites/import', async (c) => {
   try {
     const r = await importSite(c.env, settings, slug, client_id);
     return c.json({ ok: true, ...r });
+  } catch (e) {
+    return c.json({ ok: false, error: e.message }, 502);
+  }
+});
+
+// 🚀 PUBLISH NOW (session-protected): force the import for a slug WITHOUT a
+// site-meta version bump — the button next to the "edits not yet published" badge.
+// Quiet import: files only; never demotes stage, never re-holds, never emails clients.
+app.post('/api/sites/publish-now', async (c) => {
+  const { slug, client_id } = await c.req.json().catch(() => ({}));
+  if (!slug || !/^[a-z0-9-]+$/.test(String(slug))) return c.json({ error: 'valid slug required' }, 400);
+  if (!c.env.GITHUB_TOKEN) return c.json({ error: 'GITHUB_TOKEN secret not set' }, 400);
+  const db = c.env.DB;
+  const settings = await getSettings(db);
+  const cid = client_id ? Number(client_id) : await slugClientId(db, slug);
+  try {
+    const r = await importSite(c.env, settings, slug, cid, undefined, { quiet: true });
+    if (r.complete) {
+      if (r.meta_sha) await setSetting(db, `site_sha_${slug}`, r.meta_sha); // keep autoPublish in sync
+      await setSetting(db, `pubq_${slug}`, '');
+      return c.json({ ok: true, complete: true, files: r.files, preview_url: r.preview_url });
+    }
+    // more than one 25-blob pass needed — the */5 cron continues it automatically
+    await setSetting(db, `pubq_${slug}`, JSON.stringify({ client_id: cid, started: new Date().toISOString() }));
+    return c.json({ ok: true, complete: false, files: r.files, remaining: r.remaining, preview_url: r.preview_url });
   } catch (e) {
     return c.json({ ok: false, error: e.message }, 502);
   }
@@ -4463,6 +4686,12 @@ export default {
     ));
     ctx.waitUntil(autoPublish(env, settings).catch((e) =>
       logEvent(env.DB, null, 'error', `Auto-publish failed: ${e.message}`)
+    ));
+    ctx.waitUntil(editWatch(env, settings).catch((e) =>
+      logEvent(env.DB, null, 'error', `Edit-watcher failed: ${e.message}`)
+    ));
+    ctx.waitUntil(continuePublish(env, settings).catch((e) =>
+      logEvent(env.DB, null, 'error', `Publish-now continuation failed: ${e.message}`)
     ));
     ctx.waitUntil(pollBilling(env).catch((e) =>
       logEvent(env.DB, null, 'error', `Billing poll failed: ${e.message}`)
