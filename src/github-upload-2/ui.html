@@ -1,0 +1,1023 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ConversionCo — Mission Control</title>
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#071B33">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="MissionCtrl">
+<link rel="apple-touch-icon" href="/icon-192.png">
+<style>
+  :root {
+    --navy: #071B33; --navy2: #0d2b4d; --bg: #f1f5f9; --card: #ffffff;
+    --line: #e2e8f0; --text: #0f172a; --muted: #64748b;
+    --green: #059669; --amber: #d97706; --blue: #2563eb; --purple: #7c3aed; --red: #dc2626;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body { font-family: -apple-system, 'Segoe UI', Inter, Roboto, sans-serif; background: var(--bg); color: var(--text); }
+  header { background: var(--navy); color: #fff; padding: 14px 24px; display: flex; align-items: center; gap: 16px; position: sticky; top: 0; z-index: 20; }
+  header h1 { font-size: 17px; font-weight: 700; letter-spacing: .3px; }
+  header .tag { font-size: 11px; background: rgba(255,255,255,.14); padding: 3px 10px; border-radius: 99px; }
+  header .spacer { flex: 1; }
+  header button { background: rgba(255,255,255,.12); color: #fff; border: 0; padding: 8px 14px; border-radius: 8px; cursor: pointer; font-size: 13px; }
+  header button:hover { background: rgba(255,255,255,.22); }
+  main { max-width: 1200px; margin: 0 auto; padding: 24px; }
+
+  .addbar { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 22px; box-shadow: 0 1px 3px rgba(0,0,0,.05); }
+  .addbar b { font-size: 14px; margin-right: 4px; }
+  .addbar input { padding: 10px 12px; border: 1.5px solid var(--line); border-radius: 8px; font-size: 14px; }
+  .addbar input:focus { outline: none; border-color: var(--navy); }
+  #newEmail { min-width: 260px; }
+  .btn { padding: 10px 16px; border: 0; border-radius: 8px; font-size: 13.5px; font-weight: 600; cursor: pointer; }
+  .btn-primary { background: var(--navy); color: #fff; }
+  .btn-primary:hover { background: var(--navy2); }
+  .btn-ghost { background: #eef2f7; color: var(--navy); }
+  .btn-green { background: var(--green); color: #fff; }
+  .btn-red { background: #fee2e2; color: var(--red); }
+  .btn:disabled { opacity: .5; cursor: wait; }
+
+  .cols { display: grid; grid-template-columns: 1fr 340px; gap: 22px; align-items: start; }
+  @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
+
+  table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,.05); }
+  th { text-align: left; font-size: 11.5px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); padding: 12px 14px; border-bottom: 1px solid var(--line); background: #f8fafc; }
+  td { padding: 13px 14px; border-bottom: 1px solid var(--line); font-size: 14px; vertical-align: middle; }
+  tr:last-child td { border-bottom: 0; }
+  tr.rowclick { cursor: pointer; }
+  tr.rowclick:hover { background: #f8fafc; }
+  .chip { display: inline-block; padding: 4px 11px; border-radius: 99px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+
+  .panel { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px; box-shadow: 0 1px 3px rgba(0,0,0,.05); }
+  .panel h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin-bottom: 12px; }
+  .feed { display: flex; flex-direction: column; gap: 10px; max-height: 480px; overflow-y: auto; }
+  .feed .item { font-size: 13px; line-height: 1.45; padding-bottom: 10px; border-bottom: 1px dashed var(--line); }
+  .feed .item:last-child { border-bottom: 0; }
+  .feed time { color: var(--muted); font-size: 11.5px; display: block; }
+
+  .themesw { background:#fff; border:1px solid #e2e8f0; border-radius:10px; padding:8px 10px; cursor:pointer; display:flex; flex-direction:column; align-items:center; transition:all .15s; }
+  .themesw:hover { border-color:#94a3b8; transform:translateY(-1px); box-shadow:0 2px 8px rgba(0,0,0,.08); }
+  .themesw:disabled { opacity:.5; cursor:wait; }
+  .themesw.sel { border-color:#059669; box-shadow:0 0 0 2px rgba(5,150,105,.2); }
+  /* drawer */
+  #overlay { position: fixed; inset: 0; background: rgba(7,27,51,.45); display: none; z-index: 30; }
+  #drawer { position: fixed; top: 0; right: -560px; width: min(560px, 100vw); height: 100vh; background: #fff; z-index: 31; transition: right .25s ease; overflow-y: auto; box-shadow: -12px 0 40px rgba(0,0,0,.2); }
+  #drawer.open { right: 0; } #overlay.open { display: block; }
+  #drawer .dhead { background: var(--navy); color: #fff; padding: 20px 24px; }
+  #drawer .dhead h2 { font-size: 19px; } #drawer .dhead p { opacity: .75; font-size: 13px; margin-top: 3px; }
+  #drawer .dbody { padding: 20px 24px; display: flex; flex-direction: column; gap: 18px; }
+  .kv { font-size: 13.5px; } .kv b { display: block; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 2px; }
+  .intake { background: #f8fafc; border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  .intake h4 { font-size: 13px; margin-bottom: 8px; color: var(--navy); }
+  .intake dl { font-size: 13px; } .intake dt { font-weight: 600; margin-top: 8px; color: #334155; } .intake dd { margin-left: 0; color: #475569; white-space: pre-wrap; }
+  textarea, select, .modal input { width: 100%; padding: 10px 12px; border: 1.5px solid var(--line); border-radius: 8px; font-size: 13.5px; font-family: inherit; }
+  textarea:focus, select:focus, .modal input:focus { outline: none; border-color: var(--navy); }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+  /* modal */
+  .modal { position: fixed; inset: 0; background: rgba(7,27,51,.45); display: none; place-items: center; z-index: 40; }
+  .modal.open { display: grid; }
+  .modal .box { background: #fff; border-radius: 16px; width: min(640px, 94vw); max-height: 90vh; overflow-y: auto; padding: 26px; }
+  .modal h2 { font-size: 18px; margin-bottom: 4px; color: var(--navy); }
+  .modal p.hint { font-size: 12.5px; color: var(--muted); margin-bottom: 14px; }
+  .modal label { display: block; font-size: 12.5px; font-weight: 600; margin: 14px 0 5px; color: #334155; }
+  .modal .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .modal .foot { display: flex; gap: 10px; margin-top: 20px; justify-content: flex-end; }
+  .okmsg { font-size: 13px; padding: 10px 12px; border-radius: 8px; margin-top: 12px; display: none; }
+  .okmsg.ok { background: #ecfdf5; color: var(--green); display: block; }
+  .okmsg.bad { background: #fef2f2; color: var(--red); display: block; }
+
+  #toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: var(--navy); color: #fff; padding: 12px 22px; border-radius: 10px; font-size: 14px; display: none; z-index: 50; box-shadow: 0 10px 30px rgba(0,0,0,.3); }
+  .empty { text-align: center; color: var(--muted); padding: 40px; font-size: 14px; }
+
+  /* money + needs-you strips */
+  #moneyStrip { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 14px; }
+  .stat { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px 18px; box-shadow: 0 1px 3px rgba(0,0,0,.05); }
+  .stat b { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin-bottom: 4px; }
+  .stat .v { font-size: 22px; font-weight: 800; color: var(--navy); }
+  .stat .sub { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+  #needsStrip { background: #fffbeb; border: 1px solid #fde68a; border-radius: 14px; padding: 14px 18px; margin-bottom: 18px; }
+  #needsStrip h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .6px; color: #92400e; margin-bottom: 8px; }
+  #needsStrip .need { font-size: 13.5px; padding: 7px 4px; border-bottom: 1px dashed #fde68a; cursor: pointer; border-radius: 6px; }
+  #needsStrip .need:last-child { border-bottom: 0; }
+  #needsStrip .need:hover { background: #fef3c7; }
+  #needsStrip.allgood { background: #ecfdf5; border-color: #a7f3d0; }
+  #needsStrip.allgood h3 { color: #047857; }
+
+  /* health dots */
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 99px; margin-right: 7px; vertical-align: 1px; }
+  .dot.green { background: #10b981; } .dot.yellow { background: #f59e0b; } .dot.red { background: #ef4444; box-shadow: 0 0 0 3px rgba(239,68,68,.18); } .dot.gray { background: #cbd5e1; }
+
+  /* view toggle + board */
+  .viewbar { display: flex; gap: 6px; margin-bottom: 12px; align-items: center; }
+  .viewbar button { border: 1px solid var(--line); background: var(--card); color: var(--muted); padding: 7px 14px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; }
+  .viewbar button.on { background: var(--navy); color: #fff; border-color: var(--navy); }
+  #boardWrap { display: none; overflow-x: auto; padding-bottom: 10px; -webkit-overflow-scrolling: touch; }
+  .board { display: flex; gap: 12px; align-items: flex-start; min-width: max-content; }
+  .bcol { background: #eaeff5; border-radius: 14px; padding: 10px; width: 230px; flex: 0 0 230px; }
+  .bcol h4 { font-size: 11.5px; text-transform: uppercase; letter-spacing: .6px; color: #475569; padding: 4px 6px 10px; display: flex; justify-content: space-between; }
+  .bcol h4 span { background: #fff; border-radius: 99px; padding: 0 8px; font-size: 11px; }
+  .bcard { position: relative; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; cursor: pointer; box-shadow: 0 1px 2px rgba(0,0,0,.05); }
+  .bcard:hover { border-color: #94a3b8; }
+  .peek { position: absolute; top: 7px; right: 7px; background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 2px 8px; font-size: 13px; cursor: pointer; opacity: .5; transition: opacity .15s; }
+  .peek:hover { opacity: 1; background: #f1f5f9; }
+  .accessbox { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 14px; }
+  .accessbox .alinks { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 11px; font-size: 12.5px; }
+  .accessbox .alinks a { color: #475569; text-decoration: none; border-bottom: 1px dotted #cbd5e1; }
+  .accessbox .alinks a:hover { color: #0B1D33; }
+  .bcard b { font-size: 13.5px; display: block; }
+  .bcard .em { font-size: 11.5px; color: var(--muted); word-break: break-all; }
+  .bcard .tier { font-size: 10.5px; font-weight: 700; color: #7c3aed; }
+
+  /* build progress bar */
+  .bprog { margin-top: 6px; max-width: 280px; }
+  .bprog .track { height: 8px; background: #e2e8f0; border-radius: 99px; overflow: hidden; }
+  .bprog .fill { height: 100%; border-radius: 99px; background: linear-gradient(90deg, #be185d, #7c3aed);
+    background-size: 200% 100%; animation: bshine 2.2s linear infinite; transition: width .8s ease; }
+  @keyframes bshine { 0% { background-position: 0% 0; } 100% { background-position: 200% 0; } }
+  .bprog .blabel { font-size: 11px; color: var(--muted); margin-top: 3px; display: flex; justify-content: space-between; gap: 8px; }
+
+  /* mobile polish */
+  @media (max-width: 700px) {
+    main { padding: 12px; }
+    header { padding: 12px 14px; gap: 8px; }
+    header button { padding: 10px 12px; }
+    .addbar { padding: 12px; } #newEmail { min-width: 0; flex: 1 1 100%; } .addbar input { flex: 1 1 100%; } .addbar .btn { flex: 1 1 100%; padding: 13px; }
+    #moneyStrip { grid-template-columns: 1fr 1fr; gap: 8px; } #moneyStrip .stat:first-child { grid-column: 1 / -1; }
+    .stat .v { font-size: 19px; }
+    th:nth-child(3), td:nth-child(3) { display: none; }
+    td { padding: 12px 10px; } .btn { padding: 12px 14px; }
+    .bcol { width: 200px; flex-basis: 200px; }
+    #drawer { width: 100vw; right: -100vw; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>ConversionCo</h1><span class="tag">Mission Control</span>
+  <span class="spacer"></span>
+  <button onclick="pollNow(this)">↻ Check for submissions</button>
+  <button onclick="location.href='/activity'" title="Every site edit and publish, across all clients, newest first.">📜 Site activity</button>
+  <button onclick="openSettings()">⚙ Settings</button>
+</header>
+
+<main>
+  <div class="addbar">
+    <b>New client:</b>
+    <input id="newEmail" type="email" placeholder="client email address">
+    <input id="newName" type="text" placeholder="name (optional)">
+    <button class="btn btn-primary" id="addBtn" onclick="addClient()">Send Intake 1 →</button>
+    <span style="border-left:1px solid var(--line);align-self:stretch;margin:0 4px;"></span>
+    <b>💡 Prospect demo:</b>
+    <input id="proBiz" type="text" placeholder="business name">
+    <input id="proCity" type="text" placeholder="city, state" style="max-width:150px">
+    <button class="btn btn-ghost" id="proBtn" onclick="addProspect()" title="Builds them a real demo homepage before you've ever talked — send the link as your pitch.">Build demo →</button>
+  </div>
+
+  <div id="moneyStrip"></div>
+  <div id="needsStrip" style="display:none"></div>
+
+  <div class="viewbar">
+    <button id="vTable" class="on" onclick="setView('table')">☰ List</button>
+    <button id="vBoard" onclick="setView('board')">▦ Pipeline board</button>
+  </div>
+
+  <div class="cols" id="tableWrap">
+    <div>
+      <table>
+        <thead><tr><th>Client</th><th>Stage</th><th>Last activity</th><th></th></tr></thead>
+        <tbody id="clientRows"></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h3>Activity</h3>
+      <div class="feed" id="feed"></div>
+    </div>
+  </div>
+
+  <div id="boardWrap"><div class="board" id="board"></div></div>
+</main>
+
+<!-- client drawer -->
+<div id="overlay" onclick="closeDrawer()"></div>
+<div id="drawer"></div>
+
+<!-- settings modal -->
+<div class="modal" id="settingsModal">
+  <div class="box">
+    <h2>Settings</h2>
+    <p class="hint">Connects the dashboard to your GoHighLevel account and controls the emails clients receive.</p>
+
+    <label>GHL Location ID <span style="font-weight:400;color:var(--muted)">(GHL → Settings → Business Profile)</span></label>
+    <input id="s_loc" placeholder="e.g. ve9EPM428h8vShlRW1KT">
+    <div style="display:flex;gap:8px;margin-top:10px;">
+      <button class="btn btn-ghost" onclick="testGHL()">Test connection & load forms</button>
+    </div>
+    <div class="okmsg" id="ghlmsg"></div>
+
+    <div class="row2">
+      <div><label>Intake Form 1</label><select id="s_form1"><option value="">— pick after testing —</option></select></div>
+      <div><label>Intake Form 2 (Website Vision)</label><select id="s_form2"><option value="">— pick after testing —</option></select></div>
+    </div>
+    <div class="row2">
+      <div><label>Intake 1 page link</label><input id="s_link1"></div>
+      <div><label>Intake 2 page link</label><input id="s_link2"></div>
+    </div>
+    <label>Send emails from (optional, must be verified in GHL)</label>
+    <input id="s_from" placeholder="tiffany@conversionco918.com">
+
+    <label>Booking calendar link <span style="font-weight:400;color:var(--muted)">(your GHL calendar — auto-emailed after Intake 1 is submitted)</span></label>
+    <input id="s_booklink" placeholder="https://api.leadconnectorhq.com/widget/booking/...">
+    <label>Booking email — subject</label>
+    <input id="s_bsub">
+    <label>Booking email — body ({{name}} and {{booking_link}} get filled in)</label>
+    <textarea id="s_bbody" rows="6"></textarea>
+
+    <label>Intake 1 email — subject</label>
+    <input id="s_sub1">
+    <label>Intake 1 email — body (HTML, {{name}} and {{form_link}} get filled in)</label>
+    <textarea id="s_body1" rows="7"></textarea>
+    <label>Intake 2 email — subject</label>
+    <input id="s_sub2">
+    <label>Intake 2 email — body</label>
+    <textarea id="s_body2" rows="7"></textarea>
+
+    <div class="foot">
+      <button class="btn btn-ghost" onclick="closeSettings()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveSettings(this)">Save settings</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const STAGES = {
+  prospect:       { label: '💡 Prospect — demo',  bg:'#fdf4ff', fg:'#a21caf' },
+  new:            { label: 'New',                 bg:'#e2e8f0', fg:'#334155' },
+  intake1_sent:   { label: 'Intake 1 sent',       bg:'#dbeafe', fg:'#1d4ed8' },
+  intake1_done:   { label: '✓ Intake 1 done — call them!', bg:'#fef3c7', fg:'#b45309' },
+  intake2_sent:   { label: 'Intake 2 sent',       bg:'#ede9fe', fg:'#6d28d9' },
+  intake2_done:   { label: '✓ Intake 2 done',     bg:'#ccfbf1', fg:'#0f766e' },
+  generating:     { label: '⚙ Building site…',    bg:'#fce7f3', fg:'#be185d' },
+  preview_ready:  { label: '★ Preview ready',     bg:'#dcfce7', fg:'#15803d' },
+  live:           { label: '● Live',              bg:'#071B33', fg:'#ffffff' },
+  archived:       { label: 'Archived',            bg:'#f1f5f9', fg:'#94a3b8' },
+};
+let STATE = { clients: [], events: [], settings: {} };
+
+function esc(s){ return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function toast(msg){ const t = document.getElementById('toast'); t.textContent = msg; t.style.display='block'; setTimeout(()=>t.style.display='none', 3500); }
+function ago(iso){ if(!iso) return ''; const d = new Date(iso + (iso.includes('Z')||iso.includes('+') ? '' : 'Z')); const m = (Date.now()-d)/60000;
+  if (m < 1) return 'just now'; if (m < 60) return Math.floor(m)+'m ago'; if (m < 1440) return Math.floor(m/60)+'h ago'; return Math.floor(m/1440)+'d ago'; }
+
+async function api(path, opts={}) {
+  const r = await fetch(path, { headers: {'Content-Type':'application/json'}, ...opts });
+  if (r.status === 401) { location.reload(); return {}; }
+  return r.json();
+}
+
+async function refresh() {
+  STATE = await api('/api/state');
+  renderOverview(); renderClients(); renderBoard(); renderFeed();
+}
+
+let VIEW = localStorage.getItem('cc_view') || 'table';
+function setView(v) {
+  VIEW = v; localStorage.setItem('cc_view', v);
+  document.getElementById('tableWrap').style.display = v === 'table' ? '' : 'none';
+  document.getElementById('boardWrap').style.display = v === 'board' ? 'block' : 'none';
+  document.getElementById('vTable').classList.toggle('on', v === 'table');
+  document.getElementById('vBoard').classList.toggle('on', v === 'board');
+}
+
+function dot(c) {
+  const h = (STATE.overview && STATE.overview.health && STATE.overview.health[c.id]) || { dot: 'gray', why: '' };
+  return `<span class="dot ${h.dot}" title="${esc(h.why)}"></span>`;
+}
+
+// Build progress bar: real milestones from the builder, blended with elapsed time.
+// A typical build runs ~15 minutes; the time-based floor never exceeds 92% so the
+// bar only hits 100% when the site actually publishes (stage flips to preview).
+const BUILD_MINUTES = 15;
+function buildBar(c) {
+  if (c.stage !== 'generating') return '';
+  const p = (STATE.overview && STATE.overview.buildProgress && STATE.overview.buildProgress[c.id]) || {};
+  const started = Date.parse((p.started_at || c.updated_at || '') + (String(p.started_at || c.updated_at || '').includes('Z') ? '' : 'Z'));
+  const elapsedMin = isNaN(started) ? 0 : Math.max(0, (Date.now() - started) / 60000);
+  const timePct = Math.min(92, (elapsedMin / BUILD_MINUTES) * 100);
+  const pct = Math.round(Math.min(97, Math.max(p.pct || 5, timePct)));
+  const left = Math.ceil(BUILD_MINUTES - elapsedMin);
+  const eta = elapsedMin >= BUILD_MINUTES ? 'finishing up…' : `~${Math.max(1, left)} min left`;
+  // HONESTY GUARD: a dead build must never look like it's "finishing up".
+  const lastBeat = Date.parse((p.updated_at || p.started_at || '') + (String(p.updated_at || p.started_at || '').includes('Z') ? '' : 'Z'));
+  const quietMin = isNaN(lastBeat) ? null : Math.round((Date.now() - lastBeat) / 60000);
+  if (quietMin !== null && quietMin >= 20) {
+    return `<div class="bprog"><div class="track"><div class="fill" style="width:${pct}%;background:#F59E0B;"></div></div>
+      <div class="blabel"><span style="color:#B45309;font-weight:600;">⚠️ Builder went quiet ${quietMin} min ago</span><span>auto-requeue + re-fire is coming</span></div></div>`;
+  }
+  return `<div class="bprog"><div class="track"><div class="fill" style="width:${pct}%"></div></div>
+    <div class="blabel"><span>⚙ ${esc(p.step || 'Building')}</span><span>${pct}% · ${eta}</span></div></div>`;
+}
+// keep bars moving between refreshes
+setInterval(() => {
+  if ((STATE.clients || []).some(c => c.stage === 'generating')) { renderClients(); renderBoard(); }
+}, 15000);
+
+function renderOverview() {
+  const ov = STATE.overview;
+  const ms = document.getElementById('moneyStrip'), ns = document.getElementById('needsStrip');
+  if (!ov) { ms.innerHTML = ''; ns.style.display = 'none'; return; }
+  const m = ov.money;
+  ms.innerHTML = `
+    <div class="stat"><b>Cash collected</b><div class="v">$${(m.collected).toLocaleString()}</div><div class="sub">project fees paid</div></div>
+    <div class="stat"><b>Outstanding</b><div class="v">$${(m.outstanding).toLocaleString()}</div><div class="sub">invoices awaiting payment</div></div>
+    <div class="stat"><b>Recurring — MRR</b><div class="v">$${m.mrr.toLocaleString()}/mo</div><div class="sub">${m.hostingCount} care-plan subscription${m.hostingCount === 1 ? '' : 's'}</div></div>`;
+  ns.style.display = 'block';
+  if (!ov.needs.length) {
+    ns.className = 'allgood'; ns.id = 'needsStrip';
+    ns.classList.add('allgood');
+    ns.innerHTML = `<h3>Needs you — nothing 🎉</h3><div style="font-size:13.5px;color:#065f46;">No unsigned agreements, no stuck invoices, no failed checks. The machine is running itself.</div>`;
+  } else {
+    ns.classList.remove('allgood');
+    ns.innerHTML = `<h3>Needs you — ${ov.needs.length} item${ov.needs.length === 1 ? '' : 's'}</h3>` +
+      ov.needs.map(n => `<div class="need" ${n.id ? `onclick="openDrawer(${n.id})"` : ''}>${esc(n.msg)}</div>`).join('');
+  }
+}
+
+const BOARD_COLS = ['New', 'Intake 1', 'Call', 'Closing', 'Paid', 'Building', 'Preview', 'Live'];
+function colFor(c) {
+  let b = {}; try { b = JSON.parse(c.billing || '{}'); } catch {}
+  if (c.stage === 'prospect') return 'New';
+  if (c.stage === 'live') return 'Live';
+  if (c.stage === 'preview_ready') return 'Preview';
+  if (c.stage === 'generating') return 'Building';
+  const depPaid = b.dep_status === 'paid' || b.invoice_status === 'paid';
+  if (depPaid) return (c.stage === 'intake2_sent' || c.stage === 'intake2_done') ? 'Building' : 'Paid';
+  if (b.invoice_status === 'open' || b.dep_status === 'open' || b.agr_sent) return 'Closing';
+  if (c.stage === 'intake1_done' || c.stage === 'intake2_sent' || c.stage === 'intake2_done') return 'Call';
+  if (c.stage === 'intake1_sent') return 'Intake 1';
+  return 'New';
+}
+function renderBoard() {
+  const el = document.getElementById('board');
+  const active = STATE.clients.filter(c => c.stage !== 'archived');
+  const byCol = {}; BOARD_COLS.forEach(k => byCol[k] = []);
+  active.forEach(c => byCol[colFor(c)].push(c));
+  el.innerHTML = BOARD_COLS.map(k => `
+    <div class="bcol"><h4>${k} <span>${byCol[k].length}</span></h4>
+      ${byCol[k].map(c => `<div class="bcard" onclick="openDrawer(${c.id})">
+        <button class="peek" title="Open their portal — admin view" onclick="event.stopPropagation();openLink(${c.id}, 'portal', this)">👁</button>
+        <b>${dot(c)}${esc(c.business_name || c.name || c.email)}</b>
+        <span class="em">${esc(c.email)}</span>
+        ${c.tier === 'premium' ? '<span class="tier">★ PREMIUM</span>' : ''}
+        ${buildBar(c)}
+        <div style="font-size:11px;color:var(--muted);margin-top:3px;">${ago(c.updated_at)}</div>
+      </div>`).join('') || '<div style="font-size:12px;color:#94a3b8;padding:6px;">—</div>'}
+    </div>`).join('');
+}
+
+function renderClients() {
+  const tb = document.getElementById('clientRows');
+  if (!STATE.clients.length) { tb.innerHTML = '<tr><td colspan="4"><div class="empty">No clients yet — add one above to send your first automated Intake 1 email.</div></td></tr>'; return; }
+  tb.innerHTML = STATE.clients.map(c => {
+    const st = STAGES[c.stage] || STAGES.new;
+    return `<tr class="rowclick" onclick="openDrawer(${c.id})">
+      <td>${dot(c)}<b>${esc(c.name || c.email)}</b>${c.name ? `<br><span style="color:var(--muted);font-size:12px;margin-left:16px;">${esc(c.email)}</span>` : ''}</td>
+      <td><span class="chip" style="background:${st.bg};color:${st.fg}">${st.label}</span>${editChip(c)}${buildBar(c)}</td>
+      <td style="color:var(--muted);font-size:13px">${ago(c.updated_at)}</td>
+      <td><button class="peek" style="position:static" title="Open their portal — admin view" onclick="event.stopPropagation();openLink(${c.id}, 'portal', this)">👁</button> ${c.stage === 'intake1_done' ? `<button class="btn btn-green" onclick="event.stopPropagation();sendIntake2(${c.id}, this)">Approve → Intake 2</button>` : ''}</td>
+    </tr>`;
+  }).join('');
+}
+
+function renderFeed() {
+  const f = document.getElementById('feed');
+  if (!STATE.events.length) { f.innerHTML = '<div class="empty">Activity will appear here.</div>'; return; }
+  const DETAIL_TYPES = ['error','site_edit','published','auto_published'];
+  f.innerHTML = STATE.events.map(e => `<div class="item"><b>${esc(e.client_name || e.client_email || 'System')}</b> — ${esc(pretty(e.type))}${e.detail && DETAIL_TYPES.includes(e.type) ? `<br><span style="color:${e.type==='error'?'var(--red)':'#64748b'};font-size:12px">${esc(e.detail)}</span>`:''}<time>${ago(e.created_at)}</time></div>`).join('');
+}
+
+// EDIT VISIBILITY: amber badge data from /api/state (STATE.edits, keyed by slug)
+function editFor(c) { return (STATE.edits || []).find(e => e.client_id === c.id); }
+function editChip(c) {
+  const e = editFor(c); if (!e) return '';
+  return `<br><span class="chip" style="background:#fffbeb;color:#92400e;border:1px solid #fde68a;margin-top:4px;" title="${esc((e.files||[]).join(', '))}">📝 ${e.n} file${e.n===1?'':'s'} not yet published (${ago(e.since)})</span>`;
+}
+async function sendGuide(id, btn) {
+  if (btn) { btn.disabled = true; }
+  const r = await api(`/api/clients/${id}/send-guide`, { method:'POST', body: '{}' });
+  if (btn) { btn.disabled = false; }
+  if (r.error) return toast('⚠ ' + r.error);
+  toast('💼 Pricing guide emailed — you’ll see 👀 in the feed when they open it');
+  refresh(); setTimeout(() => openDrawer(id), 400);
+}
+async function publishNow(slug, id, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Publishing…'; }
+  const r = await api('/api/sites/publish-now', { method:'POST', body: JSON.stringify({ slug, client_id: id }) });
+  if (btn) { btn.disabled = false; btn.textContent = '🚀 Publish now'; }
+  if (r.error) return toast('⚠ ' + r.error);
+  if (r.complete) toast('✅ Published — ' + r.files + ' file(s) updated on ' + slug);
+  else toast('📦 Publishing ' + slug + '… ' + r.remaining + ' file(s) to go — finishes automatically within ~5 min');
+  await refresh();
+  if (id) setTimeout(() => openDrawer(id), 300);
+}
+function pretty(t){ return ({client_created:'added to pipeline', booking_email_sent:'booking link emailed 📅', intake1_sent:'Intake 1 email sent', intake1_done:'submitted Intake 1 🎉', intake2_sent:'Intake 2 email sent', intake2_done:'submitted Intake 2 🎉', stage_changed:'stage updated', error:'⚠ error', client_deleted:'removed', webhook_received:'webhook ping', build_started:'⚙ build started', build_stalled:'⚠️ build stalled — re-queued', fire_requested:'🔥 manual builder fire requested', preview_ready:'★ preview is ready', preview_held:'⏸ preview HELD — awaiting your approval', preview_approved:'📤 preview approved & sent', preview_sent:'📤 reveal email sent to client', invoice_sent:'invoice sent 💳', invoice_paid:'payment received 💰', agreement_sent:'agreement sent 📄', agreement_signed:'agreement signed ✍️', portal_invited:'portal login sent 🔑', hosting_active:'hosting active 🔒', owner_digest:'weekly digest sent 📊', sms_sent:'text sent 📱', sms_skipped:'text skipped', prospect_created:'💡 prospect added', demo_ready:'💡 demo site ready', nudge_sent:'🤖 auto-nudge sent', build_stalled:'⚠️ build stalled — re-queued', site_rolled_back:'⏪ site restored to previous version', launched:'🚀 LAUNCHED', launch_emailed:'🚀 launch email sent', page1_celebrated:'🎉 Page 1 celebration sent', first_lead_celebrated:'🎉 first-lead celebration sent', report_notified:'📬 report-ready email sent', site_edit:'📝 site files edited', published:'✅ edits published', auto_published:'🚀 site republished', import_progress:'📦 importing site files', guide_sent:'💼 pricing guide sent', guide_viewed:'👀 opened their pricing guide'})[t] || t; }
+
+async function sendExitPackage(id, btn) {
+  if (!confirm('Send the exit package?\n\nThe client receives a warm goodbye email with a download link to their COMPLETE package: every website file, all reports, Google position history, and their signed agreement.\n\nNothing is deleted or archived — you stay in control of the card afterwards.')) return;
+  btn.disabled = true;
+  const r = await api(`/api/clients/${id}/exit-package`, { method: 'POST', body: '{}' });
+  btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error);
+  copyText(r.url || '');
+  toast('📦 Exit package emailed — download link also copied for you');
+}
+async function rollbackSite(id, btn) {
+  if (!confirm('Restore this website to its PREVIOUS version?\n\nSafe: this creates a new version (history is never deleted) and republishes within ~5 minutes. You can roll forward again later.')) return;
+  btn.disabled = true;
+  const r = await api(`/api/clients/${id}/rollback`, { method:'POST', body: '{}' });
+  btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error);
+  toast(`⏪ Restored to previous version (${r.restored}) — live again within ~5 min`);
+  refresh(); setTimeout(() => openDrawer(id), 400);
+}
+
+async function addProspect() {
+  const business_name = document.getElementById('proBiz').value.trim();
+  const city = document.getElementById('proCity').value.trim();
+  if (!business_name || !city) return toast('Enter the business name and city first');
+  const btn = document.getElementById('proBtn'); btn.disabled = true;
+  const r = await api('/api/prospects', { method:'POST', body: JSON.stringify({ business_name, city }) });
+  btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error);
+  document.getElementById('proBiz').value = ''; document.getElementById('proCity').value = '';
+  toast('💡 Prospect added — demo builds on the next builder run (within 2h)');
+  refresh();
+}
+
+async function convertProspect(id) {
+  const email = (document.getElementById('convEmail')?.value || '').trim();
+  if (!email || !/.+@.+\..+/.test(email)) return toast('Enter their real email first');
+  await api(`/api/clients/${id}`, { method:'PATCH', body: JSON.stringify({ email, stage: 'new' }) });
+  const r = await api('/api/clients', { method:'POST', body: JSON.stringify({ email }) });
+  if (r.error) return toast('⚠ ' + r.error);
+  toast('🎉 Prospect converted — Intake 1 sent to ' + email);
+  closeDrawer(); refresh();
+}
+
+async function addClient() {
+  const email = document.getElementById('newEmail').value.trim();
+  const name = document.getElementById('newName').value.trim();
+  if (!email) return toast('Enter an email first');
+  const btn = document.getElementById('addBtn'); btn.disabled = true;
+  const r = await api('/api/clients', { method:'POST', body: JSON.stringify({ email, name }) });
+  btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error);
+  document.getElementById('newEmail').value = ''; document.getElementById('newName').value = '';
+  toast('Intake 1 sent to ' + email + ' ✓');
+  refresh();
+}
+
+async function sendIntake2(id, btn) {
+  if (btn) btn.disabled = true;
+  const r = await api(`/api/clients/${id}/send-intake2`, { method:'POST' });
+  if (btn) btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error);
+  toast('Intake 2 sent ✓'); closeDrawer(); refresh();
+}
+
+function intakeBlock(title, json) {
+  if (!json) return '';
+  let data; try { data = JSON.parse(json); } catch { return ''; }
+  const rows = Object.entries(data).map(([k,v]) => `<dt>${esc(k.replace(/_/g,' '))}</dt><dd>${esc(v)}</dd>`).join('');
+  return `<div class="intake"><h4>${title}</h4><dl>${rows}</dl></div>`;
+}
+
+function openDrawer(id) {
+  const c = STATE.clients.find(x => x.id === id); if (!c) return;
+  const st = STAGES[c.stage] || STAGES.new;
+  document.getElementById('drawer').innerHTML = `
+    <div class="dhead"><h2>${esc(c.name || c.email)}</h2><p>${esc(c.email)}${c.phone ? ' · ' + esc(c.phone) : ''}</p></div>
+    <div class="dbody">
+      <div><span class="chip" style="background:${st.bg};color:${st.fg}">${st.label}</span> <span id="seoScore" style="font-size:12.5px;color:#64748b;"></span>${buildBar(c)}</div>
+      <div class="actions">
+        ${c.stage === 'intake1_done' || c.stage === 'intake2_sent' ? `<button class="btn btn-green" onclick="sendIntake2(${c.id}, this)">${c.stage==='intake2_sent'?'Resend Intake 2':'Approve → Send Intake 2'}</button>` : ''}
+        ${c.stage === 'new' || c.stage === 'intake1_sent' ? `<button class="btn btn-primary" onclick="resendIntake1('${esc(c.email)}', this)">${c.stage==='intake1_sent'?'Resend Intake 1':'Send Intake 1'}</button>` : ''}
+        ${(c.preview_url || c.live_url) && c.stage !== 'prospect' ? `<button class="btn btn-ghost" onclick="rollbackSite(${c.id}, this)" title="Restore the site to its previous version — safe, creates a new version, never deletes history.">⏪ Undo last change</button>` : ''}
+        ${c.stage !== 'prospect' && c.guide_url ? `<button class="btn btn-ghost" onclick="sendGuide(${c.id}, this)" title="Email their personalized pricing guide (Prepared for them, their private link).">💼 ${getBillingUI(c).guide_sent ? 'Resend' : 'Send'} pricing guide</button><button class="btn btn-ghost" onclick="copyText('${esc(c.guide_url)}')" title="Copy their personalized guide link.">📋 Guide link</button>` : ''}
+        <button class="btn btn-red" onclick="delClient(${c.id})">Remove</button>
+      </div>
+      ${(() => { const ed = editFor(c); if (!ed) return ''; return `<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:10px;padding:14px;">
+        <p style="font-size:12.5px;font-weight:600;color:#92400e;margin-bottom:6px;">📝 Edits not yet published — ${ed.n} file${ed.n===1?'':'s'}, first seen ${ago(ed.since)}</p>
+        <p style="font-size:11.5px;color:#a16207;margin-bottom:10px;word-break:break-word;">${esc((ed.files||[]).join(' · '))}${ed.n > (ed.files||[]).length ? ' · +' + (ed.n - ed.files.length) + ' more' : ''}</p>
+        <button class="btn" style="background:#d97706;color:#fff;" onclick="publishNow('${esc(ed.slug)}', ${c.id}, this)">🚀 Publish now</button>
+        <span style="font-size:11px;color:#a16207;margin-left:8px;">no version bump needed — pushes these straight to the served copy</span>
+      </div>`; })()}
+      ${c.stage === 'prospect' ? `<div style="background:#fdf4ff;border:1px solid #f0abfc;border-radius:10px;padding:14px;">
+        <p style="font-size:12.5px;font-weight:600;color:#a21caf;margin-bottom:6px;">💡 Prospect pitch kit${c.vertical && c.vertical !== 'iv-therapy' ? ` <span style="background:#a21caf;color:#fff;border-radius:99px;padding:2px 9px;font-size:10.5px;margin-left:6px;">${esc(c.vertical)}</span>` : ''}</p>
+        ${(() => { try { const i1 = JSON.parse(c.intake1_data || '{}'); return i1._hunted ? `<p style="font-size:11.5px;color:#7c3aed;margin-bottom:6px;">🎯 Found by the prospector${i1._evidence ? ` — ${esc(i1._evidence)}` : ''}${i1._their_site ? ` · <a href="${esc(i1._their_site)}" target="_blank">their current site</a>` : ''}</p>` : ''; } catch(e) { return ''; } })()}
+        ${c.preview_url ? `<p style="font-size:12.5px;margin-bottom:8px;">Demo: <a href="${esc(c.preview_url)}" target="_blank">${esc(c.preview_url)}</a> <button class="btn btn-ghost" style="padding:5px 9px;font-size:11px" onclick="copyText('${esc(c.preview_url)}')">Copy</button></p>` : `<p style="font-size:12.5px;color:#a16207;margin-bottom:8px;">⚙ Demo builds on the next builder run — link appears here.</p>`}
+        <button class="btn btn-ghost" style="margin-bottom:8px;" onclick="copyOutreach(${c.id}, this)">📨 Copy outreach email</button>
+        <p style="font-size:11.5px;color:#64748b;margin-bottom:8px;">Pitch it: "I already built you a homepage — want to see it?" Then convert them:</p>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;">
+          <input id="convEmail" type="email" placeholder="their real email" style="flex:1;min-width:170px;padding:9px 11px;border:1.5px solid var(--line);border-radius:8px;font-size:13px;">
+          <button class="btn btn-green" onclick="convertProspect(${c.id})">Convert → Intake 1</button>
+        </div>
+      </div>` : ''}
+      ${['intake2_done','generating'].includes(c.stage) ? `<div style="background:#F0FDFA;border:1px solid #99E5DC;border-radius:10px;padding:14px;">
+        <p style="font-size:12.5px;font-weight:600;color:#0B7A6F;margin-bottom:6px;">🛠 Builder status</p>
+        <div id="bstat"><button class="btn btn-ghost" style="padding:6px 12px;font-size:12px" onclick="builderStatus(${c.id})">Check the builder now</button>
+        <button class="btn" style="padding:6px 12px;font-size:12px;background:#FEF2F2;border:1px solid #FCA5A5;color:#B91C1C;" onclick="fireBuilder(this)" title="Don't wait for the hourly alarm — signal Claude to kick the builder immediately.">🔥 Fire anyway</button>
+        ${c.stage === 'intake2_done' && !(getBillingUI(c).dep_status === 'paid' || getBillingUI(c).invoice_status === 'paid') ? `<button class="btn" style="padding:6px 12px;font-size:12px;background:#FFF7ED;border:1px solid #FDBA74;color:#C2410C;" onclick="forceBuild(${c.id}, this)" title="Skip the Stripe payment gate: marks the deposit as paid (bypass, no client email) and fires the builder immediately.">🔨 Build without payment</button>` : ''}</div>
+      </div>` : ''}
+      ${c.stage === 'preview_ready' && getBillingUI(c).preview_hold && !getBillingUI(c).preview_approved ? `<div style="background:#FFFBEB;border:1.5px solid #F59E0B;border-radius:10px;padding:14px;">
+        <p style="font-size:13px;font-weight:700;color:#92400E;margin-bottom:6px;">⏸ Preview ready — HELD. The client has no idea yet.</p>
+        <p style="font-size:12px;color:#78350F;margin-bottom:10px;">No email, no invoice, and their portal still says "Designing &amp; building." Review it first, then send when you're happy.</p>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <a class="btn btn-ghost" style="padding:7px 12px;font-size:12px;text-decoration:none;" href="${esc(c.preview_url)}" target="_blank">👀 Review the preview</a>
+          <button class="btn btn-green" style="padding:7px 12px;font-size:12px;" onclick="sendPreview(${c.id}, this)">📤 Send preview to client</button>
+        </div>
+        <p style="font-size:11px;color:#a16207;margin-top:8px;">Sending = reveal email with the preview link + the final-balance invoice, together.</p>
+      </div>` : ''}
+      ${c.preview_url && c.stage !== 'prospect' ? `<div class="kv"><b>Preview site</b><a href="${esc(c.preview_url)}" target="_blank">${esc(c.preview_url)}</a>${c.stage === 'preview_ready' && getBillingUI(c).preview_approved ? ' <span style="font-size:11px;color:#15803d;font-weight:600;">📤 sent to client</span>' : ''}</div>` : ''}
+      <div>
+        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Website tier — set after the pricing call</label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <button class="themesw${(c.tier||'standard')==='standard' ? ' sel' : ''}" onclick="setTier(${c.id}, 'standard', this)">
+            <span style="font-size:12px;font-weight:600;color:#334155;">Standard${(c.tier||'standard')==='standard' ? ' ✓' : ''}</span>
+            <span style="font-size:10.5px;color:#64748b;">Framework site — 6 pages</span>
+          </button>
+          <button class="themesw${c.tier==='premium' ? ' sel' : ''}" onclick="setTier(${c.id}, 'premium', this)">
+            <span style="font-size:12px;font-weight:600;color:#7c3aed;">★ Premium${c.tier==='premium' ? ' ✓' : ''}</span>
+            <span style="font-size:10.5px;color:#64748b;">+ drip pages, city pages, weekly blog</span>
+          </button>
+        </div>
+      </div>
+      <div>
+        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Billing — Stripe</label>
+        <div id="agrBox" style="margin-bottom:10px;"></div>
+        ${(() => {
+          const b = getBillingUI(c);
+          const full = c.tier === 'premium' ? '$999' : '$649';
+          const half = c.tier === 'premium' ? '$499.50' : '$324.50';
+          const legacyPaid = b.invoice_status === 'paid';
+          const chipFor = (st, lbl) => st === 'paid'
+            ? `<span class="chip" style="background:#ecfdf5;color:#059669">${lbl} PAID ✓</span>`
+            : `<span class="chip" style="background:#fef9c3;color:#a16207">${lbl} ${esc(st || 'open')}</span>`;
+          let inv = '';
+          if (legacyPaid) {
+            inv = `<span class="chip" style="background:#ecfdf5;color:#059669">PAID IN FULL ✓ (${full})</span>`;
+          } else {
+            // deposit half
+            if (!b.dep_id && b.dep_status !== 'paid') {
+              inv += `<div><button class="btn btn-green" onclick="sendStripeInvoice(${c.id}, this, 'deposit')">💳 Send 50% deposit — ${half}</button><p style="font-size:11px;color:#94a3b8;margin-top:3px;">Deposit paid = build unlocked.</p></div>`;
+            } else {
+              inv += `<div>${chipFor(b.dep_status, 'Deposit')}${b.dep_url ? ` <a href="${esc(b.dep_url)}" target="_blank" style="font-size:12.5px;">view</a>` : ''}</div>`;
+            }
+            // final half — auto-sent when build finishes; manual button as backup once deposit is paid
+            if (b.fin_id || b.fin_status) {
+              inv += `<div style="margin-top:8px;">${chipFor(b.fin_status, 'Final balance')}${b.fin_url ? ` <a href="${esc(b.fin_url)}" target="_blank" style="font-size:12.5px;">view</a>` : ''}</div>`;
+            } else if (b.dep_status === 'paid') {
+              inv += `<div style="margin-top:8px;"><button class="btn btn-ghost" onclick="sendStripeInvoice(${c.id}, this, 'final')">💳 Send final balance — ${half}</button><p style="font-size:11px;color:#94a3b8;margin-top:3px;">Auto-sends when the build finishes — this is the manual backup.</p></div>`;
+            } else {
+              inv += `<p style="font-size:11px;color:#94a3b8;margin-top:6px;">Final ${half} auto-invoices when the build is done.</p>`;
+            }
+          }
+          let host = '';
+          if (b.sub_status === 'active') {
+            host = `<div style="margin-top:10px;"><span class="chip" style="background:#ecfdf5;color:#059669">🔒 Care & Hosting $99/mo ACTIVE</span></div>`;
+          } else if (b.sub_link) {
+            host = `<div style="margin-top:10px;"><span class="chip" style="background:#fef9c3;color:#a16207">Hosting link sent — awaiting signup</span> <button class="btn btn-ghost" style="padding:6px 10px;font-size:12px" onclick="copyText('${esc(b.sub_link)}')">Copy link</button></div>`;
+          } else if (c.stage === 'preview_ready' || c.stage === 'live') {
+            host = `<div style="margin-top:10px;"><button class="btn btn-primary" onclick="startHosting(${c.id}, this)">🔒 Start $99/mo Care & Hosting</button><p style="font-size:11px;color:#94a3b8;margin-top:4px;">Your end-of-process confirm — creates a Stripe signup link to send the client.</p></div>`;
+          } else {
+            host = `<p style="font-size:11px;color:#94a3b8;margin-top:8px;">$99/mo Care & Hosting starts at the end — the button appears when the site is ready.</p>`;
+          }
+          const links = [];
+          if (!legacyPaid && b.dep_status !== 'paid') links.push(`<a href="#" onclick="billingBypass(${c.id},'deposit');return false;">mark deposit paid</a>`);
+          if (!legacyPaid && b.dep_status === 'paid' && b.fin_status !== 'paid') links.push(`<a href="#" onclick="billingBypass(${c.id},'final');return false;">mark final paid</a>`);
+          if (b.sub_status !== 'active') links.push(`<a href="#" onclick="billingBypass(${c.id},'hosting');return false;">mark hosting active</a>`);
+          const bypass = links.length ? `<p style="margin-top:10px;font-size:11px;color:#94a3b8;">Paid outside Stripe? ${links.join(' · ')}</p>` : '';
+          return `<div>${inv}</div>${host}${bypass}`;
+        })()}
+      </div>
+      <div>
+        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Theme ${c.preview_url ? '— one click restyles the live preview' : '— picked now, applied automatically when the site is built'}</label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          ${THEMES.map(t => `
+            <button class="themesw${c.theme === t.key ? ' sel' : ''}" onclick="applyTheme(${c.id}, '${t.key}', this)" title="Apply ${t.label}">
+              <span style="display:flex;gap:3px;margin-bottom:4px;">${t.dots.map(d => `<span style="width:14px;height:14px;border-radius:50%;background:${d};border:1px solid rgba(0,0,0,.15);"></span>`).join('')}</span>
+              <span style="font-size:11px;color:#475569;">${t.label}${c.theme === t.key ? ' ✓' : ''}</span>
+            </button>`).join('')}
+        </div>
+        <p style="font-size:11px;color:#94a3b8;margin-top:6px;">${c.preview_url ? 'Colors update within a few seconds — refresh the preview tab after applying.' : 'The generator reads this choice the moment the build starts.'}</p>
+        <div style="margin-top:12px;">
+          <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:5px;">…or describe the vibe in your own words</label>
+          <div style="display:flex;gap:8px;">
+            <input id="vibeInput" type="text" placeholder="e.g. moody and romantic · beachy but high-end · clean energizing spa" value="${esc(c.vibe || '')}" style="flex:1;padding:10px 12px;border:1.5px solid #e2e8f0;border-radius:8px;font-size:13px;">
+            <button class="btn btn-primary" onclick="applyVibe(${c.id}, this)">Apply vibe</button>
+          </div>
+          <p style="font-size:11px;color:#94a3b8;margin-top:6px;">Colors change instantly. The words also save as this client's vibe brief — fonts, photo mood, and copy tone follow it at the next build or tweak round.</p>
+        </div>
+      </div>
+      ${c.live_url ? `<div class="kv"><b>Live site</b><a href="${esc(c.live_url)}" target="_blank">${esc(c.live_url)}</a></div>` : ''}
+      ${intakeBlock('Intake 1 — Client details', c.intake1_data)}
+      ${intakeBlock('Intake 2 — Website vision', c.intake2_data)}
+      <div class="accessbox">
+        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:8px;">Client access</label>
+        <div class="actions">
+          <button class="btn btn-primary" onclick="openLink(${c.id}, 'portal', this)">👁 Open their portal</button>
+          <button class="btn btn-green" onclick="sendPortalInvite(${c.id}, this)">📧 Email portal login</button>
+          <button class="btn btn-ghost" onclick="copyLink(${c.id}, 'portal', this)">🔗 Copy portal link</button>
+        </div>
+        <div class="alinks">
+          <a href="#" onclick="event.preventDefault();openLink(${c.id}, 'pitch', this)">Pitch page ↗</a>
+          <a href="#" onclick="event.preventDefault();openLink(${c.id}, 'agreement', this)">Agreement ↗</a>
+          <a href="#" onclick="event.preventDefault();openLink(${c.id}, 'gbp', this)">GBP walkthrough ↗</a>
+          <a href="#" onclick="event.preventDefault();copyLink(${c.id}, 'pitch', this)">Copy pitch link</a>
+        </div>
+        <p style="font-size:11px;color:#94a3b8;margin-top:9px;">Everything opens exactly what the client sees — same links, same live data.</p>
+        <div style="border-top:1px dashed #e2e8f0;margin-top:12px;padding-top:11px;">
+          <div class="actions">
+            <button class="btn btn-ghost" style="color:#b91c1c;border-color:#fecaca;" onclick="sendExitPackage(${c.id}, this)">📦 Client leaving — send them everything</button>
+          </div>
+          <p style="font-size:11px;color:#94a3b8;margin-top:6px;">A warm goodbye email with a download of their complete website files, all reports, rank history, and signed agreement. Deletes nothing — you stay in control.</p>
+        </div>
+      </div>
+      <div>
+        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Request any revision</label>
+        <textarea id="revInput" rows="2" placeholder='e.g. "Change the NAD+ price to $850" · "Make the hero headline about energy, not luxury" · "Swap the About photo for their photo #2"'></textarea>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:8px;">
+          <button class="btn btn-primary" onclick="queueRevision(${c.id}, this)">✏️ Queue revision</button>
+          <span style="font-size:11px;color:#94a3b8;">Applied automatically within the hour — you get the usual email when it's live.</span>
+        </div>
+        <div id="revList" style="margin-top:10px;"></div>
+      </div>
+      <div id="leadsBox"></div>
+      <div>
+        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Client logo</label>
+        <div style="display:flex;gap:14px;align-items:center;">
+          <img id="logoPrev" src="/api/clients/${c.id}/logo?cb=${Date.now()}" alt="" style="height:52px;max-width:150px;object-fit:contain;border:1px solid #e2e8f0;border-radius:8px;padding:4px;background:#fff;" onerror="this.style.display='none';document.getElementById('logoNone').style.display='inline'">
+          <span id="logoNone" style="display:none;font-size:12px;color:#94a3b8;">No logo yet</span>
+          <label class="btn btn-ghost" style="cursor:pointer;">
+            Upload logo
+            <input type="file" accept="image/png,image/jpeg,image/webp" style="display:none" onchange="uploadLogo(${c.id}, this)">
+          </label>
+        </div>
+        <p style="font-size:11px;color:#94a3b8;margin-top:6px;">PNG with transparent background works best. It's used on their website automatically — and always links home.</p>
+      </div>
+      <div>
+        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Client photos <span style="font-weight:400;color:#94a3b8;">(their real shots — scrubs, setup, city; up to 6)</span></label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+          ${[1,2,3,4,5,6].map(n => `<img src="/api/clients/${c.id}/photo/${n}?cb=${Date.now()}" onerror="this.remove()" style="height:48px;width:48px;object-fit:cover;border-radius:8px;border:1px solid #e2e8f0;">`).join('')}
+          <label class="btn btn-ghost" style="cursor:pointer;padding:8px 12px;">
+            + Add photo
+            <input type="file" accept="image/png,image/jpeg,image/webp" multiple style="display:none" onchange="uploadPhotos(${c.id}, this)">
+          </label>
+        </div>
+        <p style="font-size:11px;color:#94a3b8;margin-top:6px;">Real photos beat stock — the builder weaves them into the hero and About page.</p>
+      </div>
+      <div>
+        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Launch &amp; Ranking Checklist</label>
+        <div class="intake" style="padding:12px 14px;">
+          ${LAUNCH_ITEMS.map(it => {
+            const done = getChecklist(c)[it.k];
+            return `<label style="display:flex;gap:9px;align-items:flex-start;padding:6px 0;font-size:13px;cursor:pointer;${done?'color:#059669;':''}">
+              <input type="checkbox" ${done?'checked':''} onchange="toggleLaunch(${c.id}, '${it.k}', this.checked)" style="width:auto;margin-top:2px;">
+              <span><b style="font-weight:600;">${it.t}</b><br><span style="color:#94a3b8;font-size:11.5px;">${it.d}</span></span>
+            </label>`;
+          }).join('')}
+        </div>
+      </div>
+      <div>
+        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:5px;">Stage (manual override)</label>
+        <select onchange="patchClient(${c.id}, {stage: this.value})">
+          ${Object.entries(STAGES).map(([k,v]) => `<option value="${k}" ${k===c.stage?'selected':''}>${v.label}</option>`).join('')}
+        </select>
+      </div>
+      <div>
+        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:5px;">Notes</label>
+        <textarea rows="4" onblur="patchClient(${c.id}, {notes: this.value}, true)">${esc(c.notes)}</textarea>
+      </div>
+      <div>
+        <label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Local competitors <span style="font-weight:400;color:var(--muted)">(2–3 names — monthly reports compare their reviews vs. this client's)</span></label>
+        <input type="text" placeholder="e.g. Radiance Drip Bar, Revive IV Lounge" value="${esc(c.competitors || '')}" onblur="patchClient(${c.id}, {competitors: this.value}, true)" style="width:100%;padding:10px 12px;border:1.5px solid var(--line);border-radius:8px;font-size:13.5px;">
+      </div>
+    </div>`;
+  document.getElementById('drawer').classList.add('open');
+  api(`/api/clients/${id}/agreement`).then((r) => {
+    const box = document.getElementById('agrBox');
+    if (!box) return;
+    const b = getBillingUI(STATE.clients.find(x=>x.id===id) || {});
+    if (r.signed) {
+      box.innerHTML = `<span class="chip" style="background:#ecfdf5;color:#059669">✍️ Agreement signed — ${esc(r.signed.signed_name)} · ${esc(r.signed.signed_at)} UTC</span>`;
+    } else {
+      box.innerHTML = `<button class="btn btn-ghost" onclick="sendAgreement(${id}, this)">📄 Email agreement to sign</button>
+        <span class="chip" style="background:${b.agr_sent ? '#fef9c3' : '#f1f5f9'};color:${b.agr_sent ? '#a16207' : '#64748b'};margin-left:6px">${b.agr_sent ? 'sent — awaiting signature' : 'not sent'}</span>
+        <p style="font-size:11px;color:#94a3b8;margin-top:5px;">Real-agency order: agreement → signed → 50% deposit → build → final 50% → live.</p>`;
+    }
+  });
+  api(`/api/clients/${id}/revisions`).then((r) => {
+    const el = document.getElementById('revList');
+    if (!el || !r.revisions || !r.revisions.length) return;
+    el.innerHTML = r.revisions.map(v => {
+      const chip = v.status === 'done' ? '<span class="chip" style="background:#ecfdf5;color:#059669">done</span>'
+        : v.status === 'failed' ? '<span class="chip" style="background:#fef2f2;color:#dc2626">needs attention</span>'
+        : '<span class="chip" style="background:#fef9c3;color:#a16207">queued</span>';
+      return `<div style="font-size:12.5px;padding:6px 0;border-bottom:1px dashed #e2e8f0;">${chip} ${esc(v.request.slice(0, 110))}${v.note ? `<br><span style="color:#94a3b8;font-size:11px;">${esc(v.note)}</span>` : ''}</div>`;
+    }).join('');
+  });
+  api(`/api/clients/${id}/leads`).then((r) => {
+    const box = document.getElementById('leadsBox');
+    if (!box || !r.leads) return;
+    box.innerHTML = `<label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Leads from their website ${r.leads.length ? `(${r.leads.length} recent)` : ''}</label>` +
+      (r.leads.length
+        ? `<div class="intake" style="padding:12px 14px;">${r.leads.map(l => `<div style="padding:7px 0;border-bottom:1px dashed #e2e8f0;font-size:13px;"><b>${esc(l.name || 'No name')}</b> · ${esc(l.phone || l.email || '')} ${l.source ? `<span class="chip" style="background:#eef2f7;color:#475569;font-size:10.5px;padding:2px 8px;">via ${esc(l.source)}</span>` : ''}<br><span style="color:#64748b;">${esc((l.message || '').slice(0, 120))}</span><br><span style="color:#94a3b8;font-size:11px;">${esc(l.created_at)}</span></div>`).join('')}</div>`
+        : `<p style="font-size:12px;color:#94a3b8;">None yet — leads from their site's contact form appear here (and email you instantly).</p>`);
+  });
+  api(`/api/clients/${id}/score`).then((sc) => {
+    const el = document.getElementById('seoScore');
+    if (!el || !sc || sc.error) return;
+    const col = sc.total >= 80 ? '#059669' : sc.total >= 60 ? '#d97706' : '#dc2626';
+    el.innerHTML = `<b style="color:${col};font-size:14px;">SEO Score ${sc.total}/100</b>
+      <span style="color:#94a3b8;"> · tech ${sc.breakdown.technical.score}/${sc.breakdown.technical.max}
+      · content ${sc.breakdown.content.score}/${sc.breakdown.content.max}
+      · local ${sc.breakdown.local.score}/${sc.breakdown.local.max}
+      · uptime ${sc.breakdown.reliability.score}/${sc.breakdown.reliability.max}
+      · off-site ${sc.breakdown.offsite.done}/${sc.breakdown.offsite.of} done</span>`;
+  });
+  document.getElementById('overlay').classList.add('open');
+}
+function closeDrawer(){ document.getElementById('drawer').classList.remove('open'); document.getElementById('overlay').classList.remove('open'); }
+async function patchClient(id, body, quiet) { await api(`/api/clients/${id}`, { method:'PATCH', body: JSON.stringify(body) }); if (!quiet) { toast('Updated ✓'); refresh(); } }
+async function uploadPhotos(id, input) {
+  const files = [...input.files].slice(0, 6);
+  if (!files.length) return;
+  toast(`Uploading ${files.length} photo(s)…`);
+  let slot = 1;
+  // find next free slots by probing existing previews
+  for (const f of files) {
+    if (f.size > 3_000_000) { toast('⚠ One photo skipped — over 3MB'); continue; }
+    const ext = f.type.includes('webp') ? 'webp' : f.type.includes('png') ? 'png' : 'jpg';
+    const b64 = await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(f); });
+    while (slot <= 6) {
+      const probe = await fetch(`/api/clients/${id}/photo/${slot}`, { method: 'HEAD' });
+      if (!probe.ok) break; slot++;
+    }
+    if (slot > 6) { toast('⚠ All 6 photo slots full'); break; }
+    const r = await api(`/api/clients/${id}/photo`, { method:'POST', body: JSON.stringify({ b64, ext, n: slot }) });
+    if (r.error) { toast('⚠ ' + r.error); break; }
+    slot++;
+  }
+  toast('Photos saved 📷');
+  refresh(); setTimeout(() => openDrawer(id), 400);
+}
+async function uploadLogo(id, input) {
+  const f = input.files[0]; if (!f) return;
+  if (f.size > 1_800_000) return toast('⚠ Logo too large — keep it under 1.8MB');
+  const ext = f.type.includes('webp') ? 'webp' : f.type.includes('jpeg') ? 'jpg' : 'png';
+  const b64 = await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(f); });
+  toast('Uploading logo…');
+  const r = await api(`/api/clients/${id}/logo`, { method:'POST', body: JSON.stringify({ b64, ext }) });
+  if (r.error) return toast('⚠ ' + r.error);
+  toast(r.applied ? 'Logo uploaded — live on their site 🖼' : 'Logo saved — will be used when the site is built 🖼');
+  refresh(); openDrawer(id);
+}
+function getBillingUI(c){ try { return JSON.parse(c.billing||'{}'); } catch { return {}; } }
+async function sendStripeInvoice(id, btn, which) {
+  which = which || 'deposit';
+  const label = which === 'final' ? 'final 50% balance' : '50% deposit';
+  if (!confirm(`Send the ${label} Stripe invoice to this client now?`)) return;
+  btn.disabled = true;
+  const r = await api(`/api/clients/${id}/invoice`, { method:'POST', body: JSON.stringify({ which }) });
+  btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error);
+  toast(`${label[0].toUpperCase() + label.slice(1)} invoice sent — ${r.display} 💳 (Stripe emails the client)`);
+  refresh(); setTimeout(() => openDrawer(id), 400);
+}
+async function startHosting(id, btn) {
+  if (!confirm('Create the $99/mo Care & Hosting signup link for this client?')) return;
+  btn.disabled = true;
+  const r = await api(`/api/clients/${id}/hosting`, { method:'POST', body: '{}' });
+  btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error);
+  copyText(r.url);
+  toast('Hosting signup link created & copied 🔒 — text or email it to the client');
+  refresh(); setTimeout(() => openDrawer(id), 400);
+}
+function copyText(t){ navigator.clipboard?.writeText(t).catch(()=>{}); }
+async function builderStatus(id) {
+  const el = document.getElementById('bstat');
+  if (!el) return;
+  el.innerHTML = '<span style="font-size:12.5px;color:#556;">Checking…</span>';
+  const s = await api('/api/builder-status');
+  const me = (s.waiting || []).find(w => w.id === id);
+  const fmtT = (iso) => new Date(iso).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  const fmtDT = (sql) => new Date(String(sql).replace(' ', 'T') + 'Z').toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  let h = '';
+  if (me && me.stage === 'generating') {
+    h = '<p style="font-size:13px;">⚙️ <b>Build in progress right now</b> — the progress bar above updates as it goes.</p>';
+  } else if (me && me.overdue) {
+    h = '<p style="font-size:13px;color:#B45309;">⚠️ <b>Overdue</b> — paid and build-ready for ' + (Math.round(me.waitingMins / 6) / 10) + 'h with no build started. An alarm email was sent to you.</p>'
+      + '<p style="font-size:12px;color:#556;margin-top:6px;">Next scheduled attempt: <b>' + fmtT(s.nextRunAt) + '</b> (~' + s.minutesUntil + ' min). Backup: tell Claude "build client ' + id + ' now".</p>';
+  } else if (me && !me.paid) {
+    h = '<p style="font-size:13px;">⏸ Waiting on the <b>deposit</b> — the builder only builds paid clients.</p>';
+  } else {
+    h = '<p style="font-size:13px;">✅ <b>In line.</b> The builder wakes at <b>' + fmtT(s.nextRunAt) + '</b> (~' + s.minutesUntil + ' min) and will pick this build up' + (me ? ' (waiting ' + me.waitingMins + ' min so far)' : '') + '.</p>';
+  }
+  if (s.lastBuildStartedAt) h += '<p style="font-size:11.5px;color:#667;margin-top:6px;">Last build started: ' + fmtDT(s.lastBuildStartedAt) + (s.lastPublishedAt ? ' · last site published: ' + fmtDT(s.lastPublishedAt) : '') + '</p>';
+  el.innerHTML = h + '<button class="btn btn-ghost" style="margin-top:8px;padding:5px 10px;font-size:11px" onclick="builderStatus(' + id + ')">↻ Re-check</button>';
+}
+async function copyOutreach(id, btn) {
+  const r = await api(`/api/clients/${id}/links`);
+  if (!r.outreach) return toast('No outreach draft yet — the prospector writes one when it finds them');
+  copyText(r.outreach);
+  if (btn) btn.textContent = '✓ Copied — paste into your email';
+  toast('Outreach email copied — review, personalize, and send it from your own email');
+}
+async function queueRevision(id, btn) {
+  const v = document.getElementById('revInput').value.trim();
+  if (!v) return toast('Describe the change first');
+  btn.disabled = true;
+  const r = await api(`/api/clients/${id}/revision`, { method:'POST', body: JSON.stringify({ request: v }) });
+  btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error);
+  document.getElementById('revInput').value = '';
+  toast('Revision queued ✏️ — it applies automatically within the hour');
+  refresh(); setTimeout(() => openDrawer(id), 400);
+}
+async function sendAgreement(id, btn) {
+  if (!confirm('Email the service agreement to this client for signature?')) return;
+  btn.disabled = true;
+  const r = await api(`/api/clients/${id}/agreement-invite`, { method:'POST', body: '{}' });
+  btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error);
+  toast('Agreement sent 📄 — you\'ll get an email the moment they sign');
+  refresh(); setTimeout(() => openDrawer(id), 400);
+}
+async function sendPortalInvite(id, btn) {
+  if (!confirm('Email this client their private portal login link?')) return;
+  btn.disabled = true;
+  const r = await api(`/api/clients/${id}/portal-invite`, { method:'POST', body: '{}' });
+  btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error);
+  toast('Portal login emailed 🔑');
+  refresh();
+}
+async function openLink(id, kind, btn) {
+  btn.disabled = true;
+  const r = await api(`/api/clients/${id}/links`);
+  btn.disabled = false;
+  if (!r[kind]) return toast('⚠ could not build link');
+  window.open(r[kind], '_blank');
+}
+async function copyLink(id, kind, btn) {
+  btn.disabled = true;
+  const r = await api(`/api/clients/${id}/links`);
+  btn.disabled = false;
+  if (!r[kind]) return toast('⚠ could not build link');
+  copyText(r[kind]);
+  toast(kind === 'portal' ? 'Portal link copied 🔗 — send it to the client' : 'Pitch link copied ✨ — send before the call');
+}
+async function billingBypass(id, what) {
+  const q = what === 'hosting' ? 'Mark hosting & security as ACTIVE without Stripe? (bypass)'
+    : what === 'final' ? 'Mark the FINAL 50% balance as PAID without Stripe? (bypass)'
+    : 'Mark the 50% DEPOSIT as PAID without Stripe? (bypass — unlocks the build)';
+  if (!confirm(q)) return;
+  const r = await api(`/api/clients/${id}/billing-bypass`, { method:'POST', body: JSON.stringify({ what }) });
+  if (r.error) return toast('⚠ ' + r.error);
+  toast('Bypassed ✓ — logged in the activity feed');
+  refresh(); setTimeout(() => openDrawer(id), 400);
+}
+async function forceBuild(id, btn) {
+  if (!confirm('Build WITHOUT Stripe payment?\n\nThis marks the 50% deposit as PAID (bypass — no client email, logged in the feed) and fires the builder immediately. Use when payment happened outside Stripe or for your own/internal sites.')) return;
+  if (btn) btn.disabled = true;
+  const b = await api(`/api/clients/${id}/billing-bypass`, { method:'POST', body: JSON.stringify({ what:'deposit', quiet:true }) });
+  if (b.error) { if (btn) btn.disabled = false; return toast('⚠ ' + b.error); }
+  const r = await api('/api/fire-builder', { method:'POST' });
+  if (btn) btn.disabled = false;
+  if (r.error) return toast('Deposit bypassed ✓ but fire failed: ' + r.error);
+  toast('🔨 Deposit bypassed + builder fired — ' + r.waiting + ' client(s) in the queue');
+  refresh(); setTimeout(() => openDrawer(id), 400);
+}
+async function fireBuilder(btn) {
+  if (!confirm('Fire the builder NOW instead of waiting for the hourly alarm?\n\nThis signals Claude to kick off the build run immediately.')) return;
+  if (btn) btn.disabled = true;
+  const r = await api('/api/fire-builder', { method:'POST' });
+  if (btn) btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error);
+  toast('🔥 Fire signal sent — the builder should pick up ' + r.waiting + ' client(s) within a couple of minutes');
+}
+async function sendPreview(id, btn) {
+  if (!confirm('Send the preview to the client NOW?\n\nThis sends the reveal email with their preview link AND the final-balance invoice. Make sure you have reviewed the site first.')) return;
+  if (btn) btn.disabled = true;
+  const r = await api(`/api/clients/${id}/approve-preview`, { method:'POST' });
+  if (btn) btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error);
+  toast(r.already ? 'Already sent to the client ✓' : ('Preview sent to the client 📤' + (r.invoiceSent ? ' + final invoice 💳' : '')));
+  refresh(); setTimeout(() => openDrawer(id), 400);
+}
+async function applyVibe(id, btn) {
+  const v = document.getElementById('vibeInput').value.trim();
+  if (!v) return toast('Type a feeling first — e.g. "moody and romantic"');
+  btn.disabled = true;
+  const r = await api(`/api/clients/${id}/vibe`, { method:'POST', body: JSON.stringify({ vibe: v }) });
+  btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error);
+  toast(r.applied ? `Vibe applied: ${r.label} 🎨 — refresh the preview` : `Vibe saved: ${r.label} 🎨 — used at build time`);
+  refresh();
+}
+const LAUNCH_ITEMS = [
+  { k:'domain',    t:'Domain connected',              d:'Client domain pointed at the site in Cloudflare' },
+  { k:'gbp',       t:'Google Business Profile live',  d:'Created, verified, category "IV therapy service" / "Medical spa"' },
+  { k:'gbp_full',  t:'GBP fully built out',           d:'Photos, services with prices, hours, booking link, description' },
+  { k:'reviewlink',t:'Review link wired',             d:'GBP review link added to the site review funnel + texted after visits' },
+  { k:'gsc',       t:'Search Console verified',       d:'Property verified, ownership confirmed' },
+  { k:'sitemap',   t:'Sitemap submitted',             d:'sitemap.xml submitted in Search Console' },
+  { k:'citations', t:'Core citations placed',         d:'Yelp, Apple Maps, Bing Places, Healthgrades, Nextdoor — identical name/phone' },
+  { k:'reviews5',  t:'First 5 reviews collected',     d:'Ask the 5 happiest clients — velocity matters more than volume' },
+];
+function getChecklist(c){ try { return JSON.parse(c.launch_checklist||'{}'); } catch { return {}; } }
+async function toggleLaunch(id, key, val){
+  const c = STATE.clients.find(x=>x.id===id); const cl = getChecklist(c); cl[key]=val;
+  c.launch_checklist = JSON.stringify(cl);
+  await api(`/api/clients/${id}`, { method:'PATCH', body: JSON.stringify({ launch_checklist: c.launch_checklist }) });
+  const done = LAUNCH_ITEMS.filter(i=>cl[i.k]).length;
+  toast(`Launch checklist: ${done}/${LAUNCH_ITEMS.length}`);
+}
+const THEMES = [
+  { key: 'warm-luxury',    label: 'Warm Luxury',    dots: ['#1A1512', '#A8874F', '#F7F4EF'] },
+  { key: 'soft-neutrals',  label: 'Soft Neutrals',  dots: ['#282019', '#B08D57', '#FAF8F4'] },
+  { key: 'coastal-navy',   label: 'Coastal Navy',   dots: ['#071B33', '#C9A254', '#F5F7F9'] },
+  { key: 'fresh-clinical', label: 'Fresh Clinical', dots: ['#0E2E32', '#2FA8B5', '#FDFEFE'] },
+  { key: 'rose-spa',       label: 'Rosé Spa',       dots: ['#2E1B26', '#C98A7D', '#FBF6F3'] },
+];
+async function setTier(id, tier, btn) {
+  btn.disabled = true;
+  await api(`/api/clients/${id}`, { method:'PATCH', body: JSON.stringify({ tier }) });
+  btn.disabled = false;
+  toast(tier === 'premium' ? 'Upgraded to ★ Premium — SEO engine will be included in the build' : 'Set to Standard');
+  refresh(); openDrawer(id);
+}
+async function applyTheme(id, theme, btn) {
+  btn.disabled = true;
+  const r = await api(`/api/clients/${id}/theme`, { method:'POST', body: JSON.stringify({ theme }) });
+  btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error);
+  toast(r.applied ? `Theme "${r.label}" applied 🎨 — refresh the preview tab` : `Theme "${r.label}" saved 🎨 — the site will be built in this theme`);
+  refresh();
+}
+async function resendIntake1(email, btn) { btn.disabled = true; const r = await api('/api/clients', { method:'POST', body: JSON.stringify({ email }) }); btn.disabled = false; if (r.error) return toast('⚠ ' + r.error); toast('Intake 1 sent ✓'); closeDrawer(); refresh(); }
+async function delClient(id) { if (!confirm('Remove this client from the pipeline?')) return; await api(`/api/clients/${id}`, { method:'DELETE' }); closeDrawer(); refresh(); }
+
+async function pollNow(btn) { btn.disabled = true; const r = await api('/api/poll-now', { method:'POST' }); btn.disabled = false;
+  if (r.error) return toast('⚠ ' + r.error); toast(r.processed ? `Found ${r.processed} new submission(s) 🎉` : 'No new submissions yet'); refresh(); }
+
+// ---- settings ----
+function openSettings() {
+  const s = STATE.settings;
+  s_loc.value = s.ghl_location_id || ''; s_link1.value = s.form1_link || ''; s_link2.value = s.form2_link || '';
+  s_from.value = s.email_from || ''; s_sub1.value = s.intake1_subject || ''; s_body1.value = s.intake1_body || '';
+  s_sub2.value = s.intake2_subject || ''; s_body2.value = s.intake2_body || '';
+  s_booklink.value = s.booking_link || ''; s_bsub.value = s.booking_subject || ''; s_bbody.value = s.booking_body || '';
+  setFormOptions([{id: s.form1_id, name: s.form1_id ? '(saved form)' : ''}, {id: s.form2_id, name: s.form2_id ? '(saved form)' : ''}].filter(f=>f.id));
+  s_form1.value = s.form1_id || ''; s_form2.value = s.form2_id || '';
+  document.getElementById('settingsModal').classList.add('open');
+}
+function closeSettings(){ document.getElementById('settingsModal').classList.remove('open'); }
+function setFormOptions(forms) {
+  for (const sel of [s_form1, s_form2]) {
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">— none —</option>' + forms.map(f => `<option value="${esc(f.id)}">${esc(f.name || f.id)}</option>`).join('');
+    if (forms.some(f => f.id === cur)) sel.value = cur;
+  }
+}
+async function testGHL() {
+  const msg = document.getElementById('ghlmsg');
+  msg.className = 'okmsg'; msg.textContent = 'Testing…'; msg.style.display = 'block';
+  await api('/api/settings', { method:'POST', body: JSON.stringify({ ghl_location_id: s_loc.value.trim() }) });
+  const r = await api('/api/ghl/test');
+  if (!r.ok) { msg.className = 'okmsg bad'; msg.textContent = '✗ ' + (r.error || 'Connection failed'); return; }
+  msg.className = 'okmsg ok'; msg.textContent = `✓ Connected to "${r.location}" — found ${r.forms.length} forms. Pick which is which below.`;
+  setFormOptions(r.forms);
+}
+async function saveSettings(btn) {
+  btn.disabled = true;
+  await api('/api/settings', { method:'POST', body: JSON.stringify({
+    ghl_location_id: s_loc.value.trim(), form1_id: s_form1.value, form2_id: s_form2.value,
+    form1_link: s_link1.value.trim(), form2_link: s_link2.value.trim(), email_from: s_from.value.trim(),
+    intake1_subject: s_sub1.value, intake1_body: s_body1.value, intake2_subject: s_sub2.value, intake2_body: s_body2.value,
+    booking_link: s_booklink.value.trim(), booking_subject: s_bsub.value, booking_body: s_bbody.value,
+  })});
+  btn.disabled = false; closeSettings(); toast('Settings saved ✓'); refresh();
+}
+
+setView(VIEW);
+refresh();
+setInterval(refresh, 60000);
+</script>
+</body>
+</html>

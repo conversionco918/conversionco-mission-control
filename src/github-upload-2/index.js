@@ -1,0 +1,4899 @@
+import { Hono } from 'hono';
+import { GHL } from './ghl.js';
+import { DEFAULT_TEMPLATES, BOOKING_TEMPLATES, DEFAULT_SETTINGS, renderTemplate } from './emails.js';
+import { THEMES } from './themes.js';
+import { vibeToTokens } from './vibe.js';
+import { PRICES, ensureCustomer, sendInvoice, invoiceStatus, hostingCheckout, checkoutStatus, halfDisplay } from './stripe.js';
+
+// 50/50 billing helpers (legacy full invoices from before the split still count)
+function depositPaid(b) { return b.dep_status === 'paid' || b.invoice_status === 'paid'; }
+function finalPaid(b) { return b.fin_status === 'paid' || b.invoice_status === 'paid'; }
+import { computeScore } from './score.js';
+import { gscConfigured, gscAddProperty, gscVerifyViaCloudflareDns, gscQueryStats, gscSubmitSitemap, gscGetDnsToken, gscRequestVerify, gscListProperties } from './google.js';
+import { buildZip } from './zipfile.js';
+import dashboardHtml from './ui.html';
+import form1Html from './form1.html';
+import form2Html from './form2.html';
+import loginHtml from './login.html';
+
+const app = new Hono();
+
+// ---------------- schema bootstrap (runs once per isolate) ----------------
+const SCHEMA_SQL = [
+  `CREATE TABLE IF NOT EXISTS clients (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    name TEXT DEFAULT '', phone TEXT DEFAULT '', business_name TEXT DEFAULT '',
+    stage TEXT NOT NULL DEFAULT 'new',
+    ghl_contact_id TEXT DEFAULT '',
+    intake1_data TEXT DEFAULT '', intake2_data TEXT DEFAULT '',
+    preview_url TEXT DEFAULT '', live_url TEXT DEFAULT '', notes TEXT DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')))`,
+  `CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_id INTEGER, type TEXT NOT NULL, detail TEXT DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')))`,
+  `CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '')`,
+  `CREATE TABLE IF NOT EXISTS site_files (
+    slug TEXT NOT NULL, path TEXT NOT NULL, content TEXT NOT NULL DEFAULT '',
+    content_type TEXT NOT NULL DEFAULT 'text/html', is_base64 INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (slug, path))`,
+  `CREATE INDEX IF NOT EXISTS idx_events_client ON events(client_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_clients_stage ON clients(stage)`,
+];
+let schemaReady = false;
+async function ensureSchema(db) {
+  if (schemaReady) return;
+  await db.batch(SCHEMA_SQL.map((s) => db.prepare(s)));
+  // additive migrations (safe to fail if the column already exists)
+  try { await db.prepare(`ALTER TABLE clients ADD COLUMN theme TEXT DEFAULT ''`).run(); } catch {}
+  try { await db.prepare(`ALTER TABLE clients ADD COLUMN tier TEXT DEFAULT 'standard'`).run(); } catch {}
+  try { await db.prepare(`ALTER TABLE clients ADD COLUMN launch_checklist TEXT DEFAULT ''`).run(); } catch {}
+  try { await db.prepare(`ALTER TABLE clients ADD COLUMN vibe TEXT DEFAULT ''`).run(); } catch {}
+  try { await db.prepare(`ALTER TABLE clients ADD COLUMN billing TEXT DEFAULT ''`).run(); } catch {}
+  try { await db.prepare(`CREATE TABLE IF NOT EXISTS agreements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER NOT NULL, version TEXT NOT NULL,
+    package TEXT DEFAULT '', signed_name TEXT NOT NULL, signed_at TEXT NOT NULL DEFAULT (datetime('now')),
+    user_agent TEXT DEFAULT '')`).run(); } catch {}
+  try { await db.prepare(`CREATE TABLE IF NOT EXISTS revisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER NOT NULL, request TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending', note TEXT DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')), done_at TEXT DEFAULT '')`).run(); } catch {}
+  try { await db.prepare(`CREATE TABLE IF NOT EXISTS leads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER, slug TEXT DEFAULT '',
+    name TEXT DEFAULT '', email TEXT DEFAULT '', phone TEXT DEFAULT '', message TEXT DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')))`).run(); } catch {}
+  try { await db.prepare(`ALTER TABLE leads ADD COLUMN source TEXT DEFAULT ''`).run(); } catch {}
+  try { await db.prepare(`ALTER TABLE leads ADD COLUMN status TEXT DEFAULT ''`).run(); } catch {}
+  try { await db.prepare(`ALTER TABLE clients ADD COLUMN competitors TEXT DEFAULT ''`).run(); } catch {}
+  try { await db.prepare(`ALTER TABLE clients ADD COLUMN vertical TEXT DEFAULT ''`).run(); } catch {}
+  try { await db.prepare(`ALTER TABLE site_files ADD COLUMN gh_sha TEXT DEFAULT ''`).run(); } catch {}
+  // first-party visitor counting: one row per site/day/page (HTML views only, bots skipped)
+  try { await db.prepare(`CREATE TABLE IF NOT EXISTS hits (
+    slug TEXT NOT NULL, day TEXT NOT NULL, path TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (slug, day, path))`).run(); } catch {}
+  // email delivery log: every client-facing send recorded; failed ones retried by the cron
+  try { await db.prepare(`CREATE TABLE IF NOT EXISTS email_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER, to_email TEXT DEFAULT '',
+    subject TEXT DEFAULT '', html TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'sent',
+    attempts INTEGER NOT NULL DEFAULT 1, error TEXT DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')), sent_at TEXT DEFAULT '')`).run(); } catch {}
+  // fixed-window rate limiting for the public endpoints (lead form, portal boxes)
+  try { await db.prepare(`CREATE TABLE IF NOT EXISTS ratelimit (
+    k TEXT PRIMARY KEY, n INTEGER NOT NULL DEFAULT 0, win TEXT NOT NULL DEFAULT '')`).run(); } catch {}
+  schemaReady = true;
+}
+
+app.use('*', async (c, next) => {
+  await ensureSchema(c.env.DB);
+  return next();
+});
+
+// 🌉 SAME-ORIGIN PUSH BRIDGE: a tiny receiver page opened as a popup from an
+// authenticated tool tab (e.g. ChatGPT). That tab cannot POST here directly
+// (its CSP blocks cross-origin fetch), so it postMessages {type:'push', path,
+// body, id} to this page, which runs the POST same-origin and replies to the
+// opener. No secret is baked in — the caller supplies the keyed path per push.
+app.get('/__bridge', (c) => c.html(`<!doctype html><meta charset=utf-8><title>bridge</title>
+<body style="font:14px system-ui;padding:12px">push bridge ready
+<script>
+var OPENER_ORIGIN='https://chatgpt.com';
+addEventListener('message', function(e){
+  if(e.origin!==OPENER_ORIGIN) return;
+  var m=e.data||{};
+  if(m.type!=='push') return;
+  var reply=function(o){ try{ e.source.postMessage(Object.assign({id:m.id,type:'push-result'},o), e.origin); }catch(x){} };
+  try{
+    fetch(m.path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(m.body)})
+      .then(function(r){ return r.text().then(function(t){ var j; try{j=JSON.parse(t)}catch(_){j=t} reply({ok:r.ok,status:r.status,r:j}); }); })
+      .catch(function(err){ reply({ok:false,err:String(err)}); });
+  }catch(err){ reply({ok:false,err:String(err)}); }
+});
+try{ if(window.opener) window.opener.postMessage({type:'bridge-ready'}, OPENER_ORIGIN); }catch(x){}
+</script>`));
+
+// 🌐 DIRECT LIVE HOSTING: when a client's custom domain points at this worker,
+// serve their site straight from storage — no separate hosting anywhere.
+// Mapping lives in settings: livehost_<hostname> = slug (set by golive-domain).
+app.use('*', async (c, next) => {
+  const host = (c.req.header('Host') || '').toLowerCase().split(':')[0];
+  if (!host || host.endsWith('.workers.dev')) return next();
+  const settings = await getSettings(c.env.DB);
+  const slug = settings[`livehost_${host}`] || settings[`livehost_${host.replace(/^www\./, '')}`];
+  if (!slug) return next();
+  let path = c.req.path.replace(/^\/+/, '') || 'index.html';
+  if (path === '' || path.endsWith('/')) path += 'index.html';
+  let row = await c.env.DB.prepare('SELECT * FROM site_files WHERE slug = ? AND path = ?').bind(slug, path).first();
+  if (!row && !path.includes('.')) {
+    row = await c.env.DB.prepare('SELECT * FROM site_files WHERE slug = ? AND path = ?').bind(slug, path + '/index.html').first()
+      || await c.env.DB.prepare('SELECT * FROM site_files WHERE slug = ? AND path = ?').bind(slug, path + '.html').first();
+  }
+  if (!row) {
+    const nf = await c.env.DB.prepare(`SELECT * FROM site_files WHERE slug = ? AND path = '404.html'`).bind(slug).first();
+    if (nf) return new Response(nf.is_base64 ? Uint8Array.from(atob(nf.content), (ch) => ch.charCodeAt(0)) : nf.content,
+      { status: 404, headers: { 'Content-Type': 'text/html' } });
+    return c.text('Not found', 404);
+  }
+  try {
+    const ua = c.req.header('User-Agent') || '';
+    const isHtml = String(row.content_type || '').includes('text/html');
+    const isBot = /bot|crawl|spider|slurp|headless|preview|monitor|lighthouse|pingdom/i.test(ua) || !ua;
+    const isFrame = (c.req.header('Sec-Fetch-Dest') || '') === 'iframe';
+    if (isHtml && !isBot && !isFrame) {
+      const day = new Date().toISOString().slice(0, 10);
+      c.executionCtx.waitUntil(c.env.DB.prepare(
+        `INSERT INTO hits (slug, day, path, n) VALUES (?, ?, ?, 1)
+         ON CONFLICT(slug, day, path) DO UPDATE SET n = n + 1`
+      ).bind(slug, day, path).run().catch(() => {}));
+    }
+  } catch { /* counting must never break serving */ }
+  const body = row.is_base64 ? Uint8Array.from(atob(row.content), (ch) => ch.charCodeAt(0)) : row.content;
+  return new Response(body, { headers: { 'Content-Type': row.content_type, 'Cache-Control': 'public, max-age=300' } });
+});
+
+// ---------------- helpers ----------------
+async function hmac(secret, msg) {
+  const key = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(msg));
+  return btoa(String.fromCharCode(...new Uint8Array(sig))).replace(/=+$/, '');
+}
+
+async function makeSession(env) {
+  const exp = Date.now() + 1000 * 60 * 60 * 24 * 30; // 30 days
+  const payload = `s:${exp}`;
+  return `${payload}.${await hmac(env.SESSION_SECRET, payload)}`;
+}
+
+async function checkSession(env, cookie) {
+  if (!cookie) return false;
+  const m = /cc_session=([^;]+)/.exec(cookie);
+  if (!m) return false;
+  const [payload, sig] = m[1].split('.');
+  if (!payload || !sig) return false;
+  if ((await hmac(env.SESSION_SECRET, payload)) !== sig) return false;
+  const exp = Number(payload.split(':')[1]);
+  return Date.now() < exp;
+}
+
+async function getSettings(db) {
+  const rows = (await db.prepare('SELECT key, value FROM settings').all()).results || [];
+  const s = { ...DEFAULT_SETTINGS, ...DEFAULT_TEMPLATES, ...BOOKING_TEMPLATES };
+  for (const r of rows) s[r.key] = r.value;
+  return s;
+}
+
+async function setSetting(db, key, value) {
+  await db.prepare(
+    'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+  ).bind(key, String(value ?? '')).run();
+}
+
+async function logEvent(db, clientId, type, detail = '') {
+  await db.prepare('INSERT INTO events (client_id, type, detail) VALUES (?, ?, ?)')
+    .bind(clientId, type, detail).run();
+}
+
+async function touchClient(db, id, fields) {
+  const keys = Object.keys(fields);
+  const sets = keys.map((k) => `${k} = ?`).join(', ');
+  await db.prepare(`UPDATE clients SET ${sets}, updated_at = datetime('now') WHERE id = ?`)
+    .bind(...keys.map((k) => fields[k]), id).run();
+}
+
+function ghlFor(env, settings) {
+  return new GHL(env.GHL_TOKEN, settings.ghl_location_id);
+}
+
+// ---------------- direct intake receiver (public, called by the form pages) ----------------
+function corsHeaders(c) {
+  c.header('Access-Control-Allow-Origin', c.req.header('Origin') || '*');
+  c.header('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  c.header('Access-Control-Allow-Headers', 'Content-Type');
+}
+
+app.options('/intake/:n', (c) => { corsHeaders(c); return c.body(null, 204); });
+
+app.post('/intake/:n', async (c) => {
+  corsHeaders(c);
+  const n = c.req.param('n') === '2' ? 2 : 1;
+  const db = c.env.DB;
+  const ct = c.req.header('Content-Type') || '';
+  let fields = {};
+  let rawBody = null;
+  try {
+    if (ct.includes('json')) {
+      fields = await c.req.json();
+      rawBody = JSON.stringify(fields);
+    } else {
+      const parsed = await c.req.parseBody();
+      for (const [k, v] of Object.entries(parsed)) fields[k] = typeof v === 'string' ? v : '(file)';
+    }
+  } catch { /* keep going with empty fields */ }
+
+  // normalize: find email/name/phone regardless of exact field naming
+  const lower = {};
+  for (const [k, v] of Object.entries(fields)) lower[k.toLowerCase().trim()] = typeof v === 'string' ? v : JSON.stringify(v);
+  const email = (lower.email || lower['email address'] || lower.e_mail ||
+    Object.values(lower).find((v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v).trim())) || '').trim();
+  const name = lower.name || lower['full name'] || [lower.first_name || lower.firstname, lower.last_name || lower.lastname].filter(Boolean).join(' ') || '';
+  const phone = lower.phone || lower['phone number'] || lower.tel || '';
+
+  // never store the web3forms key or bot fields
+  const stored = {};
+  for (const [k, v] of Object.entries(fields)) {
+    if (['access_key', 'botcheck', 'h-captcha-response'].includes(k.toLowerCase())) continue;
+    stored[k] = typeof v === 'string' ? v : JSON.stringify(v);
+  }
+
+  const dataCol = n === 2 ? 'intake2_data' : 'intake1_data';
+  const doneStage = n === 2 ? 'intake2_done' : 'intake1_done';
+  const advanceFrom = n === 2
+    ? ['new', 'intake1_sent', 'intake1_done', 'intake2_sent']
+    : ['new', 'intake1_sent'];
+
+  let clientId = null;
+  let firstTime = false;
+  if (email) {
+    const client = await db.prepare('SELECT * FROM clients WHERE email = ?').bind(email).first();
+    if (!client) {
+      const r = await db.prepare(
+        `INSERT INTO clients (email, name, phone, stage, ${dataCol}) VALUES (?, ?, ?, ?, ?)`
+      ).bind(email, name, phone, doneStage, JSON.stringify(stored)).run();
+      clientId = r.meta.last_row_id;
+      firstTime = true;
+      await logEvent(db, clientId, doneStage, `Intake ${n} submitted (new contact)`);
+    } else {
+      clientId = client.id;
+      firstTime = !(client[dataCol] && client[dataCol].length > 2);
+      const updates = { [dataCol]: JSON.stringify(stored) };
+      if (name && !client.name) updates.name = name;
+      if (phone && !client.phone) updates.phone = phone;
+      if (advanceFrom.includes(client.stage)) updates.stage = doneStage;
+      await touchClient(db, client.id, updates);
+      await logEvent(db, client.id, doneStage, `Intake ${n} submission received`);
+    }
+  } else {
+    await logEvent(db, null, 'error', `Intake ${n} submission had no email: ${JSON.stringify(stored).slice(0, 500)}`);
+  }
+
+  // 💼 GUIDE CHAIN (Tiffany 8/6): Intake 1 submitted → their personalized pricing
+  // guide goes out automatically. Name typed once at intake = "Prepared for" fills itself.
+  if (n === 1 && clientId) {
+    const guideChain = (async () => {
+      try {
+        const cl = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(clientId).first();
+        if (!cl || !cl.email) return;
+        const bG = getBilling(cl);
+        if (bG.guide_sent) return; // once — the card button handles resends
+        const settingsG = await getSettings(db);
+        const gurl = `${BASE_URL}/guide/${clientId}/${await portalToken(c.env, 'guide', clientId)}`;
+        const firstG = (cl.name || '').split(' ')[0] || 'there';
+        const bizG = cl.business_name || 'your business';
+        const ok = await emailClient(c.env, db, cl, settingsG,
+          `Your website packages, prepared for ${bizG}`,
+          `<p>${firstG}, thank you. Your answers just landed, and they are exactly what we need.</p>
+<p>While we set up your call, here is your personalized packages guide. It covers both builds, what each one includes, and exactly how pricing works:</p>
+<p><a href="${gurl}"><b>View your guide</b></a></p>
+<p>It takes about two minutes to read, and there is a live client site linked inside so you can see the quality for yourself.</p>
+<p>— The ConversionCo Team</p>`,
+          'guide_sent', `💼 Pricing guide sent automatically (Intake 1 complete): ${gurl}`);
+        if (ok) { bG.guide_sent = new Date().toISOString(); await touchClient(db, clientId, { billing: JSON.stringify(bG) }); }
+      } catch (e) { await logEvent(db, clientId, 'error', `Guide auto-send failed: ${e.message}`); }
+    })();
+    c.executionCtx.waitUntil(guideChain.catch(() => {}));
+  }
+
+  // ⛓ CHAIN (Tiffany 7/27): Intake 2 submitted → the agreement goes out IMMEDIATELY
+  // (unless already signed or already sent). Signature then auto-fires the deposit invoice.
+  if (n === 2 && clientId) {
+    const chain = (async () => {
+      try {
+        const cl = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(clientId).first();
+        if (!cl || !cl.email) return;
+        const signed = await db.prepare('SELECT id FROM agreements WHERE client_id = ? LIMIT 1').bind(clientId).first();
+        if (signed) return;
+        const bC = getBilling(cl);
+        if (bC.agr_sent) return; // already out — the nudges chase it
+        const settingsC = await getSettings(db);
+        if (!c.env.GHL_TOKEN || !settingsC.ghl_location_id) return;
+        const url = `${BASE_URL}/agreement/${clientId}/${await portalToken(c.env, 'agr', clientId)}`;
+        const biz = cl.business_name || cl.name || 'your business';
+        const ghl = ghlFor(c.env, settingsC);
+        const contact = await ghl.upsertContact({ email: cl.email, name: cl.name || '' });
+        await ghl.sendEmail({ contactId: contact.id || contact.contactId,
+          subject: `One quick signature before we begin — ${biz}`,
+          html: `<p>Hi ${(cl.name || '').split(' ')[0] || 'there'},</p>
+<p>Your vision form just landed — thank you, it's exactly what the design team needs. One quick signature and we're officially building: our service agreement is plain English, about two minutes to read, and it protects both of us. The short version: your domain and your website are yours.</p>
+<p><a href="${url}">${url}</a></p>
+<p>Your invoice arrives right after you sign, and the build starts the moment it's settled. Questions about anything in it? Just reply.</p>
+<p>Talk soon,<br>The ConversionCo Team</p>`,
+          emailFrom: settingsC.email_from || undefined });
+        bC.agr_sent = new Date().toISOString();
+        await touchClient(db, clientId, { billing: JSON.stringify(bC) });
+        await logEvent(db, clientId, 'agreement_sent', `⛓ Intake 2 received — agreement sent automatically to ${cl.email}`);
+      } catch (e) { await logEvent(db, clientId, 'error', `Auto-agreement after Intake 2 failed: ${String(e.message).slice(0, 140)}`); }
+    })();
+    c.executionCtx.waitUntil(chain);
+  }
+
+  // After a first-time Intake 1: automatically email the booking link (best effort)
+  if (n === 1 && email && firstTime) {
+    const settings = await getSettings(db);
+    if (settings.booking_link && c.env.GHL_TOKEN && settings.ghl_location_id) {
+      const sendBooking = (async () => {
+        try {
+          const ghl = ghlFor(c.env, settings);
+          const contact = await ghl.upsertContact({ email, name, phone });
+          const contactId = contact.id || contact.contactId;
+          if (clientId && contactId) await touchClient(db, clientId, { ghl_contact_id: contactId });
+          const firstName = (name || '').split(' ')[0] || 'there';
+          await ghl.sendEmail({
+            contactId,
+            subject: renderTemplate(settings.booking_subject, { name: firstName }),
+            html: renderTemplate(settings.booking_body, { name: firstName, booking_link: settings.booking_link }),
+            emailFrom: settings.email_from || undefined,
+          });
+          await logEvent(db, clientId, 'booking_email_sent', `Booking link sent to ${email}`);
+          await trySMS(ghl, db, clientId, contactId,
+            `Hi ${firstName}! ConversionCo here — got your intake, thank you! Grab a time for your quick planning call: ${settings.booking_link}`);
+        } catch (e) {
+          await logEvent(db, clientId, 'error', `Booking email failed: ${e.message}`);
+        }
+      })();
+      c.executionCtx.waitUntil(sendBooking);
+    }
+  }
+
+  // forward to Web3Forms so email notifications keep working (best effort)
+  if (fields.access_key) {
+    const fwd = fetch('https://api.web3forms.com/submit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: rawBody || JSON.stringify(fields),
+    }).catch(() => {});
+    c.executionCtx.waitUntil(fwd);
+  }
+
+  return c.json({ success: true, message: 'Submission received' });
+});
+
+// ---------------- public preview serving (client site previews) ----------------
+const MIME = { html: 'text/html;charset=utf-8', css: 'text/css', js: 'application/javascript', json: 'application/json', svg: 'image/svg+xml', xml: 'application/xml', txt: 'text/plain', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', ico: 'image/x-icon', woff2: 'font/woff2' };
+
+app.get('/preview/:slug', (c) => c.redirect(`/preview/${c.req.param('slug')}/index.html`));
+app.get('/preview/:slug/', (c) => c.redirect(`/preview/${c.req.param('slug')}/index.html`));
+app.get('/preview/:slug/*', async (c) => {
+  const slug = c.req.param('slug');
+  let path = c.req.path.replace(`/preview/${slug}/`, '') || 'index.html';
+  if (path === '' || path.endsWith('/')) path += 'index.html';
+  let row = await c.env.DB.prepare('SELECT * FROM site_files WHERE slug = ? AND path = ?').bind(slug, path).first();
+  if (!row && !path.includes('.')) {
+    row = await c.env.DB.prepare('SELECT * FROM site_files WHERE slug = ? AND path = ?').bind(slug, path + '/index.html').first()
+      || await c.env.DB.prepare('SELECT * FROM site_files WHERE slug = ? AND path = ?').bind(slug, path + '.html').first();
+  }
+  if (!row) return c.text('Not found', 404);
+  // 📊 first-party visitor counting — real page views only: HTML documents, not bots,
+  // not the portal's own mini-preview iframe, not assets
+  try {
+    const ua = c.req.header('User-Agent') || '';
+    const isHtml = String(row.content_type || '').includes('text/html');
+    const isBot = /bot|crawl|spider|slurp|headless|preview|monitor|lighthouse|pingdom/i.test(ua) || !ua;
+    const isFrame = (c.req.header('Sec-Fetch-Dest') || '') === 'iframe';
+    // Tiffany's own peeks are NOT visitors — an admin session never counts.
+    // ?nocount=1 lets QA/tests view without polluting the numbers.
+    const isAdmin = await checkSession(c.env, c.req.header('Cookie'));
+    const noCount = !!c.req.query('nocount');
+    if (isHtml && !isBot && !isFrame && !isAdmin && !noCount) {
+      const day = new Date().toISOString().slice(0, 10);
+      c.executionCtx.waitUntil(c.env.DB.prepare(
+        `INSERT INTO hits (slug, day, path, n) VALUES (?, ?, ?, 1)
+         ON CONFLICT(slug, day, path) DO UPDATE SET n = n + 1`
+      ).bind(slug, day, path).run().catch(() => {}));
+    }
+  } catch { /* counting must never break serving */ }
+  const body = row.is_base64 ? Uint8Array.from(atob(row.content), (ch) => ch.charCodeAt(0)) : row.content;
+  return new Response(body, { headers: { 'Content-Type': row.content_type, 'Cache-Control': 'no-cache' } });
+});
+
+// Keyed: wipe visit counts for a slug (test pollution cleanup) — true data only
+app.get('/api/clear-hits/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const slug = String(c.req.query('slug') || '');
+  if (!slug) return c.json({ ok: false, error: 'slug required' });
+  const r = await c.env.DB.prepare('DELETE FROM hits WHERE slug = ?').bind(slug).run();
+  return c.json({ ok: true, slug, deleted: r.meta ? r.meta.changes : 0 });
+});
+
+// ---------------- auth ----------------
+app.post('/login', async (c) => {
+  const { password } = await c.req.parseBody();
+  if (password !== c.env.DASH_PASSWORD) {
+    return c.html(loginHtml.replace('<!--ERROR-->', '<p class="err">Wrong password, try again.</p>'));
+  }
+  const token = await makeSession(c.env);
+  c.header('Set-Cookie', `cc_session=${token}; HttpOnly; Secure; Path=/; Max-Age=2592000; SameSite=Lax`);
+  return c.redirect('/');
+});
+
+// Webhook from GHL (no session; secret in URL) — optional alternative to polling
+app.post('/webhooks/ghl/:secret', async (c) => {
+  const settings = await getSettings(c.env.DB);
+  const expected = await hmac(c.env.SESSION_SECRET, 'webhook');
+  if (c.req.param('secret') !== expected.slice(0, 16)) return c.text('nope', 403);
+  const body = await c.req.json().catch(() => ({}));
+  await logEvent(c.env.DB, null, 'webhook_received', JSON.stringify(body).slice(0, 4000));
+  // Polling is the source of truth; webhook just triggers an immediate poll.
+  await pollForms(c.env, settings).catch(() => {});
+  return c.json({ ok: true });
+});
+
+// Diagnostic endpoint (keyed, GET so it can be fetched externally)
+app.get('/debug/:key', async (c) => {
+  if (c.req.param('key') !== 'dbg-7c1f4a9e2b') return c.text('nope', 403);
+  const db = c.env.DB;
+  const settings = await getSettings(db);
+  let publishResult = 'ran';
+  try { await autoPublish(c.env, settings); } catch (e) { publishResult = 'ERROR: ' + e.message; }
+  const events = (await db.prepare('SELECT type, detail, created_at FROM events ORDER BY id DESC LIMIT 12').all()).results || [];
+  // repo state diagnostics
+  let repoDiag = {};
+  try {
+    const gh = ghFetcher(c.env);
+    const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+    const ref = await gh(`/repos/${repo}/git/ref/heads/main`);
+    const commit = await gh(`/repos/${repo}/git/commits/${ref.object.sha}`);
+    const tree = await gh(`/repos/${repo}/git/trees/${commit.tree.sha}?recursive=1`);
+    const metas = (tree.tree || []).filter((t) => /^sites\/[^/]+\/site-meta\.json$/.test(t.path));
+    repoDiag = { head: ref.object.sha.slice(0,10), metas: metas.map(m => ({ path: m.path, sha: m.sha.slice(0,10), stored: (settings['site_sha_' + m.path.split('/')[1]] || 'none').slice(0,10) })) };
+  } catch (e) { repoDiag = { error: e.message }; }
+  const fileCount = await db.prepare('SELECT COUNT(*) AS n FROM site_files').first();
+  return c.json({
+    publishResult,
+    site_files: fileCount?.n,
+    has_github_token: Boolean(c.env.GITHUB_TOKEN),
+    sites_repo: settings.sites_repo,
+    repoDiag,
+    events: events.map((e) => ({ t: e.type, d: (e.detail || '').slice(0, 160), at: e.created_at })),
+    uptime: await (async () => {
+      const rows = (await c.env.DB.prepare(`SELECT key, value FROM settings WHERE key LIKE 'uptime_%'`).all()).results || [];
+      const out = {};
+      for (const r of rows) { try { out[r.key] = JSON.parse(r.value); } catch {} }
+      return out;
+    })(),
+    // which-drip quiz taps per site (market demand signal for the copy retro)
+    quiz: await (async () => {
+      const rows = (await c.env.DB.prepare(`SELECT key, value FROM settings WHERE key LIKE 'qz_%'`).all()).results || [];
+      const out = {};
+      for (const r of rows) { try { out[r.key.slice(3)] = JSON.parse(r.value); } catch {} }
+      return out;
+    })(),
+    tiers: await (async () => {
+      const rows = (await c.env.DB.prepare('SELECT id, email, business_name, tier, stage, billing, competitors, live_url FROM clients').all()).results || [];
+      const out = [];
+      for (const r of rows) {
+        let b = {}; try { b = JSON.parse(r.billing || '{}'); } catch {}
+        out.push({ id: r.id, email: r.email, business_name: r.business_name, tier: r.tier, stage: r.stage,
+          paid: depositPaid(b), paidInFull: finalPaid(b), hosting: b.sub_status === 'active',
+          competitors: r.competitors || '', live_url: r.live_url || '',
+          gbp_url: `${BASE_URL}/gbp/${r.id}/${await portalToken(c.env, 'gbp', r.id)}` });
+      }
+      return out;
+    })(),
+    revisionQueue: await (async () => {
+      const rows = (await c.env.DB.prepare(`SELECT r.*, cl.business_name, cl.tier, cl.email FROM revisions r JOIN clients cl ON cl.id = r.client_id WHERE r.status = 'pending' ORDER BY r.id`).all()).results || [];
+      return rows;
+    })(),
+    buildQueue: await (async () => {
+      const rows = (await c.env.DB.prepare(`SELECT * FROM clients WHERE stage IN ('intake2_done','generating')`).all()).results || [];
+      const out = [];
+      for (const r of rows) {
+        let b = {}; try { b = JSON.parse(r.billing || '{}'); } catch {}
+        // ingredients the builder's completeness gate checks before cooking
+        const ph = (await c.env.DB.prepare(`SELECT COUNT(*) AS n FROM site_files WHERE slug=? AND path LIKE 'photo-%'`).bind(`_assets-${r.id}`).first())?.n || 0;
+        const lg = await c.env.DB.prepare(`SELECT 1 AS x FROM site_files WHERE slug=? AND path='logo'`).bind(`_assets-${r.id}`).first();
+        out.push({ id: r.id, email: r.email, name: r.name, business_name: r.business_name,
+          tier: r.tier || 'standard', theme: r.theme || '', vibe: r.vibe || '', vertical: r.vertical || 'iv-therapy',
+          paid: depositPaid(b), photos: ph, hasLogo: !!lg,
+          intake1: r.intake1_data || '', intake2: r.intake2_data || '' });
+      }
+      return out;
+    })(),
+    demoQueue: await (async () => {
+      const rows = (await c.env.DB.prepare(`SELECT * FROM clients WHERE stage = 'prospect'`).all()).results || [];
+      const out = [];
+      for (const r of rows) {
+        out.push({ id: r.id, business_name: r.business_name, name: r.name,
+          theme: r.theme || '', vibe: r.vibe || '', vertical: r.vertical || 'iv-therapy',
+          intake1: r.intake1_data || '',
+          pitch_url: `${BASE_URL}/pitch/${r.id}/${await portalToken(c.env, 'pitch', r.id)}` });
+      }
+      return out;
+    })(),
+    clientLeads: await (async () => {
+      // recent lead messages + sources per client — feeds the FAQ-that-learns and
+      // lead-source sections of the report engines
+      // excludes the client's own portal messages — those are not visitor leads
+      const rows = (await c.env.DB.prepare(`SELECT client_id, name, message, source, created_at FROM leads WHERE created_at > datetime('now','-35 days') AND slug != 'portal-message' ORDER BY id DESC LIMIT 200`).all()).results || [];
+      const out = {};
+      for (const l of rows) {
+        if (!l.client_id) continue;
+        (out[l.client_id] = out[l.client_id] || []).push({ name: l.name, message: (l.message || '').slice(0, 300), source: l.source || 'direct', at: l.created_at });
+      }
+      return out;
+    })(),
+    counters: await (async () => {
+      const rows = (await c.env.DB.prepare('SELECT id FROM clients').all()).results || [];
+      const out = {};
+      for (const r of rows) {
+        // leads NEVER include the client's own portal messages (true-data law)
+        const l = (await c.env.DB.prepare(`SELECT COUNT(*) AS n FROM leads WHERE client_id = ? AND slug != 'portal-message'`).bind(r.id).first())?.n || 0;
+        const v = (await c.env.DB.prepare(`SELECT COUNT(*) AS n FROM revisions WHERE client_id = ? AND status='done'`).bind(r.id).first())?.n || 0;
+        const bk = (await c.env.DB.prepare(`SELECT COUNT(*) AS n FROM leads WHERE client_id = ? AND status='booked' AND slug != 'portal-message'`).bind(r.id).first())?.n || 0;
+        out[r.id] = { leads: l, revisionsDone: v, booked: bk };
+      }
+      return out;
+    })(),
+    scores: await (async () => {
+      const rows = (await c.env.DB.prepare('SELECT * FROM clients').all()).results || [];
+      const settings2 = await getSettings(c.env.DB);
+      const out = {};
+      for (const cl of rows) { try { const sc = await computeScore(c.env.DB, cl, settings2); if (sc) out[cl.id] = sc; } catch {} }
+      return out;
+    })(),
+    visits: await (async () => {
+      // First-party visitor counts from the hits table (bot-filtered, iframe-
+      // excluded, admin sessions never counted). TRUE-DATA GATE: a slug only
+      // appears here when its client is GENUINELY live (live_url set) — preview
+      // traffic before launch is internal and must never reach a report.
+      // ext-<id> entries come from the pixel on an already-live external site.
+      const out = {};
+      try {
+        // slug → live client map
+        const metasV = (await c.env.DB.prepare(`SELECT slug, content FROM site_files WHERE path='site-meta.json'`).all()).results || [];
+        const clientsV = (await c.env.DB.prepare(`SELECT id, live_url FROM clients`).all()).results || [];
+        const liveIds = new Set(clientsV.filter((x) => x.live_url).map((x) => x.id));
+        const liveSlugs = new Set();
+        for (const m of metasV) { try { const cid = JSON.parse(m.content).client_id; if (liveIds.has(cid)) liveSlugs.add(m.slug); } catch {} }
+        const rows = (await c.env.DB.prepare(`SELECT slug, day, path, n FROM hits WHERE day > date('now','-28 days')`).all()).results || [];
+        for (const h of rows) {
+          if (!h.slug.startsWith('ext-') && !liveSlugs.has(h.slug)) continue;
+          const o = (out[h.slug] = out[h.slug] || { week: 0, month: 0, pages: {} });
+          o.month += h.n;
+          if (h.day > new Date(Date.now() - 7 * 864e5).toISOString().slice(0, 10)) o.week += h.n;
+          o.pages[h.path] = (o.pages[h.path] || 0) + h.n;
+        }
+        for (const s of Object.keys(out)) {
+          const top = Object.entries(out[s].pages).filter(([p]) => p !== 'index.html' && p !== '').sort((a, b) => b[1] - a[1])[0];
+          out[s].top = top ? top[0] : '';
+          delete out[s].pages;
+        }
+      } catch {}
+      return out;
+    })(),
+    gsc: await (async () => {
+      // Google Search Console: configured flag + per-client state and the latest
+      // exact-numbers snapshot (gsc_data_<id>) — report engines PREFER this data.
+      const rows = (await c.env.DB.prepare(`SELECT key, value FROM settings WHERE key LIKE 'gsc%'`).all()).results || [];
+      const out = { configured: gscConfigured(c.env) };
+      for (const r of rows) { try { out[r.key] = JSON.parse(r.value); } catch {} }
+      return out;
+    })(),
+  });
+});
+
+// ---- Keyed file commit → client-sites repo via the worker's own GitHub token ----
+// Two modes: {path, message, b64} writes full content; {path, message, replaces:
+// [[find, replaceWith], ...]} patches the existing file (each find must match).
+app.post('/api/commit-file/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  if (!c.env.GITHUB_TOKEN) return c.json({ ok: false, error: 'GITHUB_TOKEN secret not set' });
+  let f = {}; try { f = await c.req.json(); } catch {}
+  const path = String(f.path || '');
+  const message = String(f.message || '');
+  if (!path || !message) return c.json({ ok: false, error: 'path + message required' }, 400);
+  const settings = await getSettings(c.env.DB);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  const ghHeaders = { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+  const api = `https://api.github.com/repos/${repo}/contents/${path}`;
+  const getRes = await fetch(api, { headers: ghHeaders });
+  const existing = getRes.ok ? await getRes.json() : null;
+  let content = String(f.b64 || '');
+  if (!content && Array.isArray(f.replaces)) {
+    if (!existing || !existing.content) return c.json({ ok: false, error: 'file not found for replace mode' }, 404);
+    let text = new TextDecoder().decode(Uint8Array.from(atob(String(existing.content).replace(/\n/g, '')), (ch) => ch.charCodeAt(0)));
+    for (const pair of f.replaces) {
+      const find = String(pair[0] || ''); const repl = String(pair[1] || '');
+      if (!find || !text.includes(find)) return c.json({ ok: false, error: 'target text not found: ' + find.slice(0, 80) }, 400);
+      text = text.split(find).join(repl);
+    }
+    const bytes = new TextEncoder().encode(text);
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += 8192) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+    content = btoa(bin);
+  }
+  if (!content) return c.json({ ok: false, error: 'b64 or replaces required' }, 400);
+  const putRes = await fetch(api, { method: 'PUT', headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message, content, ...(existing && existing.sha ? { sha: existing.sha } : {}) }) });
+  const out = await putRes.json();
+  if (!putRes.ok) return c.json({ ok: false, error: JSON.stringify(out).slice(0, 300) });
+  return c.json({ ok: true, commit: (out.commit && out.commit.sha || '').slice(0, 10), path });
+});
+
+// ---- AI image generation (OpenAI) → commits PNG into the client-sites repo ----
+// Keyed endpoint so the builder can trigger it without a browser session.
+app.post('/api/genimage/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  if (!c.env.OPENAI_API_KEY) return c.json({ ok: false, error: 'OPENAI_API_KEY secret not set yet' });
+  if (!c.env.GITHUB_TOKEN) return c.json({ ok: false, error: 'GITHUB_TOKEN secret not set' });
+  const { prompt, slug, name, size = '1024x1536' } = await c.req.json();
+  if (!prompt || !slug || !name) return c.json({ ok: false, error: 'prompt, slug, name required' }, 400);
+  const settings = await getSettings(c.env.DB);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  try {
+    // try gpt-image-1 first, fall back to dall-e-3
+    let b64 = null;
+    let modelUsed = 'gpt-image-1';
+    let res = await fetch('https://api.openai.com/v1/images/generations', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${c.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-image-1', prompt, size, quality: 'high' }),
+    });
+    let data = await res.json();
+    if (data?.data?.[0]?.b64_json) {
+      b64 = data.data[0].b64_json;
+    } else {
+      modelUsed = 'dall-e-3';
+      res = await fetch('https://api.openai.com/v1/images/generations', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${c.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'dall-e-3', prompt, size: '1024x1792', quality: 'hd', response_format: 'b64_json' }),
+      });
+      data = await res.json();
+      if (data?.data?.[0]?.b64_json) b64 = data.data[0].b64_json;
+      else return c.json({ ok: false, error: JSON.stringify(data?.error || data).slice(0, 400) });
+    }
+    // commit PNG to GitHub repo
+    const path = `sites/${slug}/img/${name}.png`;
+    const getRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+      headers: { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' },
+    });
+    const existing = getRes.ok ? await getRes.json() : null;
+    const putRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: `Generate ${name}.png (${modelUsed})`, content: b64, ...(existing?.sha ? { sha: existing.sha } : {}) }),
+    });
+    if (!putRes.ok) return c.json({ ok: false, error: `GitHub commit failed: ${putRes.status}` });
+    // also store directly into D1 so the preview serves it immediately
+    await c.env.DB.prepare(
+      `INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
+       VALUES (?, ?, ?, 'image/png', 1, datetime('now'))
+       ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, is_base64=1, updated_at=datetime('now')`
+    ).bind(slug, `img/${name}.png`, b64).run();
+    return c.json({ ok: true, model: modelUsed, path, preview: `${BASE_URL}/preview/${slug}/img/${name}.png` });
+  } catch (e) {
+    return c.json({ ok: false, error: e.message }, 502);
+  }
+});
+
+app.get('/api/genimage/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const q = c.req.query();
+  const res = await app.request('/api/genimage/gen-4b8e1d7f3a', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt: q.prompt, slug: q.slug, name: q.name, size: q.size }),
+  }, c.env, c.executionCtx);
+  return res;
+});
+
+// Fetch an image from a URL (e.g. a generated render) and store it into a site + GitHub
+app.post('/api/fetchimg/:key', async (c) => {
+  corsHeaders(c);
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  if (!c.env.GITHUB_TOKEN) return c.json({ ok: false, error: 'GITHUB_TOKEN secret not set' });
+  const { url, slug, name } = await c.req.json();
+  if (!url || !slug || !name) return c.json({ ok: false, error: 'url, slug, name required' }, 400);
+  const settings = await getSettings(c.env.DB);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  try {
+    const imgRes = await fetch(url);
+    if (!imgRes.ok) return c.json({ ok: false, error: `fetch ${imgRes.status}` });
+    const buf = new Uint8Array(await imgRes.arrayBuffer());
+    if (buf.length > 8_000_000) return c.json({ ok: false, error: 'image too large' });
+    let bin = '';
+    const chunk = 0x8000;
+    for (let i = 0; i < buf.length; i += chunk) bin += String.fromCharCode.apply(null, buf.subarray(i, i + chunk));
+    const b64 = btoa(bin);
+    // slug 'library' targets the shared image library instead of a client site.
+    // Respect an extension the caller already provided (jpg/webp/etc); default .png.
+    const extMatch = name.match(/\.(png|jpe?g|webp|gif|svg)$/i);
+    const fname = extMatch ? name : `${name}.png`;
+    const fmime = extMatch ? (MIME[extMatch[1].toLowerCase() === 'jpg' ? 'jpg' : extMatch[1].toLowerCase()] || 'image/png') : 'image/png';
+    const path = slug === 'library' ? `library/img/${fname}` : `sites/${slug}/img/${fname}`;
+    const getRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+      headers: { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' },
+    });
+    const existing = getRes.ok ? await getRes.json() : null;
+    const putRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: `Add ${fname}`, content: b64, ...(existing?.sha ? { sha: existing.sha } : {}) }),
+    });
+    if (!putRes.ok) return c.json({ ok: false, error: `GitHub ${putRes.status}` });
+    await c.env.DB.prepare(
+      `INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
+       VALUES (?, ?, ?, ?, 1, datetime('now'))
+       ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, is_base64=1, updated_at=datetime('now')`
+    ).bind(slug, `img/${fname}`, b64, fmime).run();
+    return c.json({ ok: true, bytes: buf.length, path });
+  } catch (e) {
+    return c.json({ ok: false, error: e.message }, 502);
+  }
+});
+app.options('/api/fetchimg/:key', (c) => { corsHeaders(c); return c.body(null, 204); });
+
+// Push raw base64 image data (e.g. read out of a page that blocks downloads) → GitHub + D1
+app.post('/api/pushimg/:key', async (c) => {
+  corsHeaders(c);
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  if (!c.env.GITHUB_TOKEN) return c.json({ ok: false, error: 'GITHUB_TOKEN secret not set' });
+  // accepts JSON or a plain form POST (form navigation is the only route past
+  // some pages' CSP — e.g. pushing a generated image out of the ChatGPT tab)
+  let f = {};
+  try { f = await c.req.json(); } catch { try { f = Object.fromEntries(Object.entries(await c.req.parseBody()).map(([k, v]) => [k, String(v)])); } catch {} }
+  const { b64, slug, name: rawName, ext = 'png' } = f;
+  if (!b64 || !slug || !rawName) return c.json({ ok: false, error: 'b64, slug, name required' }, 400);
+  if (b64.length > 11_000_000) return c.json({ ok: false, error: 'image too large' });
+  const clean = b64.replace(/^data:[^,]+,/, '');
+  // A name that already carries an extension WINS (callers send "photo.jpg");
+  // otherwise the ext field (default png). Never produce name.jpg.png again.
+  const nameExtM = String(rawName).match(/\.(png|jpe?g|webp)$/i);
+  const name = nameExtM ? String(rawName).replace(/\.(png|jpe?g|webp)$/i, '') : String(rawName);
+  const extEff = nameExtM ? (nameExtM[1].toLowerCase() === 'jpeg' ? 'jpg' : nameExtM[1].toLowerCase()) : ext;
+  const safeExt = extEff === 'webp' ? 'webp' : extEff === 'jpg' ? 'jpg' : 'png';
+  const mime = safeExt === 'webp' ? 'image/webp' : safeExt === 'jpg' ? 'image/jpeg' : 'image/png';
+  const settings = await getSettings(c.env.DB);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  try {
+    // slug 'library' targets the shared image library instead of a client site
+    const path = slug === 'library' ? `library/img/${name}.${safeExt}` : `sites/${slug}/img/${name}.${safeExt}`;
+    const ghHeaders = { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+    const getRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, { headers: ghHeaders });
+    const existing = getRes.ok ? await getRes.json() : null;
+    const putRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+      method: 'PUT',
+      headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: `Add ${name}.${safeExt}`, content: clean, ...(existing?.sha ? { sha: existing.sha } : {}) }),
+    });
+    if (!putRes.ok) return c.json({ ok: false, error: `GitHub ${putRes.status}: ${(await putRes.text()).slice(0, 200)}` });
+    // D1 preview mirror: client sites only, and only when it fits D1's value cap.
+    // Library images live in the repo alone — builders copy them at build time.
+    let mirrored = false;
+    if (slug !== 'library' && clean.length < 1_800_000) {
+      try {
+        await c.env.DB.prepare(
+          `INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
+           VALUES (?, ?, ?, ?, 1, datetime('now'))
+           ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, content_type=excluded.content_type, is_base64=1, updated_at=datetime('now')`
+        ).bind(slug, `img/${name}.${safeExt}`, clean, mime).run();
+        mirrored = true;
+      } catch { /* repo copy is canonical; preview refreshes on next auto-publish */ }
+    }
+    return c.json({ ok: true, bytes: Math.floor(clean.length * 0.75), path, mirrored, preview: slug === 'library' ? null : `${BASE_URL}/preview/${slug}/img/${name}.${safeExt}` });
+  } catch (e) {
+    return c.json({ ok: false, error: e.message }, 502);
+  }
+});
+app.options('/api/pushimg/:key', (c) => { corsHeaders(c); return c.body(null, 204); });
+
+// GET variant: grab an image URL via top-level navigation (bypasses page CSP)
+app.get('/api/grabimg/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const q = c.req.query();
+  const res = await app.request('/api/fetchimg/gen-4b8e1d7f3a', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url: q.u, slug: q.slug, name: q.name }),
+  }, c.env, c.executionCtx);
+  const data = await res.json().catch(() => ({}));
+  return c.html(`<html><body style="font-family:sans-serif;background:#111;color:#eee;padding:40px">
+    <h2>${data.ok ? '✅ SAVED' : '❌ FAILED'}</h2><p>${q.name}: ${data.ok ? data.bytes + ' bytes' : (data.error || 'unknown')}</p>
+  </body></html>`);
+});
+
+
+// Keyed text-file reader from the sites repo (GET, WebFetch-able) — lets the
+// builder read catalog.json / site-metas when its sandbox can't reach GitHub.
+app.get('/api/readfile/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  if (!c.env.GITHUB_TOKEN) return c.json({ ok: false, error: 'GITHUB_TOKEN secret not set' });
+  const path = String(c.req.query('path') || '');
+  if (!path) return c.json({ ok: false, error: 'path required' }, 400);
+  const settings = await getSettings(c.env.DB);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  const ghHeaders = { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+  const r = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, { headers: ghHeaders });
+  if (!r.ok) return c.json({ ok: false, error: `not found: ${path}` }, 404);
+  const j = await r.json();
+  if (Array.isArray(j)) return c.json({ ok: true, dir: j.map((f) => ({ name: f.name, type: f.type, size: f.size })) });
+  let content = String(j.content || '');
+  if (!content && j.sha) { // >1MB → blob API
+    const b = await fetch(`https://api.github.com/repos/${repo}/git/blobs/${j.sha}`, { headers: ghHeaders });
+    if (b.ok) content = String((await b.json()).content || '');
+  }
+  const text = new TextDecoder().decode(Uint8Array.from(atob(content.replace(/\n/g, '')), (ch) => ch.charCodeAt(0)));
+  return c.text(text.slice(0, 200000));
+});
+
+// Keyed file DELETE from the sites repo (GET, WebFetch-able) — repo hygiene:
+// removes stray/retired files so imports stay lean. Also cleans the D1 mirror.
+app.get('/api/deletefile/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  if (!c.env.GITHUB_TOKEN) return c.json({ ok: false, error: 'GITHUB_TOKEN secret not set' });
+  const path = String(c.req.query('path') || '');
+  if (!path || path.includes('..')) return c.json({ ok: false, error: 'valid path required' }, 400);
+  if (/site-meta\.json$|^tools\/|^reports\/_template\//.test(path)) return c.json({ ok: false, error: 'protected path' }, 400);
+  const settings = await getSettings(c.env.DB);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  const ghHeaders = { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+  const meta = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, { headers: ghHeaders });
+  if (!meta.ok) return c.json({ ok: false, error: `not found: ${path}` }, 404);
+  const mj = await meta.json();
+  const delRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+    method: 'DELETE', headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: `🧹 remove ${path}`, sha: mj.sha }) });
+  if (!delRes.ok) { const out = await delRes.json().catch(() => ({}));
+    return c.json({ ok: false, error: JSON.stringify(out).slice(0, 200) }); }
+  const m2 = path.match(/^sites\/([^/]+)\/(.+)$/);
+  if (m2) await c.env.DB.prepare('DELETE FROM site_files WHERE slug = ? AND path = ?').bind(m2[1], m2[2]).run();
+  return c.json({ ok: true, deleted: path });
+});
+
+// Keyed server-side file copy WITHIN the sites repo (GET so it's WebFetch-able).
+// Built for the builder: copy library images into a client's img/ folder without
+// the bytes ever leaving GitHub. Handles >1MB files via the git blob API.
+app.get('/api/copyfile/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  if (!c.env.GITHUB_TOKEN) return c.json({ ok: false, error: 'GITHUB_TOKEN secret not set' });
+  const from = String(c.req.query('from') || ''); const to = String(c.req.query('to') || '');
+  if (!from || !to) return c.json({ ok: false, error: 'from + to required' }, 400);
+  const settings = await getSettings(c.env.DB);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  const ghHeaders = { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+  const meta = await fetch(`https://api.github.com/repos/${repo}/contents/${from}`, { headers: ghHeaders });
+  if (!meta.ok) return c.json({ ok: false, error: `source not found: ${from}` }, 404);
+  const mj = await meta.json();
+  const blobRes = await fetch(`https://api.github.com/repos/${repo}/git/blobs/${mj.sha}`, { headers: ghHeaders });
+  if (!blobRes.ok) return c.json({ ok: false, error: 'blob read failed' });
+  const blob = await blobRes.json();
+  const content = String(blob.content || '').replace(/\n/g, '');
+  const destRes = await fetch(`https://api.github.com/repos/${repo}/contents/${to}`, { headers: ghHeaders });
+  const dest = destRes.ok ? await destRes.json() : null;
+  const putRes = await fetch(`https://api.github.com/repos/${repo}/contents/${to}`, {
+    method: 'PUT', headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: `copy ${from} → ${to}`, content, ...(dest && dest.sha ? { sha: dest.sha } : {}) }) });
+  if (!putRes.ok) { const out = await putRes.json().catch(() => ({}));
+    return c.json({ ok: false, error: JSON.stringify(out).slice(0, 200) }); }
+  return c.json({ ok: true, to, bytes: mj.size });
+});
+
+// Revision runner callbacks (keyed; GET so headless sessions can call via WebFetch)
+app.get('/api/revision-done/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const q = c.req.query();
+  const id = Number(q.id);
+  const status = q.status === 'failed' ? 'failed' : 'done';
+  const rev = await c.env.DB.prepare('SELECT * FROM revisions WHERE id = ?').bind(id).first();
+  if (!rev) return c.json({ ok: false, error: 'revision not found' });
+  await c.env.DB.prepare(`UPDATE revisions SET status = ?, note = ?, done_at = datetime('now') WHERE id = ?`)
+    .bind(status, String(q.note || '').slice(0, 400), id).run();
+  await logEvent(c.env.DB, rev.client_id, status === 'done' ? 'revision_done' : 'revision_failed',
+    `${status === 'done' ? '✅ Revision applied' : '⚠️ Revision needs attention'}: "${rev.request.slice(0, 80)}"${q.note ? ' — ' + String(q.note).slice(0, 120) : ''}`);
+  return c.json({ ok: true });
+});
+
+// Keyed setter for the sending identity (email_from) — used during deliverability setup
+app.get('/api/set-from/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const value = String(c.req.query('value') || '').trim();
+  if (value && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) return c.json({ ok: false, error: 'invalid email' });
+  await c.env.DB.prepare(`INSERT INTO settings (key, value) VALUES ('email_from', ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value`).bind(value).run();
+  return c.json({ ok: true, email_from: value });
+});
+
+// Keyed: trace what GHL/Mailgun actually did with emails to an address (delivery status)
+app.get('/api/email-status/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const email = String(c.req.query('email') || '').trim();
+  if (!email) return c.json({ ok: false, error: '?email= required' });
+  const settings = await getSettings(c.env.DB);
+  const ghl = new GHL(c.env.GHL_TOKEN, settings.ghl_location_id);
+  try {
+    const contact = await ghl.upsertContact({ email });
+    const contactId = contact.id || contact.contactId;
+    const conv = await ghl.req('GET', '/conversations/search', { query: { locationId: settings.ghl_location_id, contactId, limit: 5 } });
+    const convs = conv.conversations || [];
+    const out = [];
+    for (const cv of convs) {
+      try {
+        const msgs = await ghl.req('GET', `/conversations/${cv.id}/messages`, { query: { limit: 20 } });
+        const list = msgs.messages?.messages || msgs.messages || [];
+        for (const m of list) {
+          if (String(m.messageType || m.type || '').toLowerCase().includes('email') || m.type === 3) {
+            const entry = { dateAdded: m.dateAdded, status: m.status, source: m.source, direction: m.direction, meta: m.meta?.email || undefined, id: m.id };
+            const mids = m.meta?.email?.messageIds || [];
+            entry.detail = [];
+            for (const mid of mids.slice(0, 3)) {
+              try {
+                const d = await ghl.req('GET', `/conversations/messages/email/${mid}`);
+                const e2 = d.emailMessage || d;
+                entry.detail.push({ status: e2.status, subject: e2.subject, from: e2.from, to: e2.to, error: e2.error || e2.failureReason || undefined, dateAdded: e2.dateAdded });
+              } catch (e) { entry.detail.push({ detailError: String(e.message).slice(0, 200) }); }
+            }
+            out.push(entry);
+          }
+        }
+      } catch (e) { out.push({ convError: String(e.message).slice(0, 200) }); }
+    }
+    return c.json({ ok: true, email, contactId, conversations: convs.length, emails: out });
+  } catch (e) { return c.json({ ok: false, error: String(e.message || e).slice(0, 300) }); }
+});
+
+// Keyed: the auto-builder calls this the moment it starts building a client's site,
+// so Mission Control shows "⚙ Building site…" live instead of jumping straight to preview.
+app.get('/api/build-started/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const id = Number(c.req.query('id'));
+  if (!id) return c.json({ ok: false, error: '?id= required' });
+  const client = await c.env.DB.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ ok: false, error: 'client not found' });
+  await touchClient(c.env.DB, id, { stage: 'generating' });
+  await setSetting(c.env.DB, `buildprog_${id}`, JSON.stringify({ started_at: new Date().toISOString(), pct: 5, step: 'Build started' }));
+  await logEvent(c.env.DB, id, 'build_started', `⚙ Build started for ${client.business_name || client.name || client.email} — site is being generated now`);
+  return c.json({ ok: true });
+});
+
+// Keyed: the builder reports milestones so the dashboard progress bar is real
+app.get('/api/build-progress/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const id = Number(c.req.query('id'));
+  const pct = Math.max(1, Math.min(99, Number(c.req.query('pct')) || 0));
+  const step = String(c.req.query('step') || '').slice(0, 60);
+  if (!id || !pct) return c.json({ ok: false, error: '?id= and ?pct= required' });
+  const settings = await getSettings(c.env.DB);
+  let prog = {}; try { prog = JSON.parse(settings[`buildprog_${id}`] || '{}'); } catch {}
+  if (!prog.started_at) prog.started_at = new Date().toISOString();
+  prog.pct = Math.max(prog.pct || 0, pct); // never move backwards
+  if (step) prog.step = step;
+  prog.updated_at = new Date().toISOString();
+  await setSetting(c.env.DB, `buildprog_${id}`, JSON.stringify(prog));
+  return c.json({ ok: true, ...prog });
+});
+
+// Shared: send a personal-style email to a client (moments engine)
+async function emailClient(env, db, client, settings, subject, html, eventType, eventDetail) {
+  if (!client?.email || !env.GHL_TOKEN || !settings.ghl_location_id) return false;
+  try {
+    const ghl = new GHL(env.GHL_TOKEN, settings.ghl_location_id);
+    const contact = await ghl.upsertContact({ email: client.email, name: client.name || '' });
+    await ghl.sendEmail({ contactId: contact.id || contact.contactId, subject, html, emailFrom: settings.email_from || undefined });
+    if (eventType) await logEvent(db, client.id, eventType, eventDetail || subject);
+    try { await db.prepare(`INSERT INTO email_log (client_id, to_email, subject, status, sent_at) VALUES (?, ?, ?, 'sent', datetime('now'))`)
+      .bind(client.id || null, client.email, String(subject).slice(0, 200)).run(); } catch {}
+    return true;
+  } catch (e) {
+    // record the failure WITH the html so the cron can retry it — silence is how clients get lost
+    try { await db.prepare(`INSERT INTO email_log (client_id, to_email, subject, html, status, error) VALUES (?, ?, ?, ?, 'failed', ?)`)
+      .bind(client.id || null, client.email, String(subject).slice(0, 200), String(html).slice(0, 60000), String(e && e.message || e).slice(0, 300)).run(); } catch {}
+    try { await logEvent(db, client.id, 'email_failed', `📧⚠️ Email to ${client.email} failed ("${String(subject).slice(0, 60)}") — will retry automatically`); } catch {}
+    return false;
+  }
+}
+
+// Retry failed client emails (runs every 5 minutes; up to 4 total attempts each)
+async function retryFailedEmails(env, settings) {
+  const db = env.DB;
+  if (!env.GHL_TOKEN || !settings.ghl_location_id) return;
+  const rows = (await db.prepare(`SELECT * FROM email_log WHERE status = 'failed' AND attempts < 4 ORDER BY id LIMIT 5`).all()).results || [];
+  for (const r of rows) {
+    try {
+      const ghl = new GHL(env.GHL_TOKEN, settings.ghl_location_id);
+      const contact = await ghl.upsertContact({ email: r.to_email, name: '' });
+      await ghl.sendEmail({ contactId: contact.id || contact.contactId, subject: r.subject, html: r.html, emailFrom: settings.email_from || undefined });
+      await db.prepare(`UPDATE email_log SET status='sent', sent_at=datetime('now'), attempts=attempts+1, html='' WHERE id=?`).bind(r.id).run();
+      await logEvent(db, r.client_id, 'email_retried', `📧✅ Delivered on retry: "${String(r.subject).slice(0, 70)}" to ${r.to_email}`);
+    } catch (e) {
+      const done = (r.attempts || 1) + 1 >= 4;
+      await db.prepare(`UPDATE email_log SET attempts=attempts+1, error=?, status=? WHERE id=?`)
+        .bind(String(e && e.message || e).slice(0, 300), done ? 'dead' : 'failed', r.id).run();
+      if (done) await logEvent(db, r.client_id, 'email_failed', `📧⛔ Could not deliver after 4 tries: "${String(r.subject).slice(0, 70)}" to ${r.to_email} — needs a human look`);
+    }
+  }
+}
+
+// Fixed-window rate limit: true = allowed. Window resets every windowSec.
+async function rlOk(db, key, max, windowSec) {
+  try {
+    const win = String(Math.floor(Date.now() / (windowSec * 1000)));
+    const row = await db.prepare('SELECT n, win FROM ratelimit WHERE k = ?').bind(key).first();
+    if (!row || row.win !== win) {
+      await db.prepare(`INSERT INTO ratelimit (k, n, win) VALUES (?, 1, ?) ON CONFLICT(k) DO UPDATE SET n=1, win=excluded.win`).bind(key, win).run();
+      return true;
+    }
+    if (row.n >= max) return false;
+    await db.prepare('UPDATE ratelimit SET n = n + 1 WHERE k = ?').bind(key).run();
+    return true;
+  } catch { return true; /* never let the limiter break a real submission */ }
+}
+
+// Keyed: 🎉 Page 1 celebration — the engines call this the moment a keyword newly lands on Page 1
+app.get('/api/celebrate/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const id = Number(c.req.query('id'));
+  const kw = String(c.req.query('kw') || '').slice(0, 90);
+  const pos = Number(c.req.query('pos')) || null;
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ ok: false, error: 'client not found' });
+  const settings = await getSettings(db);
+  const first = (client.name || '').split(' ')[0] || 'there';
+  const url = `${BASE_URL}/portal/${id}/${await portalToken(c.env, 'portal', id)}`;
+  const ok = await emailClient(c.env, db, client, settings,
+    `You just hit Page 1 of Google 🎉`,
+    `<p>${first} — stop what you're doing for a second.</p>
+<p>When someone searches <b>"${kw}"</b>, your website is now on <b>Page 1 of Google${pos ? `, position #${pos}` : ''}</b>. That's not an ad — that's your site earning its spot.</p>
+<p>See it live in your portal:</p><p><a href="${url}">${url}</a></p>
+<p>Congratulations — this is what we've been building toward. More to come.</p>
+<p>— The ConversionCo Team</p>`,
+    'page1_celebrated', `🎉 Page 1 email sent: "${kw}"${pos ? ' #' + pos : ''}`);
+  return c.json({ ok });
+});
+
+// Keyed: 📬 report-ready email — engines call after committing a report, with one highlight
+app.get('/api/report-ready/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const id = Number(c.req.query('id'));
+  const highlight = String(c.req.query('highlight') || '').slice(0, 160);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ ok: false, error: 'client not found' });
+  const settings = await getSettings(db);
+  const first = (client.name || '').split(' ')[0] || 'there';
+  const url = `${BASE_URL}/portal/${id}/${await portalToken(c.env, 'portal', id)}`;
+  const ok = await emailClient(c.env, db, client, settings,
+    `Your new report is in — one highlight inside`,
+    `<p>Hi ${first},</p>
+<p>Your latest report just landed in your portal. The highlight:</p>
+<p style="font-size:17px;"><b>${highlight || 'Everything ran clean this period — details inside.'}</b></p>
+<p>The full picture — your Google standing, your website's health, and everything we did for you — is one tap away:</p>
+<p><a href="${url}">${url}</a></p>
+<p>Questions? Just reply.</p><p>— The ConversionCo Team</p>`,
+    'report_notified', `📬 Report-ready email sent${highlight ? ': ' + highlight.slice(0, 80) : ''}`);
+  return c.json({ ok });
+});
+
+// Keyed: resend the agreement invite (same email the card button sends)
+app.get('/api/send-agreement/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const id = Number(c.req.query('id'));
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client || !client.email) return c.json({ ok: false, error: 'client/email missing' });
+  const settings = await getSettings(db);
+  if (!c.env.GHL_TOKEN || !settings.ghl_location_id) return c.json({ ok: false, error: 'GHL not configured' });
+  const url = `${BASE_URL}/agreement/${id}/${await portalToken(c.env, 'agr', id)}`;
+  const biz = client.business_name || client.name || 'your business';
+  try {
+    const ghl = ghlFor(c.env, settings);
+    const contact = await ghl.upsertContact({ email: client.email, name: client.name || '' });
+    await ghl.sendEmail({ contactId: contact.id || contact.contactId,
+      subject: `One quick signature before we begin — ${biz}`,
+      html: `<p>Hi ${(client.name || '').split(' ')[0] || 'there'},</p>
+<p>We're excited to build this with you. Before your invoice, here's our service agreement — plain English, about two minutes to read, and it protects both of us. The short version: your domain and your website are yours, and it spells out exactly what our service covers:</p>
+<p><a href="${url}">${url}</a></p>
+<p>Your invoice follows right after you sign. Questions about anything in it? Just reply — happy to walk you through.</p>
+<p>Talk soon,<br>The ConversionCo Team</p>`,
+      emailFrom: settings.email_from || undefined });
+    let billing = {}; try { billing = JSON.parse(client.billing || '{}'); } catch {}
+    billing.agr_sent = new Date().toISOString();
+    await touchClient(db, id, { billing: JSON.stringify(billing) });
+    await logEvent(db, id, 'agreement_sent', `📄 Agreement re-sent to ${client.email}`);
+    return c.json({ ok: true });
+  } catch (e) { return c.json({ ok: false, error: String(e.message || e).slice(0, 200) }); }
+});
+
+// Keyed test: run the after-call calendar poll's query once and report what it sees
+app.get('/api/appt-test/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const settings = await getSettings(c.env.DB);
+  if (!c.env.GHL_TOKEN || !settings.ghl_location_id) return c.json({ ok: false, error: 'GHL not configured' });
+  const calId = settings.booking_calendar_id || 'kfZNB7wOmwHcy769nGh3';
+  const now = Date.now();
+  const url = new URL('https://services.leadconnectorhq.com/calendars/events');
+  url.searchParams.set('locationId', settings.ghl_location_id);
+  url.searchParams.set('calendarId', calId);
+  url.searchParams.set('startTime', String(now - 7 * 24 * 3600 * 1000));
+  url.searchParams.set('endTime', String(now + 7 * 24 * 3600 * 1000));
+  const res = await fetch(url.toString(), { headers: {
+    Authorization: `Bearer ${c.env.GHL_TOKEN}`, Version: '2021-04-15', Accept: 'application/json' } });
+  const body = await res.json().catch(() => ({}));
+  const events = (body.events || body.data || []).map((ev) => ({
+    id: ev.id || ev.eventId, start: ev.startTime, end: ev.endTime,
+    status: ev.appointmentStatus || ev.status, contactId: ev.contactId || ev.contact_id,
+    handled: Boolean(settings[`appt_done_${ev.id || ev.eventId}`]) }));
+  return c.json({ ok: res.ok, status: res.status, calendar: calId, count: events.length, events: events.slice(0, 20),
+    ...(res.ok ? {} : { error: JSON.stringify(body).slice(0, 300) }) });
+});
+
+// Keyed: clear stored email-template overrides so the code defaults (personal style) apply
+app.get('/api/reset-templates/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const keys = ['intake1_subject', 'intake1_body', 'intake2_subject', 'intake2_body', 'booking_subject', 'booking_body'];
+  for (const k of keys) await c.env.DB.prepare('DELETE FROM settings WHERE key = ?').bind(k).run();
+  return c.json({ ok: true, cleared: keys });
+});
+
+// Keyed: prove the Google connection works (called right after Tiffany pastes the secrets)
+app.get('/api/gsc-test/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  if (!gscConfigured(c.env)) return c.json({ ok: false, configured: false, hint: 'GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REFRESH_TOKEN not all set yet' });
+  try {
+    const { gscListProperties } = await import('./google.js');
+    const props = await gscListProperties(c.env);
+    return c.json({ ok: true, configured: true, properties: props });
+  } catch (e) { return c.json({ ok: false, configured: true, error: String(e.message).slice(0, 300) }); }
+});
+
+// Keyed: enroll ANY domain in Search Console on demand (testing + Tiffany's own site).
+// Tries Cloudflare auto-verify first; for domains with DNS elsewhere (e.g. Squarespace)
+// it returns the TXT record to add manually, and re-calling after DNS propagates
+// completes verification. Always finishes with a stats pull attempt.
+app.get('/api/gsc-enroll/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  if (!gscConfigured(c.env)) return c.json({ ok: false, configured: false });
+  const domain = (c.req.query('domain') || '').trim().toLowerCase().replace(/^www\./, '');
+  if (!domain || !domain.includes('.')) return c.json({ ok: false, error: 'pass ?domain=example.com' });
+  const out = { ok: true, domain };
+  try { await gscAddProperty(c.env, domain); out.property = 'added'; }
+  catch (e) { out.property = `error: ${String(e.message).slice(0, 160)}`; }
+  try { await gscVerifyViaCloudflareDns(c.env, domain); out.verified = 'auto (Cloudflare DNS)'; }
+  catch {
+    // not a Cloudflare zone — manual DNS path
+    try {
+      out.txt_record = { host: '@', type: 'TXT', value: await gscGetDnsToken(c.env, domain) };
+      try { await gscRequestVerify(c.env, domain); out.verified = true; }
+      catch (e2) { out.verified = false; out.note = `Add the TXT record at the DNS host, wait a few minutes, then call this again. Google said: ${String(e2.message).slice(0, 160)}`; }
+    } catch (e3) { out.verified = false; out.error = String(e3.message).slice(0, 200); }
+  }
+  try { out.stats = await gscQueryStats(c.env, domain, 28); } catch (e) { out.stats_error = String(e.message).slice(0, 160); }
+  return c.json(out);
+});
+
+// Keyed: run the Sunday Search Console pull on demand (first-run / catch-up)
+app.get('/api/gsc-now/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  if (!gscConfigured(c.env)) return c.json({ ok: false, configured: false });
+  const settings = await getSettings(c.env.DB);
+  await gscPullAll(c.env, settings);
+  return c.json({ ok: true, ran: true });
+});
+
+// Keyed: fire the weekly owner digest on demand (testing / catch-up)
+app.get('/api/digest-now/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  await weeklyOwnerDigest(c.env);
+  return c.json({ ok: true });
+});
+
+// Deliverability test (keyed): sends a styled test email so inbox placement can be verified
+app.get('/api/test-email/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const to = String(c.req.query('to') || '').trim();
+  if (!/.+@.+\..+/.test(to)) return c.json({ ok: false, error: 'valid ?to= required' });
+  const settings = await getSettings(c.env.DB);
+  if (!c.env.GHL_TOKEN || !settings.ghl_location_id) return c.json({ ok: false, error: 'GHL not configured' });
+  const stamp = String(c.req.query('stamp') || Date.now());
+  const link = `${BASE_URL}/portfolio.json`;
+  try {
+    const ghl = new GHL(c.env.GHL_TOKEN, settings.ghl_location_id);
+    const contact = await ghl.upsertContact({ email: to, name: 'Deliverability Test' });
+    await ghl.sendEmail({
+      contactId: contact.id || contact.contactId,
+      subject: `Quick test from ConversionCo (${stamp.slice(-6)})`,
+      html: `<p>Hi there,</p>
+<p>This is a quick delivery test from the ConversionCo system. If you're reading this in your inbox, everything is working exactly as it should. Here's a test link to tap:</p>
+<p><a href="${link}">${link}</a></p>
+<p>Talk soon,<br>The ConversionCo Team</p>`,
+      emailFrom: settings.email_from || undefined,
+    });
+    return c.json({ ok: true, to, stamp });
+  } catch (e) { return c.json({ ok: false, error: String(e.message || e) }); }
+});
+
+// Self-hosted intake forms (mobile-bulletproof — no funnel builder in the path)
+app.get('/form/1', (c) => c.html(form1Html));
+app.get('/form/2', (c) => c.html(form2Html));
+
+// ---------------- service agreement (sent before payment, e-signed) ----------------
+const AGREEMENT_VERSION = 'v2-2026-07-23-split';
+function agreementTerms(biz, pkgLabel, pkgPrice) {
+  return [
+    ['1. What we are building', `ConversionCo will design, write, and build the ${pkgLabel} for ${biz}: a custom, mobile-first website with full search-engine setup as described in your proposal. Your one-time project fee is ${pkgPrice}, paid in two equal halves: 50% as a deposit before the build begins, and the remaining 50% when your finished website preview is delivered to you.`],
+    ['2. Website Care Plan — $99/month', `Keeping your website live with us is covered by the Website Care Plan: hosting, security, 24/7 uptime monitoring, your client portal with live performance data, Google rank tracking, performance check-ins, and ongoing platform updates (Premium plans also include weekly published content). It is month-to-month, starts only when your site is ready and you confirm, and you may cancel any time — cancellation takes effect at the end of the current billing period.`],
+    ['3. Payment & refunds', `The build starts once your 50% deposit is received. Because our build process begins immediately and produces custom work, the deposit is non-refundable once your build has started — with one exception in your favor: if we fail to deliver a preview of your website within 14 days of your deposit, you may request a full refund of it. The remaining 50% is invoiced when your website preview is delivered, and is due within 7 days. Your website goes live on your domain once the balance is paid.`],
+    ['4. Revisions', `Your project includes two full rounds of revisions before launch, plus reasonable adjustments during your first 30 days live. After that, changes are handled through your Care Plan (reasonable monthly volume) or quoted separately for larger redesigns. This keeps every project fair — for you and for our other clients.`],
+    ['5. What you own', `Your domain name is yours — registered for your business, and transferable to your direct control on request at any time. Your content is yours — your logo, photos, story, and business information. And once your project fee is paid in full, the finished website code (the HTML, CSS, JavaScript, and images that make up your site) is yours as well.`],
+    ['6. What remains ours', `The ConversionCo platform is licensed to you while you are a client, and is never transferred: our client portal and dashboards, our automated build, content, and reporting systems, our monitoring tools, and our internal processes. These power your service; they are not part of the website deliverable.`],
+    ['7. If you ever leave', `You can leave whenever you want — no lock-in. On cancellation we provide a complete export of your website code and assist in pointing your domain wherever you direct. What ends with the service: hosting, the client portal, monitoring, reports, and future content or updates. Your website files are yours to host anywhere.`],
+    ['8. Your content & your practice', `You confirm that materials you provide (photos, logo, reviews, text) are yours to use. You remain solely responsible for the clinical and legal operation of your practice, including licensure, protocols, and advertising compliance. We build health-content-compliant websites and may decline content that violates Google or health-advertising policies — that protection benefits us both.`],
+    ['9. Portfolio', `We may display the finished website in the ConversionCo portfolio and marketing materials. If you prefer we do not, tell us in writing and we will remove it.`],
+    ['10. Reasonable limits', `We target excellent uptime and monitor your site daily, but no provider can guarantee against third-party outages. Each party's total liability under this agreement is capped at the fees paid in the six months prior to a claim, and neither party is liable for indirect or consequential damages.`],
+    ['11. Non-payment', `If a Care Plan payment is more than 15 days late, we may pause the website until the account is current — we will always reach out first.`],
+    ['12. The basics', `ConversionCo is an independent contractor. This is the entire agreement between us, governed by Oklahoma law; changes must be in writing (email counts). If any part is unenforceable, the rest stands.`],
+  ];
+}
+app.get('/agreement/:id/:token', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'agr', id)) return c.text('not found', 404);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.text('not found', 404);
+  const signed = await db.prepare('SELECT * FROM agreements WHERE client_id = ? ORDER BY id DESC LIMIT 1').bind(id).first();
+  const biz = client.business_name || client.name || 'your business';
+  const pkgLabel = client.tier === 'premium' ? 'Premium Website + SEO Engine' : 'Standard Website Package';
+  const pkgPrice = client.tier === 'premium' ? '$999' : '$649';
+  const terms = agreementTerms(biz, pkgLabel, pkgPrice);
+  const tok = c.req.param('token');
+  return c.html(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex"><title>Service Agreement — ${biz} × ConversionCo</title>
+<style>
+  *{box-sizing:border-box;margin:0}body{font-family:-apple-system,'Segoe UI',sans-serif;background:linear-gradient(170deg,#0C1A30,#0F2847);color:#1A2433;line-height:1.65;padding:30px 14px 60px}
+  .card{max-width:680px;margin:0 auto;background:#fff;border-radius:16px;padding:30px 26px;box-shadow:0 20px 60px rgba(0,0,0,.35)}
+  .eyebrow{color:#C9A254;font-size:11px;letter-spacing:.24em;font-weight:700;text-align:center}
+  h1{font-size:24px;text-align:center;margin:8px 0 4px;color:#0C1A30}
+  .sub{text-align:center;color:#667;font-size:13.5px;margin-bottom:24px}
+  h2{font-size:15px;color:#0C1A30;margin:20px 0 6px}
+  p{font-size:14px;color:#3A4557}
+  .sig{border-top:2px solid #EEF1F5;margin-top:28px;padding-top:22px}
+  label{display:flex;gap:10px;font-size:14px;align-items:flex-start;margin-bottom:14px;cursor:pointer}
+  input[type=text]{width:100%;padding:13px 14px;border:1.5px solid #D6DCE5;border-radius:10px;font-size:16px;margin-bottom:14px;font-family:inherit}
+  button{width:100%;padding:15px;border:0;border-radius:10px;background:#C9A254;color:#0C1A30;font-size:16px;font-weight:700;cursor:pointer}
+  .ok{background:#ECFDF5;border:1px solid #A7F3D0;color:#047857;border-radius:12px;padding:18px;text-align:center;font-weight:600}
+  .meta{font-size:11.5px;color:#99A3B0;text-align:center;margin-top:18px}
+</style></head><body>
+<div class="card">
+  <div class="eyebrow">CONVERSION CO</div>
+  <h1>Website Service Agreement</h1>
+  <p class="sub">Between <b>ConversionCo</b> and <b>${biz}</b> · ${pkgLabel} · ${pkgPrice} + $99/mo Care Plan at launch</p>
+  ${terms.map(([h, t]) => `<h2>${h}</h2><p>${t}</p>`).join('')}
+  <div class="sig">
+  ${signed ? `<div class="ok">✓ Signed by ${signed.signed_name} on ${signed.signed_at} UTC</div>` : `
+    <form id="agr">
+      <label><input type="checkbox" id="agree" required style="margin-top:3px"> I have read this agreement and I agree to its terms on behalf of ${biz}.</label>
+      <input type="text" id="signName" required placeholder="Type your full legal name to sign">
+      <button type="submit">Sign Agreement ✍️</button>
+      <p id="agrOk" style="display:none" class="ok">✓ Signed — thank you! Your invoice is on its way.</p>
+    </form>`}
+  </div>
+  <p class="meta">Agreement ${AGREEMENT_VERSION} · A signed copy is emailed to both parties and kept on file.</p>
+</div>
+${signed ? '' : `<script>
+document.getElementById('agr').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const n = document.getElementById('signName').value.trim();
+  if (!document.getElementById('agree').checked || !n) return;
+  await fetch('/agreement-sign/${id}/${tok}', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: n }) });
+  e.target.querySelector('button').style.display = 'none';
+  document.getElementById('agrOk').style.display = 'block';
+});
+</script>`}
+</body></html>`);
+});
+app.post('/agreement-sign/:id/:token', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'agr', id)) return c.text('nope', 403);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'not found' }, 404);
+  let f = {}; try { f = await c.req.json(); } catch {}
+  const name = String(f.name || '').slice(0, 120).trim();
+  if (!name) return c.json({ error: 'name required' }, 400);
+  const pkg = client.tier === 'premium' ? 'Premium $999' : 'Standard $649';
+  await db.prepare('INSERT INTO agreements (client_id, version, package, signed_name, user_agent) VALUES (?, ?, ?, ?, ?)')
+    .bind(id, AGREEMENT_VERSION, pkg, name, (c.req.header('User-Agent') || '').slice(0, 200)).run();
+  await logEvent(db, id, 'agreement_signed', `✍️ Agreement signed by ${name} (${pkg})`);
+  const settings = await getSettings(db);
+  // ⛓ CHAIN (Tiffany 7/27): the SECOND the signature lands, the 50% deposit
+  // invoice fires — no manual step. Guards: Stripe configured, nothing already
+  // sent/paid. Uses the card's current tier (set on the pricing call).
+  try {
+    const bS = getBilling(client);
+    if (c.env.STRIPE_SECRET_KEY && !bS.dep_id && bS.dep_status !== 'paid' && bS.invoice_status !== 'paid' && !bS.fin_id) {
+      const tierKeyS = (client.tier === 'premium') ? 'premium' : 'standard';
+      const custS = await ensureCustomer(c.env.STRIPE_SECRET_KEY, client.email, client.name || client.business_name || '');
+      const invS = await sendInvoice(c.env.STRIPE_SECRET_KEY, custS.id, tierKeyS, client.business_name || '', 'deposit');
+      bS.customer_id = custS.id; bS.invoice_tier = tierKeyS;
+      bS.dep_id = invS.id; bS.dep_status = invS.status; bS.dep_url = invS.url; bS.dep_created = new Date().toISOString();
+      await touchClient(db, id, { billing: JSON.stringify(bS) });
+      await logEvent(db, id, 'invoice_sent', `⛓ Signature landed — 50% deposit invoice auto-sent (${halfDisplay(tierKeyS)}) 💳`);
+    }
+  } catch (e) { await logEvent(db, id, 'error', `Auto-invoice after signature failed: ${String(e.message).slice(0, 140)} — send it manually from the card`); }
+  if (c.env.GHL_TOKEN && settings.ghl_location_id) {
+    const url = `${BASE_URL}/agreement/${id}/${await portalToken(c.env, 'agr', id)}`;
+    try {
+      const ghl = ghlFor(c.env, settings);
+      // copy to client
+      const contact = await ghl.upsertContact({ email: client.email, name: client.name || '' });
+      await ghl.sendEmail({ contactId: contact.id || contact.contactId,
+        subject: `Your signed agreement with ConversionCo`,
+        html: `<p>Hi ${(client.name || '').split(' ')[0] || 'there'},</p><p>Thanks — your service agreement is signed and on file. You can view it any time here:</p><p><a href="${url}">${url}</a></p><p>Next up: your invoice. Once that's settled, the build begins. Questions any time — just reply.</p><p>Talk soon,<br>The ConversionCo Team</p>`,
+        emailFrom: settings.email_from || undefined });
+      // copy to Tiffany
+      const me = await ghl.upsertContact({ email: settings.notify_email, name: 'ConversionCo Notifications' });
+      await ghl.sendEmail({ contactId: me.id || me.contactId,
+        subject: `✍️ ${client.business_name || client.name || client.email} signed the agreement`,
+        html: `<p><b>${name}</b> signed (${pkg}).</p><p><a href="${url}">View agreement</a> · <a href="${BASE_URL}">Open Mission Control</a> — time to send the invoice.</p>`,
+        emailFrom: settings.email_from || undefined });
+    } catch {}
+  }
+  return c.json({ ok: true });
+});
+
+// ---------------- public: client portal, pitch pages, lead capture ----------------
+async function portalToken(env, kind, id) {
+  const t = await hmac(env.SESSION_SECRET, `${kind}:${id}`);
+  return t.replace(/[+/=]/g, '').slice(0, 16);
+}
+async function slugForClient(db, id) {
+  const metas = (await db.prepare(`SELECT slug, content FROM site_files WHERE path='site-meta.json'`).all()).results || [];
+  for (const m of metas) { try { if (JSON.parse(m.content).client_id === id) return m.slug; } catch {} }
+  return null;
+}
+const PORTAL_STAGES = [
+  ['intake1_sent', 'Getting to know you'], ['intake1_done', 'Blueprint received'],
+  ['intake2_done', 'Vision captured'], ['generating', 'Designing & building'],
+  ['preview_ready', 'Preview ready'], ['live', 'LIVE on the web'],
+];
+// 💼 PERSONALIZED PRICING GUIDE (8/6): public signed link, auto-sent after Intake 1.
+// "Prepared for <name>" fills itself from the client record — she types the name once.
+function guideEsc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+app.get('/guide/:id/:token', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'guide', id)) return c.text('not found', 404);
+  const client = await c.env.DB.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.text('not found', 404);
+  const settings = await getSettings(c.env.DB);
+  const first = guideEsc((client.name || '').split(' ')[0] || '');
+  const who = guideEsc([client.name, client.business_name].filter(Boolean).join(' · ') || client.email);
+  const fromEmail = guideEsc(settings.email_from || 'team@mail.conversionco918.com');
+  const mailStd = 'mailto:' + fromEmail + '?subject=' + encodeURIComponent('I choose Standard — ' + (client.business_name || client.name || '')) + '&body=' + encodeURIComponent('I would like the Standard Site ($649). Ready for the next step.');
+  const mailPrm = 'mailto:' + fromEmail + '?subject=' + encodeURIComponent('I choose Premium — ' + (client.business_name || client.name || '')) + '&body=' + encodeURIComponent('I would like the Premium Growth Site ($999). Ready for the next step.');
+  const P1 = '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">'
+    + '<title>Website Packages — prepared for ' + guideEsc(client.business_name || client.name || 'you') + '</title>'
+    + '<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+    + '<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Hanken+Grotesk:wght@400;600;700&display=swap" rel="stylesheet">'
+    + '<style>'
+    + ':root{--navy:#071B33;--gold:#B8860B;--golds:#C9A227;--cream:#FAF7F1;--ink:#1c2733;--muted:#5b6b7b;--line:#e3dccd}'
+    + '*{margin:0;padding:0;box-sizing:border-box}body{font-family:"Hanken Grotesk",sans-serif;color:var(--ink);background:#fff;font-size:16px;line-height:1.55}'
+    + '.serif{font-family:Fraunces,serif}main{max-width:860px;margin:0 auto;padding:0 20px 40px}'
+    + '.band{background:var(--navy);color:#fff;padding:34px 20px 30px}.bandin{max-width:860px;margin:0 auto}'
+    + '.wm{font-weight:700;font-size:15px;letter-spacing:3.5px;text-transform:uppercase}.wm span{color:var(--golds)}'
+    + '.band h1{font-family:Fraunces,serif;font-weight:500;font-size:clamp(26px,5vw,34px);margin-top:14px}'
+    + '.prep{margin-top:10px;font-size:14px;color:#c3d0de}.prep b{color:var(--golds)}'
+    + '.proof{margin-top:8px;font-size:14px;color:#c3d0de}.proof a{color:var(--golds);font-weight:700;text-decoration:none}'
+    + '.gbadge{display:flex;gap:10px;align-items:flex-start;background:#FDF6E3;border:1.5px solid var(--golds);border-radius:12px;padding:14px 16px;margin:22px 0 18px}'
+    + '.gbadge .st{color:var(--gold);font-size:18px;line-height:1.2}.gbadge b{font-family:Fraunces,serif;color:var(--navy);font-size:16.5px;font-weight:600}.gbadge div span{display:block;font-size:13.5px;color:var(--muted);margin-top:2px}'
+    + '.cards{display:grid;grid-template-columns:1fr;gap:22px}@media(min-width:720px){.cards{grid-template-columns:1fr 1fr}}'
+    + '.card{border:1.5px solid var(--line);border-radius:16px;padding:22px;position:relative}.card.prm{border:2px solid var(--navy);background:linear-gradient(180deg,#fff 0%,var(--cream) 100%)}'
+    + '.ribbon{position:absolute;top:-12px;left:20px;background:var(--navy);color:var(--golds);font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;padding:5px 13px;border-radius:99px}'
+    + '.tn{font-family:Fraunces,serif;font-size:19px;font-weight:600;color:var(--navy)}.pr{font-family:Fraunces,serif;font-size:40px;font-weight:500;color:var(--navy);margin-top:4px}.pr small{font-size:14px;color:var(--muted);font-family:"Hanken Grotesk"}'
+    + '.pm{font-family:Fraunces,serif;font-size:15px;color:var(--muted);margin:8px 0 12px}'
+    + 'ul.f{list-style:none}ul.f li{font-size:14.5px;padding:7px 0 7px 24px;position:relative;border-bottom:1px dashed #eee7d8}ul.f li:last-child{border-bottom:0}ul.f li:before{content:"\\2713";position:absolute;left:2px;color:var(--gold);font-weight:700}'
+    + '.plus{font-size:11px;font-weight:700;letter-spacing:1.8px;text-transform:uppercase;color:var(--gold);margin-bottom:5px}'
+    + '.rf{margin-top:12px;background:var(--cream);border-radius:10px;padding:11px 14px;font-size:13.5px}.card.prm .rf{background:var(--navy);color:#dfe8f2}'
+    + '.choose{display:block;text-align:center;margin-top:14px;background:var(--navy);color:#fff;font-weight:700;font-size:15px;padding:13px;border-radius:10px;text-decoration:none}.card.prm .choose{background:var(--golds);color:var(--navy)}'
+    + 'table{width:100%;border-collapse:collapse;margin:26px 0 6px}th{font-size:11px;letter-spacing:1.8px;text-transform:uppercase;color:var(--muted);text-align:left;padding:8px 10px;border-bottom:2px solid var(--navy)}th:nth-child(n+2){text-align:center}td{font-size:14px;padding:8px 10px;border-bottom:1px solid #eee7d8}td:nth-child(n+2){text-align:center;color:var(--muted)}td:nth-child(3){color:var(--navy);font-weight:700;background:var(--cream)}'
+    + '.no{color:#b9c2cc}.yy{color:var(--gold)}'
+    + '.pay{background:var(--navy);color:#fff;border-radius:12px;padding:15px 18px;text-align:center;margin:14px 0 30px}.pay b{font-family:Fraunces,serif;font-size:17px;font-weight:500}.pay div{font-size:13.5px;color:#c3d0de;margin-top:3px}'
+    + 'h2.sec{font-family:Fraunces,serif;font-weight:500;font-size:24px;color:var(--navy);margin:26px 0 6px}'
+    + '.lead{color:var(--muted);font-size:15px;margin-bottom:16px}'
+    + '.hero2{border:2px solid var(--navy);border-radius:14px;padding:18px;background:linear-gradient(180deg,#fff 0%,var(--cream) 100%);margin-bottom:16px}'
+    + '.hk{font-size:10.5px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--gold)}.hero2 h3{font-family:Fraunces,serif;font-size:20px;font-weight:600;color:var(--navy);margin-top:3px}'
+    + '.chips{display:flex;flex-wrap:wrap;gap:7px;margin-top:11px}.chip{background:var(--navy);color:#fff;font-size:13px;font-weight:600;padding:6px 13px;border-radius:99px}.chip.a{background:#fff;color:var(--navy);border:1.5px solid var(--navy)}'
+    + '.tail{font-size:14px;color:var(--muted);margin-top:11px}.tail b{color:var(--navy)}'
+    + '.g3{display:grid;grid-template-columns:1fr;gap:12px;margin-top:6px}@media(min-width:720px){.g3{grid-template-columns:1fr 1fr 1fr}}'
+    + '.g{border-left:3px solid var(--golds);padding:2px 0 2px 12px}.g h4{font-size:14.5px;color:var(--navy)}.g p{font-size:13px;color:var(--muted)}'
+    + '.stats{display:grid;grid-template-columns:1fr;gap:14px;margin:18px 0}@media(min-width:720px){.stats{grid-template-columns:1fr 1fr}}'
+    + '.stat{background:var(--cream);border:1px solid var(--line);border-radius:14px;padding:16px 18px}.stat .n{font-family:Fraunces,serif;font-size:28px;font-weight:600;color:var(--navy)}.stat .n em{font-style:normal;color:var(--gold)}.stat p{font-size:13.5px;color:var(--muted);margin-top:4px}.stat p b{color:var(--navy)}'
+    + '.fair{border:1.5px solid var(--navy);border-radius:12px;padding:14px 18px;font-size:14px;margin-bottom:8px}.fair b{color:var(--navy)}.fair p+p{margin-top:8px}'
+    + '.steps{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:12px 0}@media(min-width:720px){.steps{grid-template-columns:repeat(4,1fr)}}'
+    + '.num{font-family:Fraunces,serif;font-size:22px;color:var(--gold);font-weight:600}.step h4{font-size:14px;color:var(--navy)}.step p{font-size:12.5px;color:var(--muted)}'
+    + '.fine{font-size:12px;color:var(--muted);line-height:1.6;margin:14px 0 26px}.fine b{color:var(--ink)}'
+    + '.cta{background:var(--navy);color:#fff;border-radius:14px;padding:22px;text-align:center}.cta .big{font-family:Fraunces,serif;font-size:21px}.cta p{font-size:14px;color:#c3d0de;margin-top:6px}'
+    + '.cta .row{display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin-top:14px}.cta a{display:inline-block;padding:13px 22px;border-radius:99px;font-weight:700;font-size:15px;text-decoration:none}'
+    + '.cta a.s{background:#fff;color:var(--navy)}.cta a.p{background:var(--golds);color:var(--navy)}'
+    + '.foot{max-width:860px;margin:26px auto 0;padding:14px 20px 30px;border-top:1px solid var(--line);font-size:12px;color:var(--muted);display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px}.foot b{color:var(--navy);letter-spacing:2px}'
+    + '</style></head><body>';
+  const html = P1
+    + '<div class="band"><div class="bandin"><div class="wm">Conversion<span>Co</span></div>'
+    + '<h1>Your website. Two ways to build it.</h1>'
+    + '<p class="prep">Prepared for <b>' + who + '</b></p>'
+    + '<p class="proof">See it for yourself. One of our clients, live today: <a href="https://ivycoastalwellness.com" target="_blank" rel="noopener">ivycoastalwellness.com</a></p>'
+    + '</div></div><main>'
+    + '<div class="gbadge"><span class="st">&#10022;</span><div><b>Your preview, delivered within 14 days. Guaranteed.</b><span>If we miss it, your deposit comes back in full.</span></div></div>'
+    + '<div class="cards">'
+    + '<div class="card"><div class="tn">The Standard Site</div><div class="pr">$649 <small>one-time</small></div>'
+    + '<p class="pm">A polished, professional website built to turn visitors into booked appointments.</p>'
+    + '<ul class="f"><li>Custom design around your brand and city</li><li>Every word written for you</li><li>Complete service menu with your exact pricing</li><li>Book, text, or call in one tap</li><li>8 hand-built pages</li><li>Google-ready SEO foundation</li><li>Leads sent straight to your inbox</li></ul>'
+    + '<div class="rf">The right choice when clients already find you, and your website&rsquo;s job is to convert them.</div>'
+    + '<a class="choose" href="' + mailStd + '">I choose Standard</a></div>'
+    + '<div class="card prm"><div class="ribbon">Best value</div><div class="tn">The Premium Growth Site</div><div class="pr">$999 <small>one-time</small></div>'
+    + '<p class="pm">A dedicated page for every city you serve and every service you offer, with new content every week.</p>'
+    + '<div class="plus">Everything in Standard, plus:</div>'
+    + '<ul class="f"><li>Design built to your exact vision</li><li>A full page for every service you offer</li><li>A full page for every city you serve</li><li>A new page added every week, automatically</li><li>Advanced SEO on every page</li><li>Weekly check-ins instead of monthly</li></ul>'
+    + '<div class="rf">The right choice when you want your website to become your primary source of new clients.</div>'
+    + '<a class="choose" href="' + mailPrm + '">I choose Premium</a></div>'
+    + '</div>'
+    + '<table><tr><th>At a glance</th><th>Standard &middot; $649</th><th>Premium &middot; $999</th></tr>'
+    + '<tr><td>Hand-built pages</td><td>8</td><td>15 to 25+</td></tr>'
+    + '<tr><td>A page for every service &amp; city</td><td class="no">not included</td><td><span class="yy">&#10003;</span> included</td></tr>'
+    + '<tr><td>New page added every week</td><td class="no">not included</td><td><span class="yy">&#10003;</span> included</td></tr>'
+    + '<tr><td>Check-ins in your portal</td><td>Monthly</td><td>Weekly</td></tr>'
+    + '<tr><td>SEO</td><td>Foundation</td><td>Advanced</td></tr></table>'
+    + '<div class="pay"><b>50% to begin. 50% upon delivery.</b><div>Two refinement rounds included with both packages.</div></div>'
+    + '<h2 class="sec">The $99/month Care &amp; Hosting Plan</h2>'
+    + '<p class="lead">Your website works around the clock. The Care Plan keeps it fast, secure, online, and improving. It begins the day your site goes live.</p>'
+    + '<div class="hero2"><div class="hk">Most agencies do not offer this</div><h3>Your private client portal, 24/7</h3>'
+    + '<div class="chips"><span class="chip">Visitors</span><span class="chip">Leads</span><span class="chip">Google rankings</span><span class="chip">Website score</span></div>'
+    + '<p class="tail">Your numbers, live, whenever you want them. <b>Complete transparency in what your investment is doing.</b></p></div>'
+    + '<div class="hero2"><div class="hk">Job one, around the clock</div><h3>Your website stays online.</h3>'
+    + '<div class="chips"><span class="chip a">Monitored 24/7</span><span class="chip a">Issues caught in minutes</span><span class="chip a">Resolved at no charge</span></div>'
+    + '<p class="tail">Downtime is found and resolved before most clients ever notice. <b>That is the standard.</b></p></div>'
+    + '<div class="g3">'
+    + '<div class="g"><h4>Premium hosting &amp; SSL</h4><p>Fast, secure, fully encrypted.</p></div>'
+    + '<div class="g"><h4>Daily backups</h4><p>Your entire website, preserved daily.</p></div>'
+    + '<div class="g"><h4>Google rank tracking</h4><p>Actual positions, direct from Google.</p></div>'
+    + '<div class="g"><h4>Plain-English check-ins</h4><p>Monthly on Standard. Weekly on Premium.</p></div>'
+    + '<div class="g"><h4>Lead engine, always on</h4><p>Every inquiry, delivered instantly.</p></div>'
+    + '<div class="g"><h4>New weekly page <i>(Premium)</i></h4><p>New search-targeted content weekly.</p></div>'
+    + '</div>'
+    + '<div class="stats"><div class="stat"><div class="n"><em>$3.30</em>/day</div><p><b>A single booked client covers the entire month.</b> Everything beyond that is return on your website.</p></div>'
+    + '<div class="stat"><div class="n">$150<em>&ndash;</em>$300</div><p><b>The typical agency rate</b> for comparable care, without a client portal.</p></div></div>'
+    + '<div class="fair"><p><b>Delivered complete.</b> Future changes are quoted at a flat rate and approved by you before any work begins.</p>'
+    + '<p><b>No contracts, no lock-in.</b> Cancel anytime and receive a complete export of your website files.</p></div>'
+    + '<h2 class="sec">How it works</h2>'
+    + '<div class="steps">'
+    + '<div class="step"><div class="num">1</div><h4>Pick your package</h4><p>Tap a button on this page, or reply to our email.</p></div>'
+    + '<div class="step"><div class="num">2</div><h4>Sign &amp; start</h4><p>Sign the agreement, submit the deposit, and complete a brief intake.</p></div>'
+    + '<div class="step"><div class="num">3</div><h4>Review &amp; refine</h4><p>Review your website within 14 days. Two refinement rounds included.</p></div>'
+    + '<div class="step"><div class="num">4</div><h4>Launch</h4><p>Submit the balance upon delivery, and your website goes live.</p></div>'
+    + '</div>'
+    + '<p class="fine"><b>The fine print:</b> pricing honored for 30 days. The deposit is non-refundable once your build begins, with one exception in your favor: if your website is not delivered for review within 14 days, you may request a full refund. Balance due within 7 days of delivery. New work after delivery is quoted flat and approved by you first. The Care Plan starts at launch and is required while we host your site. Your own domain is welcome.</p>'
+    + '<div class="cta"><div class="big serif">' + (first ? first + ', ready' : 'Ready') + ' to begin?</div>'
+    + '<p>Pick your package and we will take it from there.</p>'
+    + '<div class="row"><a class="s" href="' + mailStd + '">Standard &middot; $649</a><a class="p" href="' + mailPrm + '">Premium &middot; $999</a></div></div>'
+    + '</main><div class="foot"><div><b>CONVERSIONCO</b> &nbsp;&middot;&nbsp; Websites that book clients</div><div>' + fromEmail + '</div></div>'
+    + '</body></html>';
+  try {
+    // one 👀 per 6 hours per client — refreshes should not flood the feed
+    const recent = await c.env.DB.prepare(`SELECT id FROM events WHERE client_id = ? AND type = 'guide_viewed' AND created_at > datetime('now','-6 hours') LIMIT 1`).bind(id).first();
+    if (!recent) await logEvent(c.env.DB, id, 'guide_viewed', '👀 They opened their pricing guide');
+  } catch { /* view logging is best-effort */ }
+  return c.html(html);
+});
+
+app.get('/portal/:id/:token', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'portal', id)) return c.text('not found', 404);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.text('not found', 404);
+  const settings = await getSettings(db);
+  const score = await computeScore(db, client, settings);
+  let up = null; try { up = JSON.parse(settings[`uptime_${id}`] || 'null'); } catch {}
+  let billing = {}; try { billing = JSON.parse(client.billing || '{}'); } catch {}
+  // APPROVAL GATE: while the preview is held (built but Tiffany hasn't approved),
+  // the portal must not reveal it — no link, no "preview ready" stage, no events.
+  const previewHeld = client.stage === 'preview_ready' && billing.preview_hold && !billing.preview_approved;
+  const HELD_TYPES = ['preview_ready', 'auto_published', 'revision_done', 'theme_changed'];
+  const slug = await slugForClient(db, id);
+  const blogs = slug ? ((await db.prepare(`SELECT path FROM site_files WHERE slug=? AND path LIKE 'blog-%' ORDER BY updated_at DESC LIMIT 5`).bind(slug).all()).results || []) : [];
+  const leadsN = (await db.prepare(`SELECT COUNT(*) AS n FROM leads WHERE client_id = ? AND slug != 'portal-message'`).bind(id).first())?.n || 0;
+  const revsN = (await db.prepare(`SELECT COUNT(*) AS n FROM revisions WHERE client_id = ? AND status = 'done'`).bind(id).first())?.n || 0;
+  const FRIENDLY = { auto_published: '🚀 Website updated & republished', revision_done: '✅ A requested change was completed',
+    theme_changed: '🎨 Fresh look applied to your site', logo_uploaded: '🖼 Your logo was added', photo_uploaded: '📷 New photo added to your site',
+    lead_received: '🔥 New lead captured from your website', preview_ready: '👀 A new version was published', hosting_active: '🛡 Hosting & security activated',
+    build_started: '⚙️ Your website build is underway', invoice_paid: '💳 Payment received — thank you!',
+    launched: '🚀 Your website went LIVE', page1_celebrated: '🎉 You hit Page 1 of Google', first_lead_celebrated: '🎉 Your first lead arrived' };
+  let evRows = (await db.prepare(`SELECT type, created_at FROM events WHERE client_id = ? AND type IN ('auto_published','revision_done','theme_changed','logo_uploaded','photo_uploaded','lead_received','preview_ready','hosting_active','build_started','invoice_paid','launched','page1_celebrated','first_lead_celebrated') ORDER BY id DESC LIMIT 8`).bind(id).all()).results || [];
+  if (previewHeld) evRows = evRows.filter((e) => !HELD_TYPES.includes(e.type));
+  // reports list + rank spot-check from GitHub (best effort)
+  let reports = [], ranks = null;
+  if (slug && c.env.GITHUB_TOKEN) {
+    try {
+      const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+      const r = await fetch(`https://api.github.com/repos/${repo}/contents/reports/${slug}`, {
+        headers: { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' } });
+      if (r.ok) {
+        const files = await r.json();
+        reports = files.filter((f) => f.name.endsWith('.html')).map((f) => f.name).sort().reverse().slice(0, 6);
+        const rj = files.find((f) => f.name === 'ranks.json');
+        if (rj) {
+          const rr = await fetch(rj.download_url, { headers: { 'User-Agent': 'conversionco-mission-control' } });
+          if (rr.ok) { try { ranks = await rr.json(); } catch {} }
+        }
+      }
+    } catch {}
+  }
+  const biz = client.business_name || client.name || 'Your Business';
+  const portalStage = previewHeld ? 'generating' : client.stage;
+  const stageIdx = PORTAL_STAGES.findIndex(([k]) => k === portalStage);
+  const doneIdx = stageIdx === -1 ? (portalStage === 'intake2_sent' ? 2 : 0) : stageIdx;
+  const siteUrl = client.live_url || (previewHeld ? '' : client.preview_url) || '';
+  const upPct = up && up.total ? Math.round(100 * (up.total - (up.fails || 0)) / up.total) : null;
+  const tok = c.req.param('token');
+  const isPremium = client.tier === 'premium';
+  const bars = score ? Object.entries(score.breakdown).map(([k, v]) =>
+    `<div class="bar"><span>${k === 'offsite' ? 'off-site' : k}</span><div class="tr"><div class="fl" style="width:${Math.round(100 * v.score / v.max)}%"></div></div><b>${v.score}/${v.max}</b></div>`).join('') : '';
+  const plan = isPremium
+    ? ['Custom luxury website — every page designed for you', 'A landing page for every drip (Google loves depth)', 'City pages for local search domination', 'A new SEO article written & published every week', 'Weekly performance report with your SEO Score', 'Daily uptime & security monitoring', 'Review funnel — happy clients routed to Google']
+    : ['Custom luxury website — every page designed for you', 'Full search-engine foundation (schema, sitemap, local targeting)', 'Monthly performance report with your SEO Score', 'Daily uptime & security monitoring', 'Booking built into every page'];
+  // ---- Portal v2 (7/24): light, professional, report-matched design. Real data only,
+  // human voice, no fluff. Section color system mirrors the client reports.
+  const escq = (s) => String(s || '').replace(/[<>&]/g, '');
+  const ladder = (pos, prev) => {
+    const w = pos ? Math.max(6, Math.round(101 - Math.min(100, pos))) : 0;
+    const gh = (prev && prev !== pos) ? `<div class="ghost" style="left:${Math.max(2, Math.min(97, Math.round(101 - Math.min(100, prev))))}%"></div>` : '';
+    return `<div class="ladder"><div class="goal"></div>${pos ? `<div class="lfill" style="width:0%" data-w="${w}"></div>` : ''}${gh}</div><div class="lscale"><span>#100</span><span>Page 1 🏁</span></div>`;
+  };
+  const moveTxt = (pos, prev) => (!prev || prev === pos) ? '' : (pos < prev ? ` <span class="up">▲ up from #${prev}</span>` : ` <span class="mut">was #${prev}</span>`);
+  let gsc = null; try { gsc = JSON.parse(settings[`gsc_data_${id}`] || 'null'); } catch {}
+  const hasGsc = gsc && Array.isArray(gsc.queries) && gsc.queries.length > 0;
+  let hist = []; try { hist = JSON.parse(settings[`scorehist_${id}`] || '[]'); } catch {}
+  const agrRow = await db.prepare('SELECT * FROM agreements WHERE client_id = ? ORDER BY id DESC LIMIT 1').bind(id).first();
+  const agrTok = agrRow ? await portalToken(c.env, 'agr', id) : '';
+  // their brand, not ours: accent from their site theme (or a per-client override)
+  const accent = settings[`portal_accent_${id}`] || (THEMES[client.theme] && THEMES[client.theme].tokens && THEMES[client.theme].tokens['--gold']) || '#2F7E76';
+  const firstName = (client.name || '').split(' ')[0] || '';
+  // living welcome line — drawn from their real latest event, fresh every visit
+  const WELCOME = { gsc_verified: 'Google is now measuring your website — your exact positions land here soon.',
+    launched: 'your website is live on the web and under our care.',
+    auto_published: 'a fresh update just went out on your website.',
+    revision_done: 'your latest change is done and live.',
+    lead_received: 'a new lead just came in through your website.',
+    invoice_paid: 'payment received — thank you. Everything below is current.',
+    page1_celebrated: 'you are on Page 1 of Google. Enjoy this page.',
+    first_lead_celebrated: 'your first lead came in through your website.',
+    preview_ready: 'a new version of your website is up.',
+    photo_uploaded: 'your new photo is in — thank you.' };
+  const welcomeLine = (evRows.length && WELCOME[evRows[0].type])
+    ? `${firstName ? firstName + ' — ' : ''}${WELCOME[evRows[0].type]}`
+    : `${firstName ? firstName + ', w' : 'W'}elcome back — everything on this page is live and current.`;
+  // your story with us — first occurrence of each real milestone
+  const MILES = { client_created: 'The day we met', agreement_signed: 'You made it official', build_started: 'We started building',
+    preview_ready: 'Your website took its first breath', launched: 'You went live on the web', gsc_verified: 'Google began measuring you',
+    page1_celebrated: 'You reached Page 1 of Google', first_lead_celebrated: 'Your first lead arrived' };
+  let storyRows = (await db.prepare(`SELECT type, MIN(created_at) AS at FROM events WHERE client_id = ? AND type IN ('client_created','agreement_signed','build_started','preview_ready','launched','gsc_verified','page1_celebrated','first_lead_celebrated') GROUP BY type ORDER BY at`).bind(id).all()).results || [];
+  if (previewHeld) storyRows = storyRows.filter((s) => s.type !== 'preview_ready');
+  // fresh real win → one-time confetti (client-side localStorage gate)
+  const winRow = await db.prepare(`SELECT type, created_at FROM events WHERE client_id = ? AND type IN ('page1_celebrated','first_lead_celebrated') AND created_at > datetime('now','-14 days') ORDER BY id DESC LIMIT 1`).bind(id).first();
+  // Page One certificate — earliest genuine Page-1 event, forever
+  const certRow = await db.prepare(`SELECT detail, created_at FROM events WHERE client_id = ? AND type = 'page1_celebrated' ORDER BY id ASC LIMIT 1`).bind(id).first();
+  const certKw = certRow ? ((String(certRow.detail || '').match(/"([^"]+)"/) || [])[1] || '') : '';
+  // 30-day before/after — only when real history spans 25+ days
+  const histSpanDays = hist.length >= 2 ? Math.round((Date.parse(hist[hist.length - 1].d) - Date.parse(hist[0].d)) / 86400000) : 0;
+  let gscFirst = null; try { gscFirst = JSON.parse(settings[`gsc_first_${id}`] || 'null'); } catch {}
+  // first-party visitor counts (our-hosted sites use the slug; externally-hosted
+  // sites use the ext-<id> pixel — see /t/:id/t.js).
+  // TRUE-DATA GATE (Tiffany 7/24): the tile only exists once the site is genuinely
+  // public — a live domain (or pixel on their own live site). Preview peeks by us
+  // or the client are NOT "visitors"; pre-launch the tile must not appear at all.
+  let visits = null;
+  const publiclyLive = !!(client.live_url) || !slug; // no-slug clients only ever get pixel data (their site is live elsewhere)
+  if (publiclyLive) {
+    const hitSlug = slug || `ext-${id}`;
+    const v7 = await db.prepare(`SELECT SUM(n) AS n FROM hits WHERE slug = ? AND day > date('now','-7 days')`).bind(hitSlug).first();
+    const v28 = await db.prepare(`SELECT SUM(n) AS n FROM hits WHERE slug = ? AND day > date('now','-28 days')`).bind(hitSlug).first();
+    const topP = await db.prepare(`SELECT path, SUM(n) AS n FROM hits WHERE slug = ? AND day > date('now','-28 days') AND path != 'index.html' GROUP BY path ORDER BY n DESC LIMIT 1`).bind(hitSlug).first();
+    if (v28 && Number(v28.n) > 0) visits = { w: Number(v7?.n || 0), m: Number(v28.n), top: topP ? String(topP.path).replace('.html', '').replace(/-/g, ' ') : null };
+  }
+  // lead inbox + client-confirmed bookings (real revenue)
+  const leadRows = (await db.prepare(`SELECT id AS lid, name, email, phone, message, source, status, created_at FROM leads WHERE client_id = ? AND slug != 'portal-message' ORDER BY id DESC LIMIT 12`).bind(id).all()).results || [];
+  const bookedN = Number((await db.prepare(`SELECT COUNT(*) AS n FROM leads WHERE client_id = ? AND status = 'booked'`).bind(id).first())?.n || 0);
+  let avgPrice = 0;
+  if (slug) {
+    try {
+      const meta = JSON.parse((await db.prepare(`SELECT content FROM site_files WHERE slug = ? AND path = 'site-meta.json'`).bind(slug).first())?.content || '{}');
+      const prices = (Array.isArray(meta.menu) ? meta.menu : []).map((x) => {
+        const raw = typeof x === 'string' ? x : (x && (x.price ?? x[1])) ?? '';
+        return Number(String(raw).replace(/[^0-9.]/g, ''));
+      }).filter((p) => p > 10 && p < 5000);
+      if (prices.length) avgPrice = Math.round(prices.reduce((a, b) => a + b, 0) / prices.length);
+    } catch {}
+  }
+  // review pulse — engines record it into ranks.json weekly (honest approximations)
+  const reviews = (ranks && ranks.reviews && ranks.reviews.you) ? ranks.reviews : null;
+  // photo library
+  const photoSlots = new Set(((await db.prepare(`SELECT path FROM site_files WHERE slug = ? AND path LIKE 'photo-%'`).bind(`_assets-${id}`).all()).results || []).map((r) => Number(String(r.path).replace('photo-', '')) || 0));
+  // share-a-win image data
+  const shareData = certRow
+    ? { biz, title: 'PAGE ONE OF GOOGLE', sub: certKw ? `"${certKw}"` : '', date: `Verified ${String(certRow.created_at).slice(0, 10)}` }
+    : (winRow ? { biz, title: winRow.type === 'first_lead_celebrated' ? 'FIRST LEAD, IN THE BOOKS' : 'A WIN WORTH SHARING', sub: '', date: String(winRow.created_at).slice(0, 10) } : null);
+  const tiles = [];
+  if (hasGsc) {
+    tiles.push(`<div class="tile"><div class="v" data-cnt="${Number(gsc.totals?.imp || 0)}">${Number(gsc.totals?.imp || 0).toLocaleString()}<small>×</small></div><div class="l">Times shown on Google</div></div>`);
+    tiles.push(`<div class="tile"><div class="v" data-cnt="${Number(gsc.totals?.clicks || 0)}">${Number(gsc.totals?.clicks || 0).toLocaleString()}</div><div class="l">Clicks to your website</div></div>`);
+    const best = Math.min(...gsc.queries.map((q) => q.pos).filter((p) => p > 0));
+    if (isFinite(best)) tiles.push(`<div class="tile"><div class="v">#${best}</div><div class="l">Best Google spot</div></div>`);
+  }
+  if (visits) tiles.push(`<div class="tile"><div class="v" data-cnt="${visits.w > 0 ? visits.w : visits.m}">${(visits.w > 0 ? visits.w : visits.m).toLocaleString()}</div><div class="l">Visitors ${visits.w > 0 ? 'this week' : 'this month'}</div>${visits.top ? `<div class="d">most viewed: ${escq(visits.top)}</div>` : ''}</div>`);
+  if (leadsN > 0) tiles.push(`<div class="tile"><div class="v" data-cnt="${leadsN}">${leadsN}</div><div class="l">People who reached out</div></div>`);
+  if (bookedN > 0) tiles.push(`<div class="tile"><div class="v" data-cnt="${bookedN}">${bookedN}</div><div class="l">Bookings from your website</div>${avgPrice ? `<div class="d up">~$${(bookedN * avgPrice).toLocaleString()} at your prices</div>` : ''}</div>`);
+  if (score) tiles.push(`<div class="tile"><div class="v" data-cnt="${score.total}">${score.total}<small>/100</small></div><div class="l">Website score</div></div>`);
+  if (!score && up && up.total >= 3 && upPct !== null) tiles.push(`<div class="tile"><div class="v" data-cnt="${upPct}">${upPct}%</div><div class="l">Uptime, checked daily</div></div>`);
+  const FRIENDLY2 = { auto_published: 'Website updated & republished', revision_done: 'A requested change was completed',
+    theme_changed: 'Fresh look applied to your site', logo_uploaded: 'Your logo was added', photo_uploaded: 'New photo added to your site',
+    lead_received: 'New lead from your website', preview_ready: 'A new version was published', hosting_active: 'Hosting & security activated',
+    build_started: 'Your website build is underway', invoice_paid: 'Payment received — thank you', launched: 'Your website went live',
+    page1_celebrated: 'You reached Page 1 of Google', first_lead_celebrated: 'Your first lead arrived' };
+  return c.html(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex"><title>${biz} — Client Portal | ConversionCo</title>
+<meta name="theme-color" content="${accent}">
+<link rel="manifest" href="/portal-manifest/${id}/${tok}">
+<link rel="apple-touch-icon" href="/portal-logo/${id}/${tok}">
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500&family=Karla:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+  *{box-sizing:border-box;margin:0}
+  :root{--ink:#16202B;--muted:#5B6B7B;--faint:#8A99A8;--paper:#FBFAF7;--card:#FFFFFF;--line:#E7E3DA;--good:#1B7F4B;--navy:#0B1D33;--gold:#A16207;--brand:${accent}}
+  body{background:var(--paper);color:var(--ink);font-family:'Karla',-apple-system,sans-serif;font-weight:300;line-height:1.6;font-size:15.5px}
+  .wrap{max-width:700px;margin:0 auto;padding:34px 18px 70px}
+  .head{display:flex;align-items:center;gap:14px}
+  .head img{height:44px;max-width:130px;object-fit:contain;background:#fff;border:1px solid var(--line);border-radius:10px;padding:4px}
+  .head .mono{width:46px;height:46px;border-radius:50%;border:1.5px solid var(--brand);display:flex;align-items:center;justify-content:center;font-family:'Cormorant Garamond',serif;font-size:20px;color:var(--brand)}
+  h1{font-family:'Cormorant Garamond',Georgia,serif;font-weight:500;font-size:clamp(24px,5.5vw,32px);color:var(--navy);line-height:1.1}
+  .sub{color:var(--muted);font-size:12.5px;letter-spacing:.05em;margin-top:3px}
+  .card{background:var(--card);border:1px solid var(--line);border-top:3px solid var(--sec,var(--navy));border-radius:18px;padding:22px 20px;margin:14px 0}
+  .c-goog{--sec:var(--brand)}.c-cust{--sec:#1B7F4B}.c-score{--sec:#7C3AED}.c-health{--sec:#0E8A8A}.c-rep{--sec:#A16207}.c-blog{--sec:#C2410C}.c-act{--sec:#475569}.c-msg{--sec:#0B1D33}.c-doc{--sec:#0B1D33}.c-story{--sec:var(--brand)}
+  .story{position:relative;padding-left:22px;display:grid;gap:14px}
+  .story::before{content:"";position:absolute;left:5px;top:6px;bottom:6px;width:2px;background:var(--line);border-radius:2px}
+  .story .m{position:relative;font-size:14.5px}
+  .story .m::before{content:"";position:absolute;left:-22px;top:5px;width:12px;height:12px;border-radius:50%;background:var(--brand);border:2.5px solid var(--card);box-shadow:0 0 0 1.5px var(--brand)}
+  .story .m time{display:block;font-size:11.5px;color:var(--faint)}
+  .covers{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:12px}
+  .cover{display:block;text-decoration:none;background:var(--paper);border:1px solid var(--line);border-radius:12px;padding:18px 12px 14px;text-align:center;transition:border-color .15s}
+  .cover:hover{border-color:var(--brand)}
+  .cover .cm{font-family:'Cormorant Garamond',serif;font-size:19px;color:var(--ink);line-height:1.2}
+  .cover .cl{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--brand);margin-top:6px;font-weight:500}
+  .cover .bar{height:3px;border-radius:2px;background:var(--brand);width:34px;margin:0 auto 12px}
+  .cbtns{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+  .cbtn{background:var(--paper);border:1.5px solid var(--line);border-radius:99px;padding:8px 16px;font-size:13px;color:var(--ink);cursor:pointer;font-family:inherit}
+  .cbtn.on{border-color:var(--brand);color:var(--brand);font-weight:500}
+  .eyebrow{font-size:11px;letter-spacing:.22em;text-transform:uppercase;color:var(--sec,var(--gold));font-weight:500}
+  h2{font-family:'Cormorant Garamond',Georgia,serif;font-weight:400;font-size:21px;margin:5px 0 12px;color:var(--ink)}
+  .livebar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:18px 0 4px}
+  .livepill{display:inline-flex;align-items:center;gap:7px;background:#E7F5EC;color:var(--good);font-weight:500;font-size:13px;padding:7px 14px;border-radius:99px}
+  .livepill i{width:8px;height:8px;border-radius:50%;background:var(--good);display:inline-block}
+  .btn{display:inline-block;background:var(--brand);color:#fff;font-weight:500;padding:11px 22px;border-radius:10px;text-decoration:none;border:0;font-size:14px;cursor:pointer}
+  .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}
+  .tile{background:var(--paper);border:1px solid var(--line);border-radius:16px;padding:16px 12px 13px;text-align:center}
+  .tile .v{font-family:'Cormorant Garamond',serif;font-size:36px;line-height:1;color:var(--ink)}
+  .tile .v small{font-size:15px;color:var(--muted)}
+  .tile .l{font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-top:6px}
+  .grow{padding:14px 0;border-bottom:1px dashed var(--line)} .grow:last-of-type{border-bottom:0;padding-bottom:4px}
+  .grow .kw{font-size:13px;color:var(--muted)} .grow .kw b{color:var(--ink);font-weight:500}
+  .ladder{position:relative;height:16px;background:var(--line);border-radius:99px;margin:9px 0 4px}
+  .lfill{position:absolute;left:0;top:0;height:100%;border-radius:99px 5px 5px 99px;background:var(--sec,#2F7E76);min-width:8px;transition:width 1.1s cubic-bezier(.22,1,.36,1)}
+  @media (prefers-reduced-motion: reduce){.lfill{transition:none}}
+  .winbanner{display:none;background:var(--card);border:1.5px solid var(--brand);border-radius:16px;padding:16px 18px;margin:14px 0;text-align:center;font-family:'Cormorant Garamond',serif;font-size:20px;color:var(--ink)}
+  .sinceline{display:none;font-size:13px;color:var(--faint);margin-top:5px}
+  .framewrap{position:relative;height:300px;overflow:hidden;border-radius:12px;border:1px solid var(--line);background:#fff}
+  .framewrap iframe{width:1272px;height:577px;transform:scale(.52);transform-origin:0 0;border:0;pointer-events:none}
+  .micbtn{background:var(--paper);border:1.5px solid var(--line);border-radius:99px;width:42px;height:42px;font-size:17px;cursor:pointer;flex:0 0 42px}
+  .micbtn.rec{border-color:#B91C1C;background:#FEF2F2;animation:pulse 1.2s infinite}
+  @keyframes pulse{50%{transform:scale(1.08)}}
+  .ghost{position:absolute;top:-4px;width:2px;height:24px;background:var(--faint);border-radius:2px}
+  .goal{position:absolute;right:0;top:0;height:100%;width:10%;border-radius:0 99px 99px 0;background:var(--sec,#2F7E76);opacity:.14}
+  .lscale{display:flex;justify-content:space-between;font-size:10.5px;color:var(--faint)}
+  .pos{font-size:15px;margin-top:5px} .pos b{font-weight:500;color:var(--sec,#2F7E76);font-family:'Cormorant Garamond',serif;font-size:20px}
+  .up{color:var(--good);font-size:12.5px;font-weight:500} .mut{color:var(--faint);font-size:12.5px}
+  .note{font-size:12px;color:var(--faint);margin-top:10px}
+  .steps{display:flex;flex-direction:column;gap:9px}
+  .step{display:flex;gap:11px;align-items:center;font-size:14.5px}
+  .dot{width:24px;height:24px;border-radius:50%;display:grid;place-items:center;font-size:12px;flex:0 0 24px;background:var(--line);color:var(--muted)}
+  .done .dot{background:#E7F5EC;color:var(--good)} .now .dot{background:var(--navy);color:#fff}
+  .now{font-weight:500} .pend{color:var(--faint)}
+  .checks{display:grid;gap:9px} .check{display:flex;gap:10px;align-items:flex-start;font-size:14.5px}
+  .check .tick{color:var(--good);font-weight:600;flex:0 0 auto}
+  ul.list{list-style:none;display:grid;gap:8px} ul.list a{color:var(--ink);text-decoration:none;font-size:14.5px;border-bottom:1px solid var(--line);padding-bottom:7px;display:block}
+  ul.list a:hover{color:var(--sec,var(--navy))}
+  .feed{display:grid;gap:9px;font-size:14px} .feed time{color:var(--faint);font-size:11.5px;display:block}
+  textarea{width:100%;background:var(--paper);border:1px solid var(--line);border-radius:10px;color:var(--ink);padding:13px;font-family:inherit;font-size:14.5px;margin-bottom:12px}
+  .foot{text-align:center;color:var(--faint);font-size:12px;margin-top:26px} .foot a{color:var(--muted)}
+</style></head><body><div class="wrap">
+  <div class="head"><img src="/portal-logo/${id}/${tok}" onerror="this.outerHTML='<div class=mono>${escq(biz).slice(0, 1)}</div>'">
+    <div><h1>${biz}</h1><div class="sub">Private client portal · prepared by your ConversionCo team${isPremium ? ' · Premium' : ''}</div></div></div>
+  <p style="font-family:'Cormorant Garamond',serif;font-style:italic;font-size:17px;color:var(--muted);margin-top:14px">${escq(welcomeLine)}</p>
+  <p class="sinceline" id="sinceLine"></p>
+
+  <div class="winbanner" id="winBanner">${winRow ? (winRow.type === 'page1_celebrated' ? '🎉 You are on Page 1 of Google. Take a moment — this is what the work was for.' : '🎉 Your first lead came in through your website. It’s working.') : ''}${shareData ? `<div><button class="cbtn" onclick="shareWin()" style="margin-top:12px">Share this win 📤</button></div>` : ''}</div>
+
+  ${client.stage === 'live'
+    ? `<div class="livebar"><span class="livepill"><i></i>Live on the web</span>${siteUrl ? `<a class="btn" href="${siteUrl}" target="_blank">View your website →</a>` : ''}</div>`
+    : `<div class="card"><span class="eyebrow">Your Project</span><h2>Where things stand</h2><div class="steps">
+    ${PORTAL_STAGES.map(([k, label], i) => `<div class="step ${i < doneIdx ? 'done' : i === doneIdx ? 'now' : 'pend'}"><span class="dot">${i < doneIdx ? '✓' : i === doneIdx ? '●' : i + 1}</span>${label}</div>`).join('')}
+  </div>${siteUrl ? `<a class="btn" href="${siteUrl}" target="_blank" style="margin-top:16px">View your website →</a>` : ''}</div>`}
+
+  ${slug ? `<div class="card" style="padding:14px 14px 12px"><div class="framewrap">
+    <iframe src="/preview/${slug}/" loading="lazy" title="Your website, live"></iframe>
+    <a href="${siteUrl || `/preview/${slug}/`}" target="_blank" style="position:absolute;inset:0" aria-label="Open your website"></a>
+  </div><p class="note" style="margin-top:9px;text-align:center">This is what the world sees right now — tap to open it full size.</p></div>` : ''}
+
+  ${tiles.length ? `<div class="card"><span class="eyebrow">At a Glance</span><h2>Your numbers right now</h2><div class="tiles">${tiles.join('')}</div></div>` : ''}
+
+  <div class="card c-goog"><span class="eyebrow">Google</span><h2>Where you stand on Google</h2>
+    ${hasGsc ? `<p class="note" style="margin:0 0 6px">Straight from Google's own records — your exact position for searches people typed in the last 28 days · updated ${String(gsc.checked_at).slice(0, 10)}.</p>
+      ${gsc.queries.map((q) => `<div class="grow"><div class="kw">when someone searches <b>"${escq(q.q)}"</b></div>${ladder(q.pos, q.prev)}<div class="pos">you're <b>#${q.pos}</b> on Google${moveTxt(q.pos, q.prev)}</div></div>`).join('')}` : ''}
+    ${ranks && Array.isArray(ranks.keywords) && ranks.keywords.length ? `
+      ${hasGsc ? '<p class="note" style="margin:12px 0 0">And in the searches we run ourselves in your market:</p>' : `<p class="note" style="margin:0 0 6px">We run these exact searches every week${ranks.checked_at ? ` · last checked ${String(ranks.checked_at).slice(0, 10)}` : ''}.</p>`}
+      ${ranks.keywords.map((k) => `<div class="grow"><div class="kw">when someone searches <b>"${escq(k.kw)}"</b></div>${ladder(k.you || 0, null)}
+        <div class="pos">${k.you ? `you're <b>Page 1, #${k.you}</b>` : (k.pending ? 'your spot is waiting — tracking starts at launch' : `not on Page 1 yet — that's the target`)}</div>
+        ${k.competitors ? `<div class="note" style="margin-top:4px">${Object.entries(k.competitors).map(([n, p]) => `${escq(n)}: ${p ? `Page 1, #${p}` : 'not on Page 1'}`).join(' · ')}</div>` : ''}</div>`).join('')}` : ''}
+    ${!hasGsc && !(ranks && ranks.keywords && ranks.keywords.length) ? (client.live_url
+      ? `<p style="color:var(--muted);font-size:14px">Your website is registered with Google and the measuring has begun — your first exact positions appear here within days, and we re-check them every Sunday.</p><div class="ladder"><div class="goal"></div></div><div class="lscale"><span>#100</span><span>Page 1 🏁</span></div>`
+      : `<p style="color:var(--muted);font-size:14px">The day your website goes live, we start tracking exactly where you appear on Google — every week, right here.</p>`) : ''}
+  </div>
+
+  ${score ? `<div class="card c-score"><span class="eyebrow">Your Website</span><h2>Website score: ${score.total}/100</h2>
+    <div style="display:flex;gap:20px;align-items:center;flex-wrap:wrap">
+      <svg width="118" height="118" viewBox="0 0 120 120" role="img" aria-label="Score ${score.total} of 100">
+        <circle cx="60" cy="60" r="52" fill="none" stroke="var(--line)" stroke-width="9"/>
+        <circle cx="60" cy="60" r="52" fill="none" stroke="#7C3AED" stroke-width="9" stroke-linecap="round" stroke-dasharray="${(326.7 * score.total / 100).toFixed(1)} 326.7" transform="rotate(-90 60 60)"/>
+        <text x="60" y="57" text-anchor="middle" style="font:400 30px 'Cormorant Garamond';fill:var(--ink)">${score.total}</text>
+        <text x="60" y="76" text-anchor="middle" style="font:400 10px 'Karla';fill:var(--muted)">out of 100</text>
+      </svg>
+      <p style="flex:1;min-width:220px;color:var(--muted);font-size:13.5px">A real audit of your website's search-readiness. The biggest points come from your presence on Google — profile, listings, reviews — so it climbs as that work lands.</p>
+    </div>
+    ${hist.length >= 2 ? (() => { const w = 560, h = 60, mn = Math.min(...hist.map(p => p.s)) - 3, mx = Math.max(...hist.map(p => p.s)) + 3;
+      const pts = hist.map((p, i) => `${(i / (hist.length - 1) * w).toFixed(1)},${(h - (p.s - mn) / Math.max(1, mx - mn) * h).toFixed(1)}`).join(' ');
+      return `<svg viewBox="0 0 ${w} ${h + 8}" style="width:100%;height:auto;margin-top:14px"><polyline points="${pts}" fill="none" stroke="#7C3AED" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="${w}" cy="${(h - (hist[hist.length - 1].s - mn) / Math.max(1, mx - mn) * h).toFixed(1)}" r="3.5" fill="#7C3AED"/></svg><div class="note">your score since we started — ${hist[0].s} → ${hist[hist.length - 1].s}</div>`; })() : ''}
+  </div>` : ''}
+
+  <div class="card c-health"><span class="eyebrow">Health</span><h2>Healthy, safe, and working</h2><div class="checks">
+    ${up && up.total ? `<div class="check"><span class="tick">✓</span><span>Looked in on every day — ${up.total} check${up.total === 1 ? '' : 's'} so far${upPct !== null ? `, ${upPct}% clean` : ''}${up.last === 'up' ? ', all clear today' : ''}.</span></div>` : `<div class="check"><span class="tick">✓</span><span>Daily care is switched on — we look in on your website every single day.</span></div>`}
+    ${settings[`gsc_${id}`] && (JSON.parse(settings[`gsc_${id}`] || '{}').verified) ? `<div class="check"><span class="tick">✓</span><span>Registered with Google — your site map is in Google's hands, so it knows every page you have.</span></div>` : ''}
+    ${billing.sub_status === 'active' ? `<div class="check"><span class="tick">✓</span><span>Hosting &amp; security active — your website is protected around the clock.</span></div>` : ''}
+    ${revsN > 0 ? `<div class="check"><span class="tick">✓</span><span>${revsN} change${revsN === 1 ? '' : 's'} completed for you since day one.</span></div>` : ''}
+    ${score && score.pages.blogPosts > 0 ? `<div class="check"><span class="tick">✓</span><span>${score.pages.blogPosts} article${score.pages.blogPosts === 1 ? '' : 's'} written and published for you.</span></div>` : ''}
+  </div></div>
+
+  ${leadRows.length ? `<div class="card c-cust"><span class="eyebrow">Customers</span><h2>Your inbox</h2>
+    <div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:4px">
+      <div style="font-family:'Cormorant Garamond',serif;font-size:52px;line-height:1" data-cnt="${leadsN}">${leadsN}</div>
+      <p style="color:var(--muted);font-size:14px;max-width:400px">people have reached out through your website${bookedN ? ` — <b style="color:var(--good);font-weight:500">${bookedN} booked ✓</b>${avgPrice ? ` <span style="color:var(--faint)">(~$${(bookedN * avgPrice).toLocaleString()} at your average price)</span>` : ''}` : ''}.</p>
+    </div>
+    ${leadRows.map((L) => `<div class="grow" data-lead="${L.lid}">
+      <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:baseline">
+        <b style="font-weight:500">${escq(L.name || 'Someone')}</b>
+        <span class="note" style="margin:0">${String(L.created_at).slice(0, 10)}${L.source ? ` · via ${escq(L.source)}` : ''}</span>
+      </div>
+      ${L.message ? `<p style="font-size:13.5px;color:var(--muted);margin-top:3px">"${escq(String(L.message).slice(0, 180))}"</p>` : ''}
+      <div style="display:flex;gap:12px;margin-top:8px;flex-wrap:wrap;align-items:center">
+        ${L.phone ? `<a href="tel:${escq(L.phone)}" style="font-size:13px;color:var(--brand);text-decoration:none;font-weight:500">📞 Call</a>` : ''}
+        ${L.email ? `<a href="mailto:${escq(L.email)}" style="font-size:13px;color:var(--brand);text-decoration:none;font-weight:500">✉️ Email</a>` : ''}
+        <span style="margin-left:auto;font-size:12px;color:var(--faint)">Did they book?</span>
+        <button class="cbtn bk ${L.status === 'booked' ? 'on' : ''}" onclick="markLead(${L.lid}, 'booked', this)" style="padding:4px 12px;font-size:12px">Booked ✓</button>
+        <button class="cbtn bk ${L.status === 'no' ? 'on' : ''}" onclick="markLead(${L.lid}, 'no', this)" style="padding:4px 12px;font-size:12px">No</button>
+      </div>
+    </div>`).join('')}
+  </div>` : ''}
+
+  ${reviews ? `<div class="card" style="--sec:#BE123C"><span class="eyebrow">Reviews</span><h2>Your review pulse</h2>
+    <div style="display:flex;gap:20px;align-items:baseline;flex-wrap:wrap">
+      <div style="font-family:'Cormorant Garamond',serif;font-size:52px;line-height:1">${Number(reviews.you.count) || 0}</div>
+      <div style="color:var(--muted);font-size:14px">Google reviews${reviews.you.rating ? ` · ${escq(String(reviews.you.rating))}★` : ''}${(reviews.you.prev_count != null && Number(reviews.you.count) > Number(reviews.you.prev_count)) ? ` · <b style="color:var(--good);font-weight:500">up ${Number(reviews.you.count) - Number(reviews.you.prev_count)} since last check</b>` : ''}</div>
+    </div>
+    ${reviews.rivals ? `<p class="note" style="margin-top:10px">The neighbors: ${Object.entries(reviews.rivals).map(([n, r]) => `${escq(n)} ~${Number((r && r.count) != null ? r.count : r) || '?'}`).join(' · ')}</p>` : ''}
+  </div>` : ''}
+
+  ${(slug && (photoSlots.size > 0)) ? `<div class="card c-blog"><span class="eyebrow">Your Photos</span><h2>Your photo library</h2>
+    <p class="note" style="margin:0 0 12px">The photos we keep on file for your website. Send a new one in the box below — tick "add to my website" and we place it for you.</p>
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:10px">
+    ${[1, 2, 3, 4, 5, 6].map((n) => photoSlots.has(n)
+      ? `<img src="/portal-photo-view/${id}/${tok}/${n}" style="width:100%;aspect-ratio:1;object-fit:cover;border-radius:10px;border:1px solid var(--line)" alt="Your photo ${n}" loading="lazy">`
+      : `<div style="aspect-ratio:1;border:1.5px dashed var(--line);border-radius:10px;display:flex;align-items:center;justify-content:center;color:var(--faint);font-size:22px">·</div>`).join('')}
+    </div></div>` : ''}
+
+  ${reports.length ? `<div class="card c-rep"><span class="eyebrow">Reports</span><h2>Your latest report</h2>
+    <p style="color:var(--muted);font-size:13.5px;margin-bottom:12px">The full story — where you stand on Google, what we handled, and what it's worth.</p>
+    <a class="btn" href="/portal/${id}/${tok}/report/${reports[0]}" target="_blank">Read your ${reports[0].replace('.html', '')} report →</a>
+    ${reports.length > 1 ? `<div class="covers" style="margin-top:16px">
+      ${reports.slice(1).map((r) => `<a class="cover" href="/portal/${id}/${tok}/report/${r}" target="_blank"><div class="bar"></div><div class="cm">${r.replace('.html', '')}</div><div class="cl">Report</div></a>`).join('')}
+    </div>` : ''}
+  </div>` : ''}
+
+  ${storyRows.length >= 2 ? `<div class="card c-story"><span class="eyebrow">Your Story With Us</span><h2>The journey so far</h2>
+    <div class="story">
+    ${storyRows.map((s) => `<div class="m">${MILES[s.type] || s.type}<time>${String(s.at).slice(0, 10)}</time></div>`).join('')}
+    </div></div>` : ''}
+
+  ${(agrRow || certRow) ? `<div class="card c-doc"><span class="eyebrow">Documents</span><h2>Your documents</h2>
+    ${agrRow ? `<p style="color:var(--muted);font-size:14px">Your agreement — signed by ${escq(agrRow.signed_name)} on ${String(agrRow.signed_at).slice(0, 10)}, kept right here for your records.</p>
+    <a class="btn" style="margin-top:10px" href="/agreement/${id}/${agrTok}" target="_blank">View your signed agreement →</a>` : ''}
+    ${certRow ? `<p style="color:var(--muted);font-size:14px;margin-top:${agrRow ? '18px' : '0'}">Your Page One certificate — earned ${String(certRow.created_at).slice(0, 10)}${certKw ? ` for the search "${escq(certKw)}"` : ''}. Print it, frame it — you earned it.</p>
+    <a class="btn" style="margin-top:10px;background:#A16207" href="/portal/${id}/${tok}/certificate" target="_blank">Your Page One certificate →</a>
+    <button class="cbtn" onclick="shareWin()" style="margin-left:8px">Share it 📤</button>` : ''}
+  </div>` : ''}
+
+  ${(histSpanDays >= 25 && score && hist.length >= 2) ? `<div class="card c-score"><span class="eyebrow">Then &amp; Now</span><h2>Your first ${histSpanDays} days</h2>
+    <div style="display:flex;gap:26px;align-items:center;flex-wrap:wrap">
+      <div style="text-align:center"><div class="note" style="margin:0">then</div><div style="font-family:'Cormorant Garamond',serif;font-size:44px;color:var(--faint);line-height:1">${hist[0].s}</div></div>
+      <div style="font-size:24px;color:#7C3AED">→</div>
+      <div style="text-align:center"><div class="note" style="margin:0">now</div><div style="font-family:'Cormorant Garamond',serif;font-size:44px;color:#7C3AED;line-height:1">${hist[hist.length - 1].s}</div></div>
+      ${(gscFirst && hasGsc && Number(gsc.totals?.imp || 0) > gscFirst.imp) ? `<div style="margin-left:auto;text-align:center"><div class="note" style="margin:0">shown on Google</div><div style="font-size:17px">${Number(gscFirst.imp).toLocaleString()}× → <b style="color:#7C3AED">${Number(gsc.totals.imp).toLocaleString()}×</b></div></div>` : ''}
+    </div></div>` : ''}
+
+  ${blogs.length ? `<div class="card c-blog"><span class="eyebrow">Published For You</span><h2>Fresh on your website</h2><ul class="list">${blogs.map((b) => `<li><a href="/preview/${slug}/${b.path}" target="_blank">${b.path.replace('blog-', '').replace('.html', '').replace(/-/g, ' ')} →</a></li>`).join('')}</ul></div>` : ''}
+
+  ${evRows.length ? `<div class="card c-act"><span class="eyebrow">Activity</span><h2>Recently, from your team</h2><div class="feed">
+    ${evRows.map((e) => `<div>${FRIENDLY2[e.type] || e.type}<time>${String(e.created_at).slice(0, 10)}</time></div>`).join('')}
+  </div></div>` : ''}
+
+  <div class="card c-msg"><span class="eyebrow">Talk To Us</span><h2>How can we help?</h2>
+    <div class="cbtns">
+      <button class="cbtn on" id="mQ" onclick="setMode('q')">Ask a question</button>
+      <button class="cbtn" id="mC" onclick="setMode('c')">Request a change</button>
+      <button class="cbtn" id="mP" onclick="setMode('p')">Send us a photo</button>
+    </div>
+    <form id="msgForm">
+      <p id="modeHint" style="color:var(--muted);font-size:13px;margin-bottom:9px">A real person reads every message and replies, usually the same day.</p>
+      <div id="photoRow" style="display:none;margin-bottom:11px">
+        <input type="file" id="photoFile" accept="image/png,image/jpeg,image/webp" style="font-size:13px;margin-bottom:9px">
+        ${slug ? `<label style="display:flex;gap:8px;align-items:center;font-size:13.5px;color:var(--ink)"><input type="checkbox" id="wantOnSite" checked style="width:16px;height:16px;accent-color:var(--brand)"> Please add this photo to my website</label>` : ''}
+      </div>
+      <div style="display:flex;gap:9px;align-items:flex-start">
+        <textarea name="message" id="msgText" rows="3" placeholder="Type your message…" style="flex:1;margin-bottom:0"></textarea>
+        <button type="button" class="micbtn" id="micBtn" title="Hold on — talk instead of type" style="display:none">🎤</button>
+      </div>
+      <button class="btn" type="submit" id="msgBtn" style="margin-top:12px">Send</button>
+      <p id="msgOk" style="display:none;color:var(--good);font-weight:500;margin-top:10px"></p>
+    </form>
+  </div>
+
+  <p class="foot">Website care by <a href="https://conversionco918.com">ConversionCo</a></p>
+</div>
+<script>
+window.CCWIN = ${winRow ? JSON.stringify({ t: winRow.type, at: winRow.created_at }) : 'null'};
+window.CCEV = ${JSON.stringify(evRows.map((e) => ({ t: e.type, at: e.created_at })))};
+window.CCIMP = ${hasGsc ? Number(gsc.totals?.imp || 0) : 'null'};
+window.CCSHARE = ${shareData ? JSON.stringify(shareData) : 'null'};
+window.BRAND = '${accent}';
+// mark a lead booked / not — powers the real-revenue tracking
+async function markLead(lid, status, btn) {
+  try {
+    await fetch('/portal-lead/${id}/${tok}', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lead: lid, status: status }) });
+    var row = btn.closest('[data-lead]');
+    row.querySelectorAll('.bk').forEach(function (b) { b.classList.remove('on'); });
+    btn.classList.add('on');
+  } catch (e) {}
+}
+// share-a-win: draw a branded square, download it
+function ccWrap(x, t, cx, y, maxw, lh) {
+  var words = String(t).split(' '); var line = ''; var yy = y;
+  words.forEach(function (w) { var test = line ? line + ' ' + w : w; if (x.measureText(test).width > maxw && line) { x.fillText(line, cx, yy); yy += lh; line = w; } else line = test; });
+  x.fillText(line, cx, yy); return yy;
+}
+async function shareWin() {
+  if (!window.CCSHARE) return;
+  try { await document.fonts.load('500 88px "Cormorant Garamond"'); await document.fonts.load('italic 40px "Cormorant Garamond"'); } catch (e) {}
+  var cv = document.createElement('canvas'); cv.width = 1080; cv.height = 1080;
+  var x = cv.getContext('2d');
+  x.fillStyle = '#FBFAF7'; x.fillRect(0, 0, 1080, 1080);
+  x.strokeStyle = BRAND; x.lineWidth = 6; x.strokeRect(42, 42, 996, 996);
+  x.lineWidth = 1.5; x.strokeRect(60, 60, 960, 960);
+  x.textAlign = 'center';
+  x.fillStyle = BRAND; x.font = '54px "Cormorant Garamond", serif'; x.fillText('✦', 540, 190);
+  x.fillStyle = '#8A99A8'; x.font = '400 26px Karla, sans-serif'; x.fillText('A  W I N  W O R T H  F R A M I N G', 540, 262);
+  x.fillStyle = '#16202B'; x.font = '500 84px "Cormorant Garamond", serif';
+  var yEnd = ccWrap(x, CCSHARE.biz, 540, 400, 880, 92);
+  x.fillStyle = BRAND; x.font = '500 62px "Cormorant Garamond", serif';
+  yEnd = ccWrap(x, CCSHARE.title, 540, yEnd + 130, 880, 70);
+  if (CCSHARE.sub) { x.fillStyle = '#5B6B7B'; x.font = 'italic 42px "Cormorant Garamond", serif'; ccWrap(x, CCSHARE.sub, 540, yEnd + 90, 860, 50); }
+  x.fillStyle = '#8A99A8'; x.font = '400 23px Karla, sans-serif'; x.fillText(CCSHARE.date, 540, 952);
+  cv.toBlob(function (b) { var a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'my-win.png'; a.click(); });
+}
+// numbers that move (respecting reduced-motion)
+(function () {
+  var noMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  document.querySelectorAll('.lfill[data-w]').forEach(function (el) {
+    var w = el.getAttribute('data-w') + '%';
+    if (noMotion) { el.style.width = w; } else { setTimeout(function () { el.style.width = w; }, 150); }
+  });
+  if (!noMotion) document.querySelectorAll('.tile .v[data-cnt]').forEach(function (el) {
+    var target = parseInt(el.getAttribute('data-cnt'), 10); if (!isFinite(target) || target <= 0) return;
+    var suffix = el.querySelector('small') ? el.querySelector('small').outerHTML : '';
+    var extra = /%$/.test(el.textContent.trim()) ? '%' : '';
+    var t0 = null;
+    function step(ts) {
+      if (!t0) t0 = ts;
+      var p = Math.min(1, (ts - t0) / 900); p = 1 - Math.pow(1 - p, 3);
+      el.innerHTML = Math.round(target * p).toLocaleString() + extra + suffix;
+      if (p < 1) requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  });
+})();
+// one-time confetti on a real, recent win
+(function () {
+  if (!window.CCWIN) return;
+  var key = 'cc_win_' + CCWIN.t + '_' + CCWIN.at;
+  try { if (localStorage.getItem(key)) return; localStorage.setItem(key, '1'); } catch (e) { return; }
+  document.getElementById('winBanner').style.display = 'block';
+  if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  var cv = document.createElement('canvas'); cv.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:99';
+  cv.width = innerWidth; cv.height = innerHeight; document.body.appendChild(cv);
+  var ctx = cv.getContext('2d'); var pieces = []; var colors = ['#2F7E76', '#A16207', '#7C3AED', '#1B7F4B', '#BE123C'];
+  for (var i = 0; i < 90; i++) pieces.push({ x: Math.random() * cv.width, y: -20 - Math.random() * cv.height * 0.4, r: 3 + Math.random() * 5, c: colors[i % colors.length], v: 2 + Math.random() * 3, a: Math.random() * 6.28, s: (Math.random() - 0.5) * 0.2 });
+  var frames = 0;
+  (function draw() {
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    pieces.forEach(function (p) { p.y += p.v; p.a += p.s; ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.a); ctx.fillStyle = p.c; ctx.fillRect(-p.r, -p.r / 2, p.r * 2, p.r); ctx.restore(); });
+    if (++frames < 260) requestAnimationFrame(draw); else cv.remove();
+  })();
+})();
+// since your last visit — honest diff, stored locally
+(function () {
+  try {
+    var K = 'cc_visit_${id}';
+    var last = localStorage.getItem(K);
+    if (last) {
+      var lv = Date.parse(last); var msgs = [];
+      var ups = CCEV.filter(function (e) { return ['auto_published', 'revision_done', 'preview_ready', 'photo_uploaded'].indexOf(e.t) >= 0 && Date.parse(e.at.replace(' ', 'T') + 'Z') > lv; }).length;
+      if (ups) msgs.push(ups + ' update' + (ups > 1 ? 's' : '') + ' went out on your website');
+      var pi = localStorage.getItem(K + '_imp');
+      if (pi !== null && CCIMP !== null && CCIMP > +pi) msgs.push("Google's count of people who saw you grew by " + (CCIMP - +pi));
+      if (msgs.length) { var el = document.getElementById('sinceLine'); el.textContent = 'Since you were last here: ' + msgs.join(', and ') + '.'; el.style.display = 'block'; }
+    }
+    localStorage.setItem(K, new Date().toISOString());
+    if (CCIMP !== null) localStorage.setItem(K + '_imp', CCIMP);
+  } catch (e) {}
+})();
+// talk instead of type
+(function () {
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  var btn = document.getElementById('micBtn');
+  if (!SR || !btn) return;
+  btn.style.display = 'block';
+  var rec = null, on = false;
+  btn.addEventListener('click', function () {
+    var ta = document.getElementById('msgText');
+    if (on) { try { rec.stop(); } catch (e) {} return; }
+    rec = new SR(); rec.continuous = true; rec.interimResults = true; rec.lang = 'en-US';
+    var base = ta.value ? ta.value + ' ' : '';
+    rec.onresult = function (ev) {
+      var out = '';
+      for (var i = 0; i < ev.results.length; i++) out += ev.results[i][0].transcript;
+      ta.value = base + out;
+    };
+    rec.onend = function () { on = false; btn.classList.remove('rec'); btn.textContent = '🎤'; };
+    rec.onerror = function () { on = false; btn.classList.remove('rec'); btn.textContent = '🎤'; };
+    rec.start(); on = true; btn.classList.add('rec'); btn.textContent = '⏹';
+  });
+})();
+let MODE = 'q';
+const HINTS = {
+  q: 'A real person reads every message and replies, usually the same day.',
+  c: 'Describe the change in your own words — new price, different photo, updated hours, anything. We take it from there and you get an email when it\\'s live.',
+  p: 'Send us any photo — your space, your team, your work.${slug ? " Tick the box and we\\'ll place it on your website for you." : ''}'
+};
+const PLACEHOLDERS = { q: 'Type your message…', c: 'e.g. "Change the NAD+ price to $850" or "Use a beach photo in the top section"', p: 'Anything we should know about this photo? (optional)' };
+function setMode(m) {
+  MODE = m;
+  for (const [k, elId] of [['q','mQ'],['c','mC'],['p','mP']]) document.getElementById(elId).classList.toggle('on', k === m);
+  document.getElementById('modeHint').textContent = HINTS[m];
+  document.getElementById('msgText').placeholder = PLACEHOLDERS[m];
+  document.getElementById('photoRow').style.display = m === 'p' ? 'block' : 'none';
+  document.getElementById('msgText').required = m !== 'p';
+}
+setMode('q');
+document.getElementById('msgForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const btn = document.getElementById('msgBtn'); btn.disabled = true;
+  const msg = document.getElementById('msgText').value;
+  const ok = document.getElementById('msgOk');
+  try {
+    if (MODE === 'p') {
+      const f = document.getElementById('photoFile').files[0];
+      if (!f) { btn.disabled = false; return alert('Choose a photo first.'); }
+      if (f.size > 3200000) { btn.disabled = false; return alert('Please keep photos under ~3MB.'); }
+      const b64 = await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(f); });
+      const want = document.getElementById('wantOnSite');
+      const r = await fetch('/portal-photo/${id}/${tok}', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ b64, note: msg, wantOnSite: !!(want && want.checked) }) }).then((x) => x.json());
+      if (r.error) { btn.disabled = false; return alert(r.error); }
+      ok.textContent = r.queued ? 'Photo received — it will appear on your website within the day. We\\'ll email you when it\\'s live.' : 'Photo received — thank you. It\\'s safely in your library.';
+    } else if (MODE === 'c') {
+      if (!msg.trim()) { btn.disabled = false; return; }
+      await fetch('/portal-req/${id}/${tok}', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: msg }) });
+      ok.textContent = 'Change request received — we\\'re on it. You\\'ll get an email when it\\'s live.';
+    } else {
+      if (!msg.trim()) { btn.disabled = false; return; }
+      await fetch('/portal-msg/${id}/${tok}', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: msg }) });
+      ok.textContent = 'Sent — we\\'ll get back to you shortly.';
+    }
+    btn.style.display = 'none'; ok.style.display = 'block';
+  } catch { btn.disabled = false; alert('Something hiccuped — try again?'); }
+});
+</script>
+</body></html>`);
+});
+
+// Portal message → instant email to Tiffany + logged like a lead
+app.post('/portal-msg/:id/:token', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'portal', id)) return c.text('nope', 403);
+  const db = c.env.DB;
+  if (!(await rlOk(db, `pmsg:${id}:${c.req.header('CF-Connecting-IP') || 'noip'}`, 8, 3600)))
+    return c.json({ error: "We got your earlier notes — give us a little while and we'll reply to everything at once." }, 429);
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'not found' }, 404);
+  let f = {}; try { f = await c.req.json(); } catch {}
+  const msg = String(f.message || '').slice(0, 2000);
+  if (!msg.trim()) return c.json({ error: 'empty' }, 400);
+  await db.prepare(`INSERT INTO leads (client_id, slug, name, email, phone, message) VALUES (?, 'portal-message', ?, ?, ?, ?)`)
+    .bind(id, client.name || '', client.email || '', client.phone || '', msg).run();
+  await logEvent(db, id, 'portal_message', `💬 Portal message from ${client.name || client.email}: "${msg.slice(0, 100)}"`);
+  const settings = await getSettings(db);
+  if (settings.notify_email && c.env.GHL_TOKEN && settings.ghl_location_id) {
+    try {
+      const ghl = ghlFor(c.env, settings);
+      const contact = await ghl.upsertContact({ email: settings.notify_email, name: 'ConversionCo Notifications' });
+      await ghl.sendEmail({ contactId: contact.id || contact.contactId,
+        subject: `💬 Portal message from ${client.business_name || client.name || client.email}`,
+        html: `<p><b>${client.name || ''}</b> (${client.email || ''}, ${client.phone || ''}) wrote via their portal:</p><blockquote style="border-left:3px solid #C9A254;padding-left:12px;">${msg.slice(0, 1200)}</blockquote><p><a href="${BASE_URL}">Open Mission Control</a></p>`,
+        emailFrom: settings.email_from || undefined });
+    } catch {}
+  }
+  return c.json({ ok: true });
+});
+
+// Portal logo (tokenized, public): uploaded logo first, then the site's logo file
+app.get('/portal-logo/:id/:token', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'portal', id)) return c.text('nope', 403);
+  const db = c.env.DB;
+  let row = await db.prepare(`SELECT content, content_type FROM site_files WHERE slug=? AND path='logo'`).bind(`_assets-${id}`).first();
+  if (!row) {
+    const slug = await slugForClient(db, id);
+    if (slug) row = await db.prepare(`SELECT content, content_type FROM site_files WHERE slug=? AND path='img/logo.png' AND is_base64=1`).bind(slug).first();
+  }
+  if (!row) return c.text('no logo', 404);
+  return c.body(Uint8Array.from(atob(row.content), (ch) => ch.charCodeAt(0)), 200,
+    { 'Content-Type': row.content_type || 'image/png', 'Cache-Control': 'public, max-age=3600' });
+});
+
+// Per-client PWA manifest: their business as an app on their phone
+app.get('/portal-manifest/:id/:token', async (c) => {
+  const id = Number(c.req.param('id'));
+  const tok = c.req.param('token');
+  if (tok !== await portalToken(c.env, 'portal', id)) return c.text('nope', 403);
+  const client = await c.env.DB.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.text('nope', 404);
+  const biz = client.business_name || client.name || 'Client Portal';
+  const hasLogo = await c.env.DB.prepare(`SELECT 1 AS x FROM site_files WHERE slug=? AND path='logo'`).bind(`_assets-${id}`).first();
+  const icon = hasLogo ? `/portal-logo/${id}/${tok}` : '/icon-192.png';
+  return c.json({
+    name: biz, short_name: biz.slice(0, 12), start_url: `/portal/${id}/${tok}`,
+    display: 'standalone', background_color: '#FBFAF7', theme_color: '#0B1D33',
+    icons: [{ src: icon, sizes: '192x192', type: 'image/png' }, { src: hasLogo ? icon : '/icon-512.png', sizes: '512x512', type: 'image/png' }],
+  });
+});
+
+// Portal change request → straight into the revision queue (done within the hour)
+app.post('/portal-req/:id/:token', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'portal', id)) return c.text('nope', 403);
+  const db = c.env.DB;
+  if (!(await rlOk(db, `preq:${id}:${c.req.header('CF-Connecting-IP') || 'noip'}`, 8, 3600)))
+    return c.json({ error: "We've queued your earlier requests — give us a little while to work through those first." }, 429);
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'not found' }, 404);
+  let f = {}; try { f = await c.req.json(); } catch {}
+  const msg = String(f.message || '').slice(0, 1500);
+  if (!msg.trim()) return c.json({ error: 'empty' }, 400);
+  await db.prepare('INSERT INTO revisions (client_id, request) VALUES (?, ?)')
+    .bind(id, `[from the client, via their portal] ${msg}`).run();
+  await logEvent(db, id, 'portal_message', `✏️ Change request from ${client.name || client.email} (queued): "${msg.slice(0, 100)}"`);
+  const settings = await getSettings(db);
+  if (settings.notify_email && c.env.GHL_TOKEN && settings.ghl_location_id) {
+    try {
+      const ghl = ghlFor(c.env, settings);
+      const contact = await ghl.upsertContact({ email: settings.notify_email, name: 'ConversionCo Notifications' });
+      await ghl.sendEmail({ contactId: contact.id || contact.contactId,
+        subject: `✏️ Client change request — ${client.business_name || client.name || client.email} (auto-queued)`,
+        html: `<p><b>${client.name || ''}</b> asked via their portal:</p><blockquote style="border-left:3px solid #C9A254;padding-left:12px;">${msg.slice(0, 1200)}</blockquote><p>It's already in the revision queue — applied within the hour unless you pull it in <a href="${BASE_URL}">Mission Control</a>.</p>`,
+        emailFrom: settings.email_from || undefined });
+    } catch {}
+  }
+  return c.json({ ok: true, queued: true });
+});
+
+// Portal photo upload → client asset library; "add to my website" auto-queues placement
+app.post('/portal-photo/:id/:token', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'portal', id)) return c.text('nope', 403);
+  const db = c.env.DB;
+  if (!(await rlOk(db, `pphoto:${id}:${c.req.header('CF-Connecting-IP') || 'noip'}`, 12, 3600)))
+    return c.json({ error: 'That is a lot of photos at once — give it an hour and send the rest.' }, 429);
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'not found' }, 404);
+  let f = {}; try { f = await c.req.json(); } catch {}
+  const b64raw = String(f.b64 || '');
+  const m = b64raw.match(/^data:image\/(png|jpeg|jpg|webp);base64,/);
+  if (!m) return c.json({ error: 'Please choose a PNG, JPG, or WEBP photo.' }, 400);
+  const ext = m[1] === 'jpeg' ? 'jpg' : m[1];
+  const mime = ext === 'webp' ? 'image/webp' : ext === 'png' ? 'image/png' : 'image/jpeg';
+  const clean = b64raw.replace(/^data:[^,]+,/, '');
+  if (clean.length > 4_400_000) return c.json({ error: 'Please keep photos under ~3MB.' }, 400);
+  // next free library slot (1-6)
+  const used = new Set(((await db.prepare(`SELECT path FROM site_files WHERE slug=? AND path LIKE 'photo-%'`).bind(`_assets-${id}`).all()).results || []).map((r) => r.path));
+  let slot = 0; for (let i = 1; i <= 6; i++) if (!used.has(`photo-${i}`)) { slot = i; break; }
+  if (!slot) return c.json({ error: 'Your photo library is full (6) — reply to any of our emails and we\'ll make room.' }, 400);
+  await db.prepare(`INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
+    VALUES (?, ?, ?, ?, 1, datetime('now'))
+    ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, content_type=excluded.content_type, updated_at=datetime('now')`)
+    .bind(`_assets-${id}`, `photo-${slot}`, clean, mime).run();
+  const note = String(f.note || '').slice(0, 500);
+  const slug = await slugForClient(db, id);
+  let queued = false;
+  if (f.wantOnSite && slug && c.env.GITHUB_TOKEN) {
+    // push the file into their site's repo folder so the revision runner can use it
+    try {
+      const settings0 = await getSettings(db);
+      const repo = settings0.sites_repo || 'conversionco918/conversionco-client-sites';
+      const path = `sites/${slug}/img/client-photo-${slot}.${ext}`;
+      const ghHeaders = { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+      const getRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, { headers: ghHeaders });
+      const existing = getRes.ok ? await getRes.json() : null;
+      const putRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+        method: 'PUT', headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: `Client photo (portal upload) → ${slug}`, content: clean, ...(existing?.sha ? { sha: existing.sha } : {}) }) });
+      if (putRes.ok) {
+        await db.prepare(`INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
+          VALUES (?, ?, ?, ?, 1, datetime('now'))
+          ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, content_type=excluded.content_type, updated_at=datetime('now')`)
+          .bind(slug, `img/client-photo-${slot}.${ext}`, clean, mime).run();
+        await db.prepare('INSERT INTO revisions (client_id, request) VALUES (?, ?)')
+          .bind(id, `[from the client, via their portal] They uploaded a new photo — img/client-photo-${slot}.${ext} (already committed in sites/${slug}/img/) — and asked for it on their website. Place it tastefully where it fits best${note ? `; their note: "${note}"` : ''}. Keep every other design choice unchanged.`).run();
+        queued = true;
+      }
+    } catch { /* photo is safe in the library either way */ }
+  }
+  await logEvent(db, id, 'photo_uploaded', `📷 Client uploaded a photo via their portal (library slot ${slot})${queued ? ' — placement auto-queued for the site' : ''}${note ? ` · note: "${note.slice(0, 80)}"` : ''}`);
+  const settings = await getSettings(db);
+  if (settings.notify_email && c.env.GHL_TOKEN && settings.ghl_location_id) {
+    try {
+      const ghl = ghlFor(c.env, settings);
+      const contact = await ghl.upsertContact({ email: settings.notify_email, name: 'ConversionCo Notifications' });
+      await ghl.sendEmail({ contactId: contact.id || contact.contactId,
+        subject: `📷 ${client.business_name || client.name || client.email} sent a photo${queued ? ' — placement auto-queued' : ''}`,
+        html: `<p><b>${client.name || ''}</b> uploaded a photo via their portal (library slot ${slot}).${note ? `<br>Note: "${note}"` : ''}</p><p>${queued ? 'They asked for it on their website — it\'s already in the revision queue and will be placed within the hour.' : 'It\'s saved in their photo library.'}</p><p><a href="${BASE_URL}">Open Mission Control</a></p>`,
+        emailFrom: settings.email_from || undefined });
+    } catch {}
+  }
+  return c.json({ ok: true, slot, queued });
+});
+
+// Portal "did they book?" — the client confirms real revenue with one tap
+app.post('/portal-lead/:id/:token', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'portal', id)) return c.text('nope', 403);
+  const db = c.env.DB;
+  let f = {}; try { f = await c.req.json(); } catch {}
+  const lid = Number(f.lead || 0);
+  if (!lid) return c.json({ error: 'no lead' }, 400);
+  const raw = String(f.status || '');
+  const status = raw === 'booked' ? 'booked' : raw === 'no' ? 'no' : '';
+  const res = await db.prepare(`UPDATE leads SET status = ? WHERE id = ? AND client_id = ? AND slug != 'portal-message'`).bind(status, lid, id).run();
+  if (!res.meta || res.meta.changes === 0) return c.json({ error: 'not found' }, 404);
+  if (status === 'booked') {
+    await logEvent(db, id, 'lead_booked', `💰 Client marked a lead as BOOKED (lead #${lid})`);
+  }
+  return c.json({ ok: true, status });
+});
+
+// Portal photo library viewer — serves the client's own uploaded photos
+app.get('/portal-photo-view/:id/:token/:n', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'portal', id)) return c.text('nope', 403);
+  const n = Math.min(6, Math.max(1, Number(c.req.param('n')) || 1));
+  const row = await c.env.DB.prepare('SELECT content, content_type FROM site_files WHERE slug = ? AND path = ?')
+    .bind(`_assets-${id}`, `photo-${n}`).first();
+  if (!row) return c.text('no photo', 404);
+  return c.body(Uint8Array.from(atob(row.content), (ch) => ch.charCodeAt(0)), 200,
+    { 'Content-Type': row.content_type || 'image/jpeg', 'Cache-Control': 'private, max-age=600' });
+});
+
+// 📜 Page One certificate — print-ready, earned only (real page1_celebrated event)
+app.get('/portal/:id/:token/certificate', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'portal', id)) return c.text('nope', 403);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  const ev = await db.prepare(`SELECT detail, created_at FROM events WHERE client_id = ? AND type = 'page1_celebrated' ORDER BY id ASC LIMIT 1`).bind(id).first();
+  if (!client || !ev) return c.text('Not found', 404);
+  const settings = await getSettings(db);
+  const accent = settings[`portal_accent_${id}`] || (THEMES[client.theme] && THEMES[client.theme].tokens && THEMES[client.theme].tokens['--gold']) || '#2F7E76';
+  const biz = client.business_name || client.name || 'This business';
+  const kw = (String(ev.detail || '').match(/"([^"]+)"/) || [])[1] || '';
+  const when = new Date(String(ev.created_at).replace(' ', 'T') + 'Z').toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+  return c.html(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex"><title>Page One of Google — ${biz}</title>
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;1,400&family=Karla:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0}
+body{background:#EFEBE2;font-family:'Karla',sans-serif;color:#16202B;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px}
+.cert{background:#FDFCF8;max-width:760px;width:100%;padding:64px 56px;text-align:center;border:1px solid #E7E3DA;box-shadow:0 20px 60px rgba(22,32,43,.12);position:relative}
+.cert::before{content:"";position:absolute;inset:14px;border:1.5px solid ${accent};pointer-events:none}
+.cert::after{content:"";position:absolute;inset:19px;border:.5px solid ${accent}55;pointer-events:none}
+.crest{width:58px;height:58px;border-radius:50%;border:1.5px solid ${accent};display:flex;align-items:center;justify-content:center;font-family:'Cormorant Garamond',serif;font-size:24px;color:${accent};margin:0 auto 22px}
+.eyebrow{font-size:11px;letter-spacing:.34em;text-transform:uppercase;color:#8A99A8;margin-bottom:20px}
+h1{font-family:'Cormorant Garamond',serif;font-weight:500;font-size:40px;line-height:1.1;margin-bottom:6px}
+.rule{width:60px;height:2px;background:${accent};margin:22px auto}
+.body{font-size:15.5px;color:#5B6B7B;max-width:480px;margin:0 auto;line-height:1.75}
+.body b{color:#16202B;font-weight:500}
+.big{font-family:'Cormorant Garamond',serif;font-style:italic;font-size:26px;color:${accent};margin:20px 0}
+.date{font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:#8A99A8;margin-top:30px}
+.sig{font-family:'Cormorant Garamond',serif;font-style:italic;font-size:18px;margin-top:26px}
+.sig small{display:block;font-family:'Karla',sans-serif;font-style:normal;font-size:10.5px;letter-spacing:.2em;text-transform:uppercase;color:#8A99A8;margin-top:6px}
+.printbtn{position:fixed;top:18px;right:18px;background:#0B1D33;color:#fff;border:0;border-radius:99px;padding:11px 22px;font-size:13px;cursor:pointer}
+@media print{.printbtn{display:none}body{background:#fff;padding:0}.cert{box-shadow:none;border:0}}
+</style></head><body>
+<button class="printbtn" onclick="window.print()">Print / save</button>
+<div class="cert">
+  <div class="crest">${(biz).slice(0, 1)}</div>
+  <div class="eyebrow">Certificate of Achievement</div>
+  <h1>${biz}</h1>
+  <div class="rule"></div>
+  <p class="body">has earned a place on <b>Page One of Google</b> — not through advertising, but through a website and search presence strong enough that Google itself put it there${kw ? ' for the search' : ''}.</p>
+  ${kw ? `<div class="big">"${kw}"</div>` : ''}
+  <div class="date">Verified · ${when}</div>
+  <p class="sig">The ConversionCo Team<small>conversionco918.com</small></p>
+</div>
+</body></html>`);
+});
+
+// Render a stored report inside the portal (proxied from GitHub)
+app.get('/portal/:id/:token/report/:name', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'portal', id)) return c.text('not found', 404);
+  const name = c.req.param('name');
+  if (!/^[\w.-]+\.html$/.test(name)) return c.text('bad name', 400);
+  const db = c.env.DB;
+  const slug = await slugForClient(db, id);
+  if (!slug || !c.env.GITHUB_TOKEN) return c.text('no reports', 404);
+  const settings = await getSettings(db);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  const r = await fetch(`https://api.github.com/repos/${repo}/contents/reports/${slug}/${name}`, {
+    headers: { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' } });
+  if (!r.ok) return c.text('report not found', 404);
+  const data = await r.json();
+  const html = decodeURIComponent(escape(atob((data.content || '').replace(/\n/g, ''))));
+  return c.html(html);
+});
+
+// Pitch page: personalized pre-proposal generated from Intake 1
+app.get('/pitch/:id/:token', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'pitch', id)) return c.text('not found', 404);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.text('not found', 404);
+  let i1 = {}; try { i1 = JSON.parse(client.intake1_data || '{}'); } catch {}
+  const biz = client.business_name || i1['Business Name'] || client.name || 'Your IV Bar';
+  const loc = (i1['Location'] || 'your city').split(',')[0];
+  const { tokens } = vibeToTokens(client.vibe || 'warm luxury elegant');
+  const t = tokens;
+  const settings = await getSettings(db);
+  const drips = [['Hydration', '#5BC8D8'], ['Recovery', '#E8873A'], ['Glow', '#E88BA5']];
+  return c.html(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex"><title>A website for ${biz} — ConversionCo</title>
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;1,400&family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
+<style>
+  *{box-sizing:border-box;margin:0}body{font-family:'Outfit',sans-serif;background:${t['--porcelain']};color:${t['--espresso']};line-height:1.65}
+  .hero{background:${t['--night']};color:${t['--porcelain']};padding:90px 20px 70px;text-align:center}
+  .eyebrow{font-size:11px;letter-spacing:.3em;text-transform:uppercase;color:${t['--gold-soft']}}
+  h1{font-family:'Cormorant Garamond',serif;font-size:clamp(44px,9vw,84px);font-weight:400;margin:16px 0 8px}
+  h1 em{font-style:italic;color:${t['--gold-soft']}}
+  .hero p{color:${t['--taupe']};max-width:46ch;margin:0 auto}
+  .wrap{max-width:860px;margin:0 auto;padding:56px 20px}
+  .drips{display:flex;gap:18px;justify-content:center;flex-wrap:wrap;margin:-40px auto 0;position:relative}
+  .drip{background:${t['--night']};border-radius:14px;padding:26px 20px;width:150px;text-align:center;color:${t['--porcelain']};box-shadow:0 18px 40px rgba(0,0,0,.25)}
+  .bag{width:44px;height:64px;border-radius:10px 10px 14px 14px;margin:0 auto 12px;position:relative}
+  .drip span{font-family:'Cormorant Garamond',serif;font-size:17px}
+  h2{font-family:'Cormorant Garamond',serif;font-size:clamp(28px,5vw,40px);font-weight:400;text-align:center;margin-bottom:10px}
+  .sub{text-align:center;color:${t['--cocoa']};max-width:52ch;margin:0 auto 36px}
+  .pk{display:flex;gap:18px;flex-wrap:wrap;justify-content:center}
+  .p{background:#fff;border:1px solid ${t['--bone']};border-radius:16px;padding:30px;width:300px}
+  .p h3{font-family:'Cormorant Garamond',serif;font-size:24px}.p .pr{font-size:38px;font-weight:600;margin:8px 0}
+  .p ul{padding-left:18px;color:${t['--cocoa']};font-size:14px;margin:12px 0}
+  .p.best{border:2px solid ${t['--gold']};position:relative}
+  .p.best::before{content:"MOST POPULAR";position:absolute;top:-11px;left:50%;transform:translateX(-50%);background:${t['--gold']};color:#fff;font-size:10px;letter-spacing:.15em;padding:4px 12px;border-radius:99px}
+  .cta{text-align:center;background:${t['--night']};color:${t['--porcelain']};padding:60px 20px;margin-top:56px}
+  .btn{display:inline-block;background:${t['--gold']};color:${t['--night']};font-weight:600;padding:16px 34px;border-radius:10px;text-decoration:none;margin-top:14px}
+  .foot{text-align:center;font-size:12px;color:${t['--taupe']};padding:26px}
+</style></head><body>
+  <div class="hero"><span class="eyebrow">Prepared exclusively for</span><h1>${biz.replace(/ IV| Iv/, ' <em>IV</em>')}</h1>
+  <p>A glimpse of the website we'd build for you — luxury design, glowing drip menu, and Google-ready from day one, serving ${loc}.</p></div>
+  <div class="drips">${drips.map(([n, col]) => `<div class="drip"><div class="bag" style="background:radial-gradient(ellipse at 50% 35%, ${col}, ${col}66);box-shadow:0 0 28px ${col}88"></div><span>The ${n}</span></div>`).join('')}</div>
+  <div class="wrap"><h2>Two ways to start</h2><p class="sub">Both include custom luxury design, mobile-first build, booking integration, and full search-engine setup — reviewed with you before anything goes live.</p>
+  <div class="pk">
+    <div class="p"><h3>Standard</h3><div class="pr">$649</div><ul><li>6-page custom website</li><li>Glowing IV drip menu</li><li>Booking built in</li><li>Full SEO foundation</li><li>Monthly performance report</li></ul></div>
+    <div class="p best"><h3>Premium</h3><div class="pr">$999</div><ul><li>Everything in Standard</li><li>A landing page for every drip</li><li>City pages for local Google</li><li>Weekly SEO blog — written for you</li><li>Weekly performance report</li></ul></div>
+  </div>
+  <p class="sub" style="margin-top:26px"><b>Simple, fair payments:</b> 50% to begin, 50% only when your finished website is delivered — you never pay in full for something you haven't seen.</p>
+  <p class="sub" style="margin-top:10px">+ $99/month Care &amp; Hosting Plan — 24/7 uptime monitoring, your live client portal, Google rank tracking, and updates. Starts only when your site is live.</p></div>
+  <div class="cta"><h2 style="color:inherit">Ready when you are, ${(client.name || 'friend').split(' ')[0]}.</h2>
+  <p style="opacity:.75">Grab a time and we'll walk through it together.</p>
+  ${settings.booking_link ? `<a class="btn" href="${settings.booking_link}">Book your call</a>` : ''}</div>
+  <div class="foot">Crafted by ConversionCo · conversionco918.com</div>
+</body></html>`);
+});
+
+// GBP concierge: a beautiful tokenized walkthrough so saying yes to the Google
+// Business Profile is effortless (the biggest unlock in the score).
+app.get('/gbp/:id/:token', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'gbp', id)) return c.text('not found', 404);
+  const client = await c.env.DB.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.text('not found', 404);
+  const biz = client.business_name || client.name || 'Your Business';
+  let city = '';
+  try { const i1 = JSON.parse(client.intake1_data || '{}'); city = i1['Primary City & State'] || ''; } catch {}
+  const steps = [
+    ['Go to Google', `On your phone, open <b>google.com/business</b> and sign in with the Google account you use for ${biz}.`],
+    ['Add your business', `Tap <b>Add your business</b> and type it exactly like this: <b>${biz}</b>${city ? ` — ${city}` : ''}. Consistent spelling matters to Google.`],
+    ['Pick your category', `Choose <b>“IV therapy service”</b> (or the closest match). You can add more categories later — we'll tell you which.`],
+    ['Location & hours', `If clients come to you, enter your address. If you travel to them, choose “I deliver goods and services” and set your service area${city ? ` around ${city}` : ''}. Add your real hours.`],
+    ['Phone & website', `Use the same phone number that's on your website, and your website address — matching details are a ranking signal.`],
+    ['Verify', `Google will offer a verification method (video, phone, or postcard). Do it right away — nothing counts until you're verified.`],
+  ];
+  return c.html(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex"><title>Google setup — ${biz}</title>
+<style>body{font-family:-apple-system,'Segoe UI',sans-serif;background:#FBFAF7;color:#16202B;margin:0;padding:0 0 60px;line-height:1.65}
+.wrap{max-width:640px;margin:0 auto;padding:0 20px}.hero{background:#0B1D33;color:#fff;padding:44px 0 36px}
+.hero .wrap p{opacity:.8}.hero h1{font-size:clamp(24px,6vw,32px);margin:8px 0 6px}
+.eyebrow{font-size:11px;letter-spacing:.22em;text-transform:uppercase;color:#C9A254;font-weight:600}
+.step{background:#fff;border:1px solid #E7E3DA;border-radius:14px;padding:20px 22px;margin-top:14px;display:flex;gap:16px}
+.n{width:34px;height:34px;border-radius:50%;background:#0B1D33;color:#C9A254;display:flex;align-items:center;justify-content:center;font-weight:600;flex:0 0 34px}
+.step h3{margin:2px 0 6px;font-size:16px}.step p{margin:0;font-size:14.5px;color:#5B6B7B}
+.done{background:#fff;border:1px solid #C9A254;border-radius:14px;padding:22px;margin-top:26px;text-align:center}
+.done b{font-size:16px}.done p{color:#5B6B7B;font-size:14px;margin:8px 0 0}
+.foot{text-align:center;color:#8A99A8;font-size:12px;margin-top:30px}</style></head><body>
+<div class="hero"><div class="wrap"><span class="eyebrow">15 minutes · we're with you</span>
+<h1>Put ${biz} on Google Maps</h1>
+<p>This is the single biggest step for showing up when locals search. Six steps — do them in order, and reply to any of our emails if you get stuck on one.</p></div></div>
+<div class="wrap">
+${steps.map((s, i) => `<div class="step"><div class="n">${i + 1}</div><div><h3>${s[0]}</h3><p>${s[1]}</p></div></div>`).join('')}
+<div class="done"><b>Done? Tell us. 🎉</b><p>Reply to any ConversionCo email with the word <b>“verified”</b> — we take it from there: photos, services, your review link, and wiring it to your website. Your score jumps the moment it's live.</p></div>
+<div class="foot">Prepared for ${biz} by ConversionCo · conversionco918.com</div>
+</div></body></html>`);
+});
+
+// Lead capture from client sites (public, CORS)
+app.options('/lead/:slug', (c) => { corsHeaders(c); return c.body(null, 204); });
+app.post('/lead/:slug', async (c) => {
+  corsHeaders(c);
+  const slug = c.req.param('slug');
+  const db = c.env.DB;
+  let f = {}; try { f = await c.req.json(); } catch { try { f = Object.fromEntries(Object.entries(await c.req.parseBody()).map(([k, v]) => [k, String(v)])); } catch {} }
+  // 🧪 QA marker: proves the form → worker → client mapping WITHOUT creating a
+  // lead or sending any email. Builders/tests submit name "__qa-test".
+  if (String(f.name || '') === '__qa-test' || f._qa) {
+    const metaQ = await db.prepare(`SELECT content FROM site_files WHERE slug=? AND path='site-meta.json'`).bind(slug).first();
+    let cidQ = null; try { cidQ = JSON.parse(metaQ?.content || '{}').client_id ?? null; } catch {}
+    return c.json({ ok: true, qa: true, slugKnown: !!metaQ, mapped: cidQ != null, client_id: cidQ });
+  }
+  // 🛡 spam shields — both answer "ok" so bots learn nothing:
+  // 1. honeypot: forms carry a hidden "website" field humans never see; bots fill it
+  if (String(f.website || f._hp || '').trim()) return c.json({ ok: true });
+  // 2. rate limit: max 5 submissions per hour per visitor per site
+  const ipL = c.req.header('CF-Connecting-IP') || 'noip';
+  if (!(await rlOk(db, `lead:${slug}:${ipL}`, 5, 3600))) return c.json({ ok: true });
+  const meta = await db.prepare(`SELECT content FROM site_files WHERE slug=? AND path='site-meta.json'`).bind(slug).first();
+  let clientId = null; try { clientId = JSON.parse(meta?.content || '{}').client_id ?? null; } catch {}
+  // lead-source tag: explicit field (utm/?s= from the form) beats referrer sniffing
+  let source = String(f.src || f.source || '').slice(0, 60).trim();
+  if (!source) {
+    const ref = String(c.req.header('Referer') || '');
+    if (/[?&](utm_source|s)=/i.test(ref)) source = decodeURIComponent((ref.match(/[?&](?:utm_source|s)=([^&]+)/i) || [])[1] || '').slice(0, 60);
+    else if (ref) source = 'website';
+  }
+  if (!source) source = 'direct';
+  await db.prepare(`INSERT INTO leads (client_id, slug, name, email, phone, message, source) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .bind(clientId, slug, String(f.name || '').slice(0, 120), String(f.email || '').slice(0, 160), String(f.phone || '').slice(0, 40), String(f.message || '').slice(0, 1500), source).run();
+  await logEvent(db, clientId, 'lead_received', `🔥 New lead on ${slug} (via ${source}): ${f.name || 'no name'} ${f.phone || f.email || ''}`);
+  // 📨 FORWARD EVERY LEAD TO THE CLIENT INSTANTLY — the lead is the product; it
+  // should reach the nurse's inbox in seconds, not sit in the portal unseen.
+  if (clientId) {
+    const clientFwd = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(clientId).first();
+    if (clientFwd && clientFwd.email) {
+      const settingsFwd = await getSettings(db);
+      const escF = (s) => String(s || '').replace(/[<>&]/g, '');
+      const firstFwd = (clientFwd.name || '').split(' ')[0] || 'there';
+      const purlFwd = `${BASE_URL}/portal/${clientId}/${await portalToken(c.env, 'portal', clientId)}`;
+      const nmF = escF(f.name) || 'Someone';
+      const phF = escF(f.phone); const emF = escF(f.email); const msgF = escF(String(f.message || '').slice(0, 800));
+      c.executionCtx.waitUntil(emailClient(c.env, db, clientFwd, settingsFwd,
+        `🔥 New inquiry from your website — ${nmF}`,
+        `<p>${firstFwd} — someone just reached out through your website:</p>
+<p style="font-size:17px"><b>${nmF}</b>${phF ? ` · <a href="tel:${phF}">${phF}</a>` : ''}${emF ? ` · <a href="mailto:${emF}">${emF}</a>` : ''}</p>
+${msgF ? `<blockquote style="border-left:3px solid #C9A254;padding-left:12px;color:#444">${msgF}</blockquote>` : ''}
+<p>Reaching out while it's warm makes all the difference — most people book with whoever answers first.</p>
+<p>When they book, tap <b>Booked ✓</b> next to their name in your portal so your reports count the real revenue:</p>
+<p><a href="${purlFwd}">${purlFwd}</a></p>
+<p>— The ConversionCo Team</p>`,
+        'lead_forwarded', `📨 Lead forwarded to ${clientFwd.email} in real time (${nmF})`));
+    }
+  }
+  // 🎉 FIRST-LEAD CELEBRATION: the moment their website earns its first potential customer
+  if (clientId) {
+    const n = (await db.prepare('SELECT COUNT(*) AS n FROM leads WHERE client_id = ?').bind(clientId).first())?.n || 0;
+    if (n === 1) {
+      const clientRow = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(clientId).first();
+      const settingsC = await getSettings(db);
+      const firstC = (clientRow?.name || '').split(' ')[0] || 'there';
+      const purl = `${BASE_URL}/portal/${clientId}/${await portalToken(c.env, 'portal', clientId)}`;
+      c.executionCtx.waitUntil(emailClient(c.env, db, clientRow, settingsC,
+        `It happened — your first lead 🎉`,
+        `<p>${firstC} — it happened.</p>
+<p>Your website just brought you its <b>first potential customer</b>. A real person found you, liked what they saw, and reached out — all on their own.</p>
+<p>Their details are in your portal (and in the email we just sent you):</p><p><a href="${purl}">${purl}</a></p>
+<p>The first one is the hardest. From here, it compounds.</p><p>— The ConversionCo Team</p>`,
+        'first_lead_celebrated', '🎉 First-lead celebration email sent'));
+    }
+  }
+  const settings = await getSettings(db);
+  if (settings.notify_email && c.env.GHL_TOKEN && settings.ghl_location_id) {
+    try {
+      const ghl = ghlFor(c.env, settings);
+      const contact = await ghl.upsertContact({ email: settings.notify_email, name: 'ConversionCo Notifications' });
+      await ghl.sendEmail({ contactId: contact.id || contact.contactId,
+        subject: `🔥 New lead for ${slug}: ${f.name || 'someone'}`,
+        html: `<p><b>${f.name || ''}</b> · ${f.phone || ''} · ${f.email || ''}</p><p>${String(f.message || '').slice(0, 600)}</p><p>Site: ${slug}</p>`,
+        emailFrom: settings.email_from || undefined });
+    } catch {}
+  }
+  return c.json({ ok: true });
+});
+
+// 🔎 Visitor counting for sites we DON'T host: one line pasted into their site —
+// <script defer src="<BASE>/t/<clientId>/t.js"></script> — sends a 1px beacon per
+// page view into the same hits table (slug ext-<id>), bot-filtered like /preview.
+app.get('/t/:id/t.js', (c) => {
+  const id = Number(c.req.param('id')) || 0;
+  const js = "(function(){try{var p=encodeURIComponent(location.pathname||'/');(new Image()).src='" + BASE_URL + "/t/" + id + "/p.gif?p='+p+'&r='+Date.now();}catch(e){}})();";
+  return c.body(js, 200, { 'Content-Type': 'application/javascript', 'Cache-Control': 'public, max-age=86400', 'Access-Control-Allow-Origin': '*' });
+});
+app.get('/t/:id/p.gif', async (c) => {
+  const id = Number(c.req.param('id')) || 0;
+  const GIF = Uint8Array.from(atob('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'), (ch) => ch.charCodeAt(0));
+  const gifHeaders = { 'Content-Type': 'image/gif', 'Cache-Control': 'no-store, private' };
+  const ua = c.req.header('User-Agent') || '';
+  if (!id || !ua || /bot|crawl|spider|slurp|headless|preview|monitor|lighthouse|pingdom/i.test(ua)) return c.body(GIF, 200, gifHeaders);
+  let p = String(c.req.query('p') || '/');
+  try { p = decodeURIComponent(p); } catch {}
+  p = p.replace(/^\/+/, '').replace(/\/$/, '').slice(0, 80) || 'index.html';
+  const day = new Date().toISOString().slice(0, 10);
+  c.executionCtx.waitUntil(c.env.DB.prepare(`INSERT INTO hits (slug, day, path, n) VALUES (?, ?, ?, 1)
+    ON CONFLICT(slug, day, path) DO UPDATE SET n = n + 1`).bind(`ext-${id}`, day, p).run());
+  return c.body(GIF, 200, gifHeaders);
+});
+
+// Quiz beacon: which-drip quiz taps → market-demand counters (no PII, bot-filtered).
+// Sites call GET /qz/<slug>/<state> (state = short token like wrecked/sick/depleted/longgame).
+app.get('/qz/:slug/:state', async (c) => {
+  const GIF = Uint8Array.from(atob('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'), (ch) => ch.charCodeAt(0));
+  const gifHeaders = { 'Content-Type': 'image/gif', 'Cache-Control': 'no-store, private', 'Access-Control-Allow-Origin': '*' };
+  const ua = c.req.header('User-Agent') || '';
+  const slug = String(c.req.param('slug') || '').replace(/[^a-z0-9-]/gi, '').slice(0, 60);
+  const state = String(c.req.param('state') || '').replace(/[^a-z0-9-]/gi, '').slice(0, 30);
+  if (!slug || !state || !ua || /bot|crawl|spider|slurp|headless|preview|monitor|lighthouse|pingdom/i.test(ua)) return c.body(GIF, 200, gifHeaders);
+  // admin sessions never count (same true-data gate as visits)
+  if (await checkSession(c.env, c.req.header('Cookie'))) return c.body(GIF, 200, gifHeaders);
+  c.executionCtx.waitUntil((async () => {
+    const db = c.env.DB;
+    let counts = {}; try { counts = JSON.parse((await db.prepare('SELECT value FROM settings WHERE key = ?').bind(`qz_${slug}`).first())?.value || '{}'); } catch {}
+    counts[state] = (counts[state] || 0) + 1;
+    await setSetting(db, `qz_${slug}`, JSON.stringify(counts));
+  })());
+  return c.body(GIF, 200, gifHeaders);
+});
+
+// Keyed: lead-form mapping proof for headless builders (GET — they can't POST).
+// Same truth as the __qa-test marker: does this slug accept leads for a client?
+app.get('/api/lead-qa/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const slug = String(c.req.query('slug') || '');
+  if (!slug) return c.json({ ok: false, error: 'slug required' });
+  const meta = await c.env.DB.prepare(`SELECT content FROM site_files WHERE slug=? AND path='site-meta.json'`).bind(slug).first();
+  let cid = null; try { cid = JSON.parse(meta?.content || '{}').client_id ?? null; } catch {}
+  return c.json({ ok: true, slugKnown: !!meta, mapped: cid != null, client_id: cid,
+    note: meta ? (cid != null ? 'form submissions will reach this client' : 'site imported but site-meta has no client_id — leads would be ORPHANED') : 'slug not imported yet — publishes on the next auto-publish cycle' });
+});
+
+// Keyed: Cloudflare token health — identity + zone visibility (read-only)
+app.get('/api/cf-check/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  if (!c.env.CLOUDFLARE_API_TOKEN) return c.json({ ok: false, error: 'no token set' });
+  const cfGet = async (p) => {
+    const res = await fetch(`https://api.cloudflare.com/client/v4${p}`, {
+      headers: { Authorization: `Bearer ${c.env.CLOUDFLARE_API_TOKEN}` } });
+    return res.json().catch(() => ({}));
+  };
+  try {
+    const verify = await cfGet('/user/tokens/verify');
+    const accounts = await cfGet('/accounts');
+    const zones = await cfGet('/zones?per_page=50');
+    return c.json({
+      ok: true,
+      tokenId: verify && verify.result ? verify.result.id : null,
+      tokenStatus: verify && verify.result ? verify.result.status : (verify.errors ? JSON.stringify(verify.errors).slice(0, 150) : 'unknown'),
+      accounts: accounts && accounts.success ? (accounts.result || []).map((a) => ({ name: a.name, id: a.id })) : 'cannot list',
+      zones: zones && zones.success ? (zones.result || []).map((z) => ({ name: z.name, status: z.status, account: z.account && z.account.name })) : 'cannot list: ' + JSON.stringify(zones.errors || []).slice(0, 150),
+    });
+  } catch (e) { return c.json({ ok: false, error: String(e.message).slice(0, 150) }); }
+});
+
+// 🎯 Keyed: the PROSPECTOR drops hunted businesses here (GET — headless sessions
+// can only WebFetch). Dedupes hard, stores honest evidence + an outreach draft
+// Tiffany approves and sends HERSELF. The demo builder picks the prospect up on
+// its normal cycle. Nothing here ever emails the business directly.
+app.get('/api/add-prospect/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const db = c.env.DB;
+  const q = c.req.query();
+  const biz = String(q.biz || '').trim().slice(0, 120);
+  const cty = String(q.city || '').trim().slice(0, 80);
+  const vertical = String(q.vertical || 'iv-therapy').trim().slice(0, 40);
+  const email = String(q.email || '').trim().slice(0, 160); // ONLY a publicly published address — never guessed
+  const site = String(q.site || '').trim().slice(0, 200);
+  const evidence = String(q.evidence || '').trim().slice(0, 500);
+  const draft = String(q.draft || '').trim().slice(0, 1800);
+  if (!biz || !cty) return c.json({ ok: false, error: 'biz + city required' }, 400);
+  // hard dedupe: same business name (loose match) anywhere in the pipeline
+  const dupe = await db.prepare(`SELECT id, stage FROM clients WHERE LOWER(REPLACE(business_name,' ','')) = ?`)
+    .bind(biz.toLowerCase().replace(/ /g, '')).first();
+  if (dupe) return c.json({ ok: false, skipped: true, reason: `already in pipeline (id ${dupe.id}, ${dupe.stage})` });
+  const placeholderEmail = email || `prospect+${biz.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40)}@conversionco918.com`;
+  const existing = await db.prepare('SELECT id FROM clients WHERE email = ?').bind(placeholderEmail).first();
+  if (existing) return c.json({ ok: false, skipped: true, reason: 'email already in pipeline' });
+  const intake1 = JSON.stringify({
+    'Business Name': biz, 'Contact Name': '', 'Email': placeholderEmail,
+    'Primary City & State': cty,
+    'Services Offered': vertical === 'med-spa' ? 'Med spa treatments' : vertical === 'injector' ? 'Botox & filler' : vertical === 'lash-brow' ? 'Lashes & brows' : vertical === 'weight-loss' ? 'Medical weight loss' : 'IV therapy',
+    '_prospect': true, '_hunted': true, '_vertical': vertical,
+    '_their_site': site, '_evidence': evidence, '_created': new Date().toISOString(),
+  });
+  const r = await db.prepare(`INSERT INTO clients (email, name, business_name, stage, vertical, intake1_data) VALUES (?, '', ?, 'prospect', ?, ?)`)
+    .bind(placeholderEmail, biz, vertical, intake1).run();
+  const id = r.meta.last_row_id;
+  if (draft) await setSetting(db, `outreach_${id}`, draft);
+  await logEvent(db, id, 'prospect_created', `🎯 Hunted prospect: ${biz} (${cty}, ${vertical})${evidence ? ` — ${evidence.slice(0, 90)}` : ''} — demo queued${draft ? ' + outreach drafted' : ''}`);
+  return c.json({ ok: true, id });
+});
+
+// Keyed: read/update an outreach draft (also readable by the dashboard)
+app.get('/api/outreach/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const id = Number(c.req.query('id'));
+  if (!id) return c.json({ ok: false, error: 'id required' });
+  const settings = await getSettings(c.env.DB);
+  const set = c.req.query('draft');
+  if (set !== undefined) { await setSetting(c.env.DB, `outreach_${id}`, String(set).slice(0, 1800)); return c.json({ ok: true }); }
+  return c.json({ ok: true, draft: settings[`outreach_${id}`] || '' });
+});
+
+// Keyed: run the nightly backup on demand (verification / before risky changes)
+app.get('/api/backup-now/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const out = await backupDatabase(c.env);
+  return c.json(out);
+});
+
+// Keyed: one-line owner alert — lets the engines (and reminders) email Tiffany
+app.get('/api/notify-owner/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const subject = String(c.req.query('subject') || '').slice(0, 150);
+  const msg = String(c.req.query('msg') || '').slice(0, 2000);
+  if (!subject) return c.json({ ok: false, error: 'subject required' });
+  const settings = await getSettings(c.env.DB);
+  const ok = await notifyOwner(c.env, settings, subject, `<p>${msg.replace(/[<>&]/g, '')}</p>`);
+  return c.json({ ok });
+});
+
+// Public portfolio feed (for the ConversionCo showcase page)
+app.get('/portfolio.json', async (c) => {
+  const db = c.env.DB;
+  const clients = (await db.prepare(`SELECT * FROM clients WHERE stage IN ('preview_ready','live')`).all()).results || [];
+  const settings = await getSettings(db);
+  const out = [];
+  for (const cl of clients) {
+    // approval gate: held previews stay out of the public portfolio too
+    let bP = {}; try { bP = JSON.parse(cl.billing || '{}'); } catch {}
+    if (cl.stage === 'preview_ready' && bP.preview_hold && !bP.preview_approved) continue;
+    const score = await computeScore(db, cl, settings).catch(() => null);
+    let up = null; try { up = JSON.parse(settings[`uptime_${cl.id}`] || 'null'); } catch {}
+    out.push({ business: cl.business_name || cl.name, url: cl.live_url || cl.preview_url,
+      tier: cl.tier || 'standard', score: score?.total ?? null, pages: score?.pages?.total ?? null,
+      uptimePct: up && up.total ? Math.round(100 * (up.total - (up.fails || 0)) / up.total) : null });
+  }
+  c.header('Access-Control-Allow-Origin', '*');
+  return c.json({ sites: out });
+});
+
+// ---- PWA: installable Mission Control (public routes — manifest fetches lack cookies) ----
+const ICON192 = 'iVBORw0KGgoAAAANSUhEUgAAAMAAAADACAIAAADdvvtQAAADiUlEQVR42u3dy03kQBRA0cZCIohZEQP7yYsIyItEJhUWSAgJGMqu/3vnrmfcbuq4XO6f7x7+PN2kqx3+BAJIAAkgASQBJIAEkACSABJAAkgASQAJIAEkgCSABJAAEkACSAJIAAkgASQBJIAEkACSABJAAkgASQAJIAEkgASQdLV7f4LPvb48lvyzv8///K3eu/ND44VoYAKopRuSkgJq7ia5pESABtBJyCgFoMF0UjGKD+isnl+HvPkGAUp9TZ78yj8soJJxbTiogx8OoJl6ug7kxIcGKM745WF00DP+4mviVaEZ6Mqo1NB5fXms/O+x56GDnl83WzNh/OfRY8xDwT/OscJRHvt1oAiAfjqUG77A0+kd+wCT0EHP3Hlod0MHPYVbrh/pkIYCroFWXnPEWw9tDOjbA7fJCP00JTSZKr7dw30noYOeReahTQ35Vsa5gYz0InJeQFtPP8EmoSAzUCs9JUPYapi9lbHiKSb2CRSg7acfk5BFtBID6jfDn93yOnsCUOqzwO777xR2/aD3mtBmgL4OWNc3LoYZ+vosNqJpBhJAU1esyU9kZiDlANTjQG+1zZX3DaCwF8AxnkveU1jbQzztSsgaSABZtQC0u560hg56GAJIAIWYfhJOQmYgASSAgp1Z8pzFDiA8lxSAst3KZJfnaw0kgASQAJqwLIixju70ZQGABJAL4Oj7vxmgmrl9nVsdxLiAdwoTQJufBfzQuLNY6vPXLcPNVuwzQEWH6SL3Li3cfoDfCc27iO43Ttne8d0YUOXP5PYY6fJthpl+bvG+2jzLUE49MU9h4w1V6nEKW241M9JQvZ6tV05hf2RzjKHkem5h7trcZHhOnV+abDnAVdt97IvMUzft/viXbe8BHfsbGu4bn3GvALpyrA8esKV2xiK6wbpknS8WRnrBOtQMtML45aETGVDhfNNwOAc/HECrGKof10U+BQDQZEblI918gwBFMzRsXQ8QRnnppAM0jFGqj5WlA9RPUsKPI6YG1EpSTjcAuSYHSAvkq80CSAAJIAEkASSABJAAkgASQAJIAEkACSABpDhN/nmXVLdY79Tcj0eagQSQABJAyphvZcgMJIAEkACSABJAAkgASQAJIAEkgCSABJAAEkASQAJIAAkgASQBJIAEkACSABJAAkgASQAJIAEkgCSABJAAEkACSAJIAAkgASQBJIAEkACSABJAWrQ32LZxEm35/n4AAAAASUVORK5CYII=';
+const ICON512 = 'iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAIAAAB7GkOtAAAJ70lEQVR42u3dy20bSxCGUdEQwCC4UgzcMy9GoLyUCFPx3oYfmmdV/efsL8DuoevrHgm6l+vt/gZAnh+2AEAAABAAAAQAAAEAQAAAEAAABAAAAQBAAAAQAAAEAAABAEAAABAAAAQAAAEAQAAAEAAABAAAAQBAAAAQAAAEAEAAABAAAAQAAAEAQAAAEAAABAAAAQBAAAAQAAAEAAABAEAAABAAAAQAAAEAQAAAEAAABAAAAQBAAAAQAAAEAEAAABAAAAQAAAEAQAAAEAAABAAAAQBAAAAQAAAEAAABAEAAABAAAAQAAAEAQAAAEAAABAAAAQBAAAAQAAAEAAABABAAAAQAAAEAQAAAEAAABAAAAQBAAAAQAAAEAAABAEAAABAAAAQAAAEAQAAAEAAABAAAAQBAAAAQAAAEAAABABAAAAQAAAEAQAAAEAAABAAAAQBAAAAQAAAEAAABAEAAABAAAI72bguY7evzY81//ni+7CFTXa63u13ArFcFBABMfD1AAMDE1wMEAMx9JUAAwNxXAgQAzH0lQADA3FcCBACMfhlAAMDcVwIEAIx+GUAAMPqRAQQAox8ZQAAw+pEBDubPQWP62z3cAMDwchVAAGDS6F88PccsBASA+dP/gBE5foEIAPSYjKcPxMxVIwBwzhwsO/5sAgKA6Z8+8mwIAoDRnz7m7A8CgOkfPdpsFAKA6Z8+zmwaAoApFj3FbCACgOEVPbnsJAJA+swKH1i2FAEgcVSZU/YWASBuQhlPNpkK/DloDKYqtt0Zf40VNwAKzRGj354jAMRNosp/vWf8XxbSAP7EKyCip/9b4VclW+2bd0EIAKZ/PxrArrwCYq95UXz0/7LGXp9WjHEDwKxxFXAPQAAw/dcts/5w1AAEgNLT//F8Ofvv2oD126sBCAC7TP/WK+0yGTUAAcD0j74KaAACwJB5VCR1jcai4iIAnH/8N4maNsAlAAEw/YOm//8sttdY1AAEANPfPUADEACazJ3KtWs3E5UYAeC4o5+JM6kBLgECgOk/efp/d70dZ6IGIACY/u4BGoAAUGm+tAte04Go0AgADnr4biAAbPQvPOr4H3sJ0AABgCHT3/MCAWDV4a7vNFl/nu17Il781FwCBAAAAcDxP/X47xKAAGD6505/DUAASOQHiZ4jAkDo8d+SbaN/PgKAYyOeJgKAQ1zwkm0mAoADI54pAsDE41vrSbH3ibX1iXjZk3UJEAAABADH/9Tjv0sAAgCAADCL479LAAJAe+7s+EYhADj+G4guAQiAwxr4XiEAOP67BPjaIwAAAkDqPd3x3yUgYb0IAAACQOR1xyUABMBAXP4egDG8BRIAcPx3CUAAcADEdwABwInYYm2+xQoAGEDGIgKAuz++CQgAjp9W6ikgAAAIAG792QfPpkdjb4EEAAABAIfrsEsAAoDJCL51AsBcHV/49ho3HYejHwMIAAACAA7UYZ8ZAQBAAHDStECPxi1HABjDz/rw3UAAcMb0+REAAAQAHJ+tAgEAQADAwdlaEABMFvANFAD66fJ7fvPGSpcV+U1QAQCz0roQADAlrQ4BAEAAwAHZGhEAMBmtFAEAM9F6EQAABAAch60aAQBz0NoRAAAEAMd/OwACAIAA4PBrH0AAABAAAASA3rz3sBsIAAACgAOvPQEBwJTBNwQB4G/8H1zxDUQAABAAavOSwc4gAAAIAAACwGzectgfBIDQEeOXRirvj/wIAEaGEWN/5FwAABAAAAQAAAGgJy/i8a1AAIbwszh86xAAAAQAAAHgd1744vuAAAAIAJ35iRy+bwgAbv34JiAAAAiAW7kP6SF6iAgA7v74DiAAAALADAvu5g6Ajv97f8cQAAAEANcU7AwCQIUh4i1QJu9/EAAAAcBhEE8cAaC1+vd0bxI8NQQAR0I8awQAx0nPyydEAHAwxFNGAAAQAA65sx95PPRW4fh9WPZ8PSkBAEAAcAlwCXD8RwAYyc8JPVMEAAdMn9DTQQBwYDRl2q7a8R8BcMwE3xwEAJcAx38EwBYYNxpg+kuyAGDoaIDpb/oLAAACgLOnS4DjPwJALg0Imf4IAE6gGhA6/R3/BQAN8DntOQIAJ10Cxsyjg1fh5Q8CwF4jSQOmTn/H/0CX6+1uFxzn6w+LdgfbXltk+rsB4B5Qdxz3mlCmPwKAC0RiA1yP6MIrIHN81ew4ZSiXnXcdd8Px3w2AXCv//Z8yi2vOLNMfNwDcA+KuAk2Xb/rjBkDjQfx4vs6dYid+AO/9cQOg0EA5/UR52EwcsFLHfwSAgWNl1wzMWKDpjwCw1/SsM18sx/RHADBlvrG01h/e9EcAMGs8EU8EAeC8iWPoeBBU5tdA2Xde+G1F0x8BQAMw/anFKyCOG98mkT1HAMidR0aSraYOr4A4eo54I2T64wZA9HgyoewtAkD0nDKqbCkCQPTAypxZdhIBwOSKG142EAHAFIubYjYNAcA4yxpqNgoBQAPippv9QQCQgaxJZ0MQADQga/DZBAQADThOzv+I2PRHAJCBkyfj+AUiANB1RG44NMcsBASA6Ay0ZvQjAMiA0Q+b8eegMb/sHm4A4Cpg9CMAIANGPwIAMmD0IwAgA0Y/AgBKYO4jACADRj8CAEpg7iMAoATmPgIAoSUw9xEAyCqBuY8AQEoPTHwEAFJ6YOIjADC/CmY9AgDANP4cNIAAACAAAAgAAAIAgAAAIAAACAAAAgCAAAAgAAAIAAACAIAAACAAAAgAAAIAgAAAIAAACAAAAgCAAAAgAAAIAIAAACAAAAgAAAIAgAAAIAAACAAAAgCAAAAgAAAIAAACAIAAACAAAAgAAAIAgAAAIAAACAAAAgDAv7zbgm19fX7YBNjJ4/myCW4AAAgAAAIAgAAAIAAACAAAAgAgAABEulxvd7sA4AYAgAAAIAAACAAAAgCAAAAgAAAIAAACAIAAACAAAAgAAAIAgAAAIAAACAAAAgCAAAAgAAAIAAACAIAAACAAAAIAgAAAIAAACAAAAgCAAAAgAAAIAAACAIAAACAAAAgAAAIAgAAAIAAACAAAAgCAAAAgAAAIAAACAIAAACAAAAIAgAAAIAAACAAAAgCAAAAgAAAIAAACAIAAACAAAAgAAAIAgAAAIAAACAAAAgCAAAAgAAAIAAACAIAAACAAAAgAgAAAIAAACAAAAgCAAAAgAAAIAAACAIAAACAAAAgAAAIAgAAAIAAACAAAAgCAAAAgAAAIAAACAIAAACAAAAgAgAAAIAAACAAAAgCAAAAgAAAIAAACAIAAACAAAAgAAAIAgAAAIAAACAAAAgCAAAAgAAAIAAACAIAAACAAAAgAgADYAgABAEAAABAAAAQAAAEAQAAAEAAABAAAAQBAAAAQAAAEAAABAEAAABAAAAQAAAEAYIWfEyHLXsxkRCoAAAAASUVORK5CYII=';
+function b64bytes(b64) { const bin = atob(b64); const a = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i); return a; }
+app.get('/manifest.json', (c) => c.json({
+  name: 'ConversionCo Mission Control', short_name: 'MissionCtrl',
+  start_url: '/', display: 'standalone', background_color: '#071B33', theme_color: '#071B33',
+  icons: [
+    { src: '/icon-192.png', sizes: '192x192', type: 'image/png' },
+    { src: '/icon-512.png', sizes: '512x512', type: 'image/png' },
+  ],
+}));
+app.get('/icon-192.png', (c) => c.body(b64bytes(ICON192), 200, { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=604800' }));
+app.get('/icon-512.png', (c) => c.body(b64bytes(ICON512), 200, { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=604800' }));
+
+// Everything below requires a session
+app.use('*', async (c, next) => {
+  if (await checkSession(c.env, c.req.header('Cookie'))) return next();
+  if (c.req.path.startsWith('/api/')) return c.json({ error: 'unauthorized' }, 401);
+  return c.html(loginHtml.replace('<!--ERROR-->', ''));
+});
+
+app.get('/', (c) => c.html(dashboardHtml));
+
+// ---------------- API: clients ----------------
+// Money + Needs-You + health, computed from data the system already tracks
+async function computeOverview(db, clients, settings) {
+  const signedRows = (await db.prepare('SELECT DISTINCT client_id FROM agreements').all()).results || [];
+  const signed = new Set(signedRows.map((r) => r.client_id));
+  const revFailed = (await db.prepare(`SELECT client_id, request FROM revisions WHERE status='failed' ORDER BY id DESC LIMIT 20`).all()).results || [];
+  const revFailedByClient = {};
+  for (const r of revFailed) (revFailedByClient[r.client_id] = revFailedByClient[r.client_id] || []).push(r.request);
+  const newLeads = (await db.prepare(`SELECT l.*, c.business_name AS cbiz, c.name AS cname FROM leads l LEFT JOIN clients c ON c.id = l.client_id WHERE l.created_at > datetime('now','-2 days') ORDER BY l.id DESC LIMIT 20`).all()).results || [];
+
+  let collected = 0, outstanding = 0, hostingCount = 0, mrrTotal = 0;
+  const needs = [], health = {};
+  const dayMs = 86400000;
+  for (const cl of clients) {
+    if (cl.stage === 'archived') { health[cl.id] = { dot: 'gray', why: 'archived' }; continue; }
+    const label = cl.business_name || cl.name || cl.email;
+    let b = {}; try { b = JSON.parse(cl.billing || '{}'); } catch {}
+    const tierKey = b.invoice_tier || (cl.tier === 'premium' ? 'premium' : 'standard');
+    const amt = PRICES[tierKey].amount / 100, half = amt / 2;
+    if (b.invoice_status === 'paid') collected += amt; // legacy full invoice
+    else {
+      if (b.dep_status === 'paid') collected += half;
+      else if (b.dep_status === 'open') { outstanding += half; needs.push({ id: cl.id, sev: 2, kind: 'invoice', msg: `💳 ${label} — 50% deposit outstanding (${halfDisplay(tierKey)})` }); }
+      if (b.fin_status === 'paid') collected += half;
+      else if (b.fin_status === 'open') { outstanding += half; needs.push({ id: cl.id, sev: 2, kind: 'invoice', msg: `💳 ${label} — final balance outstanding (${halfDisplay(tierKey)})` }); }
+    }
+    if (b.invoice_status === 'open') { outstanding += amt; needs.push({ id: cl.id, sev: 2, kind: 'invoice', msg: `💳 ${label} — invoice outstanding (${PRICES[tierKey].display})` }); }
+    if (b.sub_status === 'active') { hostingCount++; mrrTotal += (PRICES[b.sub_plan] && ['hosting','care199','care399'].includes(b.sub_plan) ? PRICES[b.sub_plan].amount : PRICES.hosting.amount) / 100; }
+
+    let why = [], dot = 'green';
+    let upt = {}; try { upt = JSON.parse(settings[`uptime_${cl.id}`] || '{}'); } catch {}
+    if (upt.last === 'down') { dot = 'red'; why.push('site check failed'); needs.push({ id: cl.id, sev: 1, kind: 'down', msg: `⛔ ${label} — site check FAILED (${upt.how || ''})` }); }
+    if (revFailedByClient[cl.id]) { dot = 'red'; why.push('revision needs attention'); needs.push({ id: cl.id, sev: 1, kind: 'revision', msg: `✏️ ${label} — revision needs attention: "${String(revFailedByClient[cl.id][0]).slice(0, 60)}"` }); }
+    if (b.agr_sent && !signed.has(cl.id)) {
+      const days = Math.floor((Date.now() - Date.parse(b.agr_sent)) / dayMs);
+      if (days >= 2) { if (dot === 'green') dot = 'yellow'; why.push('agreement unsigned'); needs.push({ id: cl.id, sev: 2, kind: 'agreement', msg: `📄 ${label} — agreement unsigned for ${days} day${days === 1 ? '' : 's'} (nudge them)` }); }
+    }
+    if ((b.invoice_status === 'open' || b.dep_status === 'open' || b.fin_status === 'open') && dot === 'green') { dot = 'yellow'; why.push('invoice open'); }
+    if (depositPaid(b) && !cl.intake2_data && !['generating', 'preview_ready', 'live'].includes(cl.stage)) {
+      if (dot === 'green') dot = 'yellow'; why.push('deposit paid — needs Intake 2');
+      if (cl.stage !== 'intake2_sent') needs.push({ id: cl.id, sev: 2, kind: 'intake2', msg: `🚀 ${label} — deposit PAID and ready: send Intake 2 to start their build` });
+    }
+    if (cl.stage === 'intake1_done') needs.push({ id: cl.id, sev: 3, kind: 'call', msg: `📞 ${label} — Intake 1 done, book/hold the pricing call` });
+    if (cl.stage === 'preview_ready' && b.preview_hold && !b.preview_approved) {
+      if (dot === 'green') dot = 'yellow'; why.push('preview held — awaiting your review');
+      needs.push({ id: cl.id, sev: 2, kind: 'preview', msg: `⏸ ${label} — website is BUILT and waiting on you: review the preview, then hit Send` });
+    }
+    health[cl.id] = { dot, why: why.join(' · ') || 'all good' };
+  }
+  for (const l of newLeads) needs.push({ id: l.client_id, sev: 3, kind: 'lead', msg: `🔥 New lead for ${l.cbiz || l.cname || 'client'}: ${l.name || l.email || l.phone || 'someone'} (${ago2(l.created_at)})` });
+  // undelivered client emails — silence here is how clients quietly get lost
+  const emailBad = (await db.prepare(`SELECT client_id, to_email, subject, status FROM email_log WHERE status IN ('failed','dead') AND created_at > datetime('now','-7 days') ORDER BY id DESC LIMIT 10`).all()).results || [];
+  for (const eb of emailBad) needs.push({ id: eb.client_id, sev: eb.status === 'dead' ? 1 : 2, kind: 'email',
+    msg: `📧 ${eb.status === 'dead' ? 'GAVE UP after 4 tries' : 'Delivery failed (auto-retrying)'} — "${String(eb.subject).slice(0, 60)}" to ${eb.to_email}` });
+  needs.sort((a, b2) => a.sev - b2.sev);
+  const buildProgress = {};
+  for (const cl of clients) {
+    if (cl.stage !== 'generating') continue;
+    let prog = {}; try { prog = JSON.parse(settings[`buildprog_${cl.id}`] || '{}'); } catch {}
+    buildProgress[cl.id] = { pct: prog.pct || 5, step: prog.step || 'Build started', started_at: prog.started_at || cl.updated_at,
+      updated_at: prog.updated_at || prog.started_at || cl.updated_at };
+  }
+  return { money: { collected, outstanding, hostingCount, mrr: Math.round(mrrTotal) }, needs: needs.slice(0, 12), health, buildProgress };
+}
+function ago2(iso) { if (!iso) return ''; const m = (Date.now() - Date.parse(iso + (String(iso).includes('Z') ? '' : 'Z'))) / 60000; if (m < 60) return `${Math.max(1, Math.floor(m))}m ago`; if (m < 1440) return `${Math.floor(m / 60)}h ago`; return `${Math.floor(m / 1440)}d ago`; }
+
+app.get('/api/state', async (c) => {
+  const db = c.env.DB;
+  const clients = (await db.prepare('SELECT * FROM clients ORDER BY updated_at DESC').all()).results || [];
+  const events = (await db.prepare(
+    'SELECT e.*, c.name AS client_name, c.email AS client_email FROM events e LEFT JOIN clients c ON c.id = e.client_id ORDER BY e.id DESC LIMIT 50'
+  ).all()).results || [];
+  const settings = await getSettings(db);
+  let overview = null;
+  try { overview = await computeOverview(db, clients, settings); } catch { /* dashboard still renders without it */ }
+  const webhookSecret = (await hmac(c.env.SESSION_SECRET, 'webhook')).slice(0, 16);
+  // personalized pricing-guide link per client (signed, public-safe)
+  for (const cl of clients) {
+    try { cl.guide_url = `${BASE_URL}/guide/${cl.id}/${await portalToken(c.env, 'guide', cl.id)}`; } catch { cl.guide_url = ''; }
+  }
+  // EDIT VISIBILITY: unpublished-edit badges, keyed by slug (editpending_<slug> is
+  // maintained by the edit-watcher cron and cleared by importSite on completion)
+  const edits = [];
+  for (const k of Object.keys(settings)) {
+    if (!k.startsWith('editpending_') || !settings[k]) continue;
+    try { const p = JSON.parse(settings[k]); if (p && p.n) edits.push({ slug: k.slice(12), ...p }); } catch {}
+  }
+  return c.json({ clients, events, settings, overview, edits, webhook_path: `/webhooks/ghl/${webhookSecret}` });
+});
+
+// 📜 SITE ACTIVITY (session-protected): the "what actually happened" page —
+// every edit, publish, import and rollback across all clients, newest first.
+app.get('/activity', async (c) => {
+  const db = c.env.DB;
+  const rows = (await db.prepare(
+    `SELECT e.*, c.business_name AS biz, c.name AS cname FROM events e LEFT JOIN clients c ON c.id = e.client_id
+     WHERE e.type IN ('site_edit','published','auto_published','import_progress','preview_ready','site_rolled_back','revision_done','revision_failed','build_started','demo_ready')
+     ORDER BY e.id DESC LIMIT 300`).all()).results || [];
+  const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const ICON = { site_edit: '📝', published: '✅', auto_published: '🚀', import_progress: '📦', preview_ready: '★', site_rolled_back: '⏪', revision_done: '✅', revision_failed: '⚠️', build_started: '⚙️', demo_ready: '💡' };
+  const LABEL = { site_edit: 'Edited', published: 'Published', auto_published: 'Auto-published', import_progress: 'Importing', preview_ready: 'Preview ready', site_rolled_back: 'Rolled back', revision_done: 'Revision done', revision_failed: 'Revision failed', build_started: 'Build started', demo_ready: 'Demo ready' };
+  const items = rows.map((e) => {
+    const who = e.biz || e.cname || '';
+    return '<div class="ev"><span class="ic">' + (ICON[e.type] || '•') + '</span><div class="body"><div class="top"><b>'
+      + esc(LABEL[e.type] || e.type) + '</b>' + (who ? ' <span class="who">' + esc(who) + '</span>' : '')
+      + '<time>' + esc(ago2(e.created_at)) + ' · ' + esc(String(e.created_at).replace('T', ' ').slice(0, 16)) + ' UTC</time></div>'
+      + '<div class="det">' + esc(e.detail || '') + '</div></div></div>';
+  }).join('');
+  return c.html('<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+    + '<title>Site activity — Mission Control</title><style>'
+    + 'body{font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;background:#f1f5f9;margin:0;color:#0f172a}'
+    + 'header{background:#071B33;color:#fff;padding:14px 24px;display:flex;align-items:center;gap:14px;position:sticky;top:0}'
+    + 'header h1{font-size:16px;margin:0}header a{color:#93c5fd;font-size:13px;text-decoration:none;margin-left:auto}'
+    + 'main{max-width:860px;margin:22px auto;padding:0 16px}'
+    + '.ev{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:12px 16px;margin-bottom:10px;display:flex;gap:12px}'
+    + '.ic{font-size:18px;line-height:1.4}.body{flex:1;min-width:0}'
+    + '.top{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;font-size:13.5px}'
+    + '.who{color:#334155;background:#eef2f7;border-radius:99px;padding:1px 9px;font-size:11.5px}'
+    + 'time{margin-left:auto;color:#94a3b8;font-size:11.5px}'
+    + '.det{color:#475569;font-size:12.5px;margin-top:3px;word-break:break-word}'
+    + '.empty{color:#94a3b8;text-align:center;padding:40px}'
+    + '</style></head><body><header><h1>📜 Site activity</h1><span style="font-size:12px;color:#94a3b8">every edit &amp; publish, newest first</span>'
+    + '<a href="/">&larr; Back to Mission Control</a></header><main>'
+    + (items || '<div class="empty">No edit or publish activity yet — it starts logging from now.</div>')
+    + '</main></body></html>');
+});
+
+// Add client + send Intake 1
+app.post('/api/clients', async (c) => {
+  const db = c.env.DB;
+  const { email, name, sendNow = true } = await c.req.json();
+  if (!email || !/.+@.+\..+/.test(email)) return c.json({ error: 'Valid email required' }, 400);
+
+  const existing = await db.prepare('SELECT * FROM clients WHERE email = ?').bind(email.trim()).first();
+  let clientId = existing?.id;
+  if (!clientId) {
+    const r = await db.prepare('INSERT INTO clients (email, name) VALUES (?, ?)')
+      .bind(email.trim(), name || '').run();
+    clientId = r.meta.last_row_id;
+    await logEvent(db, clientId, 'client_created', email.trim());
+  }
+
+  if (!sendNow) return c.json({ ok: true, id: clientId });
+
+  const settings = await getSettings(db);
+  if (!settings.ghl_location_id) return c.json({ error: 'Set your GHL Location ID in Settings first.' }, 400);
+  const ghl = ghlFor(c.env, settings);
+
+  try {
+    const contact = await ghl.upsertContact({ email: email.trim(), name });
+    const contactId = contact.id || contact.contactId;
+    const firstName = (name || contact.firstName || '').split(' ')[0] || 'there';
+    await ghl.sendEmail({
+      contactId,
+      subject: renderTemplate(settings.intake1_subject, { name: firstName }),
+      html: renderTemplate(settings.intake1_body, { name: firstName, form_link: settings.form1_link }),
+      emailFrom: settings.email_from || undefined,
+    });
+    await trySMS(ghl, db, clientId, contactId,
+      `Hi ${firstName === 'there' ? '' : firstName + '! '}It's ConversionCo — excited to build your website. Step 1 is a quick 10-min intake form: ${settings.form1_link}`.replace('Hi It', "Hi! It"));
+    await touchClient(db, clientId, { stage: 'intake1_sent', ghl_contact_id: contactId, name: name || existing?.name || '' });
+    await logEvent(db, clientId, 'intake1_sent', `Sent to ${email.trim()}`);
+    return c.json({ ok: true, id: clientId });
+  } catch (e) {
+    await logEvent(db, clientId, 'error', `Intake 1 send failed: ${e.message}`);
+    return c.json({ error: e.message }, 502);
+  }
+});
+
+// Demo-first pitching: create a PROSPECT (no email needed) — the auto-builder
+// makes them a one-page demo site before you've ever spoken to them.
+app.post('/api/prospects', async (c) => {
+  const db = c.env.DB;
+  const { business_name, city, email = '', name = '' } = await c.req.json();
+  if (!business_name || !String(business_name).trim()) return c.json({ error: 'Business name required' }, 400);
+  if (!city || !String(city).trim()) return c.json({ error: 'City required' }, 400);
+  const biz = String(business_name).trim(), cty = String(city).trim();
+  const placeholderEmail = email.trim() || `prospect+${biz.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40)}@conversionco918.com`;
+  const existing = await db.prepare('SELECT id FROM clients WHERE email = ?').bind(placeholderEmail).first();
+  if (existing) return c.json({ error: 'A prospect/client with that email already exists' }, 400);
+  // synthesize a minimal intake1 so the demo builder + pitch page read it like a real client
+  const intake1 = JSON.stringify({
+    'Business Name': biz, 'Contact Name': name || '', 'Email': placeholderEmail,
+    'Primary City & State': cty, 'Services Offered': 'IV therapy',
+    '_prospect': true, '_created': new Date().toISOString(),
+  });
+  const r = await db.prepare(`INSERT INTO clients (email, name, business_name, stage, intake1_data) VALUES (?, ?, ?, 'prospect', ?)`)
+    .bind(placeholderEmail, name || '', biz, intake1).run();
+  const id = r.meta.last_row_id;
+  await logEvent(db, id, 'prospect_created', `💡 Prospect added: ${biz} (${cty}) — demo build queued`);
+  return c.json({ ok: true, id });
+});
+
+// 💼 Send / resend the personalized pricing guide (session-protected card button)
+app.post('/api/clients/:id/send-guide', async (c) => {
+  const id = Number(c.req.param('id'));
+  const db = c.env.DB;
+  const cl = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!cl) return c.json({ error: 'client not found' }, 404);
+  if (!cl.email || cl.email.startsWith('prospect+')) return c.json({ error: 'This card has no real email yet — copy the link instead.' }, 400);
+  const settings = await getSettings(db);
+  const gurl = `${BASE_URL}/guide/${id}/${await portalToken(c.env, 'guide', id)}`;
+  const first = (cl.name || '').split(' ')[0] || 'there';
+  const biz = cl.business_name || 'your business';
+  const ok = await emailClient(c.env, db, cl, settings,
+    `Your website packages, prepared for ${biz}`,
+    `<p>${first}, here is your personalized packages guide: both builds, what each includes, and exactly how pricing works.</p>
+<p><a href="${gurl}"><b>View your guide</b></a></p>
+<p>There is a live client site linked inside so you can see the quality for yourself. Questions? Just reply.</p>
+<p>— The ConversionCo Team</p>`,
+    'guide_sent', `💼 Pricing guide sent from the dashboard: ${gurl}`);
+  if (!ok) return c.json({ error: 'Email failed to send — it will NOT auto-retry from here. Check GHL settings.' }, 502);
+  const bS = getBilling(cl); bS.guide_sent = new Date().toISOString();
+  await touchClient(db, id, { billing: JSON.stringify(bS) });
+  return c.json({ ok: true, url: gurl });
+});
+
+// Approve after pricing call -> send Intake 2
+// Shared: send Intake 2 (used by the dashboard button AND the after-call automation)
+async function sendIntake2Flow(env, db, client, settings) {
+  const ghl = ghlFor(env, settings);
+  let contactId = client.ghl_contact_id;
+  if (!contactId) {
+    const contact = await ghl.upsertContact({ email: client.email, name: client.name });
+    contactId = contact.id || contact.contactId;
+  }
+  const firstName = (client.name || '').split(' ')[0] || 'there';
+  // carry the client's email in the form link so their submission auto-matches
+  const link2 = settings.form2_link + (settings.form2_link.includes('?') ? '&' : '?') +
+    'e=' + encodeURIComponent(client.email);
+  await ghl.sendEmail({
+    contactId,
+    subject: renderTemplate(settings.intake2_subject, { name: firstName }),
+    html: renderTemplate(settings.intake2_body, { name: firstName, form_link: link2 }),
+    emailFrom: settings.email_from || undefined,
+  });
+  await trySMS(ghl, db, client.id, contactId,
+    `Hi ${firstName}! ConversionCo here — last step before design starts: your Website Vision form. ${link2}`);
+  await touchClient(db, client.id, { stage: 'intake2_sent', ghl_contact_id: contactId });
+  await logEvent(db, client.id, 'intake2_sent', `Sent to ${client.email}`);
+}
+
+app.post('/api/clients/:id/send-intake2', async (c) => {
+  const db = c.env.DB;
+  const id = Number(c.req.param('id'));
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'Client not found' }, 404);
+  const settings = await getSettings(db);
+  try {
+    await sendIntake2Flow(c.env, db, client, settings);
+    return c.json({ ok: true });
+  } catch (e) {
+    await logEvent(db, id, 'error', `Intake 2 send failed: ${e.message}`);
+    return c.json({ error: e.message }, 502);
+  }
+});
+
+// 📅 AFTER-CALL AUTOPILOT (Tiffany 7/27): the moment the planning call ends,
+// Intake 2 goes out automatically — no waiting on a manual send.
+// Polls the GHL booking calendar every 5 min for recently-ended appointments.
+async function pollAppointments(env, settings) {
+  if (!env.GHL_TOKEN || !settings.ghl_location_id) return;
+  const db = env.DB;
+  const calId = settings.booking_calendar_id || 'kfZNB7wOmwHcy769nGh3';
+  const now = Date.now();
+  const url = new URL('https://services.leadconnectorhq.com/calendars/events');
+  url.searchParams.set('locationId', settings.ghl_location_id);
+  url.searchParams.set('calendarId', calId);
+  url.searchParams.set('startTime', String(now - 48 * 3600 * 1000));
+  url.searchParams.set('endTime', String(now));
+  const res = await fetch(url.toString(), { headers: {
+    Authorization: `Bearer ${env.GHL_TOKEN}`, Version: '2021-04-15', Accept: 'application/json' } });
+  if (!res.ok) {
+    const last = Number(settings.appt_poll_err || 0);
+    if (now - last > 6 * 3600 * 1000) {
+      await setSetting(db, 'appt_poll_err', String(now));
+      await logEvent(db, null, 'error', `After-call autopilot: calendar poll failed (${res.status}) — Intake 2 auto-send paused; manual send still works`);
+    }
+    return;
+  }
+  const data = await res.json().catch(() => ({}));
+  const events = data.events || data.data || [];
+  for (const ev of events) {
+    const evId = ev.id || ev.eventId || '';
+    const endT = Date.parse(ev.endTime || ev.end_time || 0) || Number(ev.endTime) || 0;
+    const status = String(ev.appointmentStatus || ev.appoinmentStatus || ev.status || '').toLowerCase();
+    if (!evId || !endT || endT > now) continue; // only ENDED appointments
+    if (['cancelled', 'canceled', 'noshow', 'no-show', 'invalid'].includes(status)) continue;
+    if (settings[`appt_done_${evId}`]) continue; // handled already
+    await setSetting(db, `appt_done_${evId}`, new Date().toISOString());
+    // match the appointment to a client: contact id first, then email lookup
+    let client = null;
+    const contactId = ev.contactId || ev.contact_id || '';
+    if (contactId) client = await db.prepare('SELECT * FROM clients WHERE ghl_contact_id = ?').bind(contactId).first();
+    if (!client && contactId) {
+      try {
+        const ghl = ghlFor(env, settings);
+        const contact = await ghl.getContact(contactId);
+        const cEmail = (contact?.contact?.email || contact?.email || '').toLowerCase().trim();
+        if (cEmail) client = await db.prepare('SELECT * FROM clients WHERE lower(email) = ?').bind(cEmail).first();
+      } catch { /* contact lookup best-effort */ }
+    }
+    if (!client) continue;
+    // only clients who haven't gotten/done Intake 2 yet
+    if (!['new', 'intake1_sent', 'intake1_done'].includes(client.stage)) continue;
+    if (client.intake2_data && client.intake2_data.length > 2) continue;
+    try {
+      await sendIntake2Flow(env, db, client, settings);
+      await logEvent(db, client.id, 'intake2_sent', `🤖 Planning call ended — Intake 2 sent automatically to ${client.email}`);
+    } catch (e) {
+      await logEvent(db, client.id, 'error', `After-call Intake 2 auto-send failed: ${String(e.message).slice(0, 140)}`);
+    }
+  }
+}
+
+
+// Manual stage change / notes / delete
+app.patch('/api/clients/:id', async (c) => {
+  const id = Number(c.req.param('id'));
+  const body = await c.req.json();
+  const allowed = {};
+  for (const k of ['stage', 'notes', 'name', 'phone', 'business_name', 'preview_url', 'live_url', 'theme', 'tier', 'launch_checklist', 'vibe', 'email', 'competitors']) {
+    if (k in body) allowed[k] = body[k];
+  }
+  if (!Object.keys(allowed).length) return c.json({ error: 'nothing to update' }, 400);
+  // 🚀 LAUNCH DAY: first time the site goes live (stage=live or live_url set), make it an event.
+  // quietLaunch:true = imported/already-live client — record the launch state, skip the email.
+  const quietLaunch = body.quietLaunch === true;
+  const before = await c.env.DB.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  const goingLive = before && ((allowed.stage === 'live' && before.stage !== 'live') || (allowed.live_url && !before.live_url));
+  await touchClient(c.env.DB, id, allowed);
+  if (goingLive) {
+    let bL = {}; try { bL = JSON.parse(before.billing || '{}'); } catch {}
+    if (bL.launched_at || quietLaunch) {
+      if (!bL.launched_at) { bL.launched_at = new Date().toISOString(); await touchClient(c.env.DB, id, { billing: JSON.stringify(bL) }); }
+      if (quietLaunch) await logEvent(c.env.DB, id, 'launched', `🚀 ${before.business_name || before.name || before.email} imported as LIVE (quiet — no launch email)`);
+    } else {
+      bL.launched_at = new Date().toISOString();
+      await touchClient(c.env.DB, id, { billing: JSON.stringify(bL) });
+      const settingsL = await getSettings(c.env.DB);
+      const firstL = (before.name || '').split(' ')[0] || 'there';
+      const site = allowed.live_url || before.live_url || '';
+      const purlL = `${BASE_URL}/portal/${id}/${await portalToken(c.env, 'portal', id)}`;
+      await logEvent(c.env.DB, id, 'launched', `🚀 LAUNCH DAY — ${before.business_name || before.name || before.email} is live${site ? ' at ' + site : ''}`);
+      await emailClient(c.env, c.env.DB, before, settingsL,
+        `You're live. 🚀`,
+        `<p>${firstL} — today's the day.</p>
+<p><b>${before.business_name || 'Your business'} is officially live on the internet${site ? ` at ${site}` : ''}.</b> Google has been told where to find you, your daily protection checks are running, and starting this week we track <b>what page of Google you're on</b> — you'll see it in your portal and in every report.</p>
+<p>Here's your window into all of it:</p><p><a href="${purlL}">${purlL}</a></p>
+<p>Thirty days from now, we'll show you a before-and-after. Welcome to the climb.</p>
+<p>— The ConversionCo Team</p>`,
+        'launch_emailed', '🚀 Launch-day email sent');
+    }
+    // 📡 INSTANT Search Console enrollment — Google gets the map the moment a site
+    // goes live (property + verification + sitemap). Sunday's pull is the safety net.
+    try {
+      const afterCl = await c.env.DB.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+      const settingsG = await getSettings(c.env.DB);
+      c.executionCtx.waitUntil(gscEnsureClient(c.env, settingsG, afterCl).then((r) => {
+        if (r) return logEvent(c.env.DB, id, 'gsc_enroll_kickoff', `📡 Search Console enrollment ran at go-live for ${r.domain}${r.st.verified ? ' — verified ✓' : ' — verification pending (auto-retries every Sunday)'}`);
+      }).catch(() => {}));
+    } catch { /* Sunday safety net covers it */ }
+  }
+  if (allowed.stage) {
+    await logEvent(c.env.DB, id, 'stage_changed', `Moved to ${allowed.stage}`);
+    // keep the progress bar honest when the stage is set by hand
+    if (allowed.stage === 'generating') {
+      await setSetting(c.env.DB, `buildprog_${id}`, JSON.stringify({ started_at: new Date().toISOString(), pct: 5, step: 'Waiting for the builder' }));
+    } else {
+      await setSetting(c.env.DB, `buildprog_${id}`, '');
+    }
+  }
+  return c.json({ ok: true });
+});
+
+app.delete('/api/clients/:id', async (c) => {
+  const id = Number(c.req.param('id'));
+  await c.env.DB.prepare('DELETE FROM clients WHERE id = ?').bind(id).run();
+  await logEvent(c.env.DB, id, 'client_deleted');
+  return c.json({ ok: true });
+});
+
+async function sendPortalEmail(env, db, client, settings) {
+  if (!client?.email || !env.GHL_TOKEN || !settings.ghl_location_id) return false;
+  const url = `${BASE_URL}/portal/${client.id}/${await portalToken(env, 'portal', client.id)}`;
+  const biz = client.business_name || client.name || 'your business';
+  const first = (client.name || '').split(' ')[0] || 'there';
+  try {
+    const ghl = new GHL(env.GHL_TOKEN, settings.ghl_location_id);
+    const contact = await ghl.upsertContact({ email: client.email, name: client.name || '' });
+    await ghl.sendEmail({
+      contactId: contact.id || contact.contactId,
+      subject: `Your private client portal — ${biz}`,
+      html: `<p>Hi ${first},</p>
+<p>You're officially on the books. Your private client portal is live — it's your window into everything we do for ${biz}: watch your website get built stage by stage, see your SEO score, your uptime monitoring, and everything we publish for you.</p>
+<p><a href="${url}">${url}</a></p>
+<p>That link is your personal key — no password needed. Bookmark it; it updates in real time, and you can message us directly from inside it any time. Or just reply to this email.</p>
+<p>Talk soon,<br>The ConversionCo Team</p>`,
+      emailFrom: settings.email_from || undefined,
+    });
+    await trySMS(ghl, db, client.id, contact.id || contact.contactId,
+      `Hi ${first}! It's ConversionCo — you're officially on the books. Your private client portal is live (bookmark it): ${url}`);
+    await logEvent(db, client.id, 'portal_invited', `Portal login auto-sent to ${client.email} 🔑`);
+    return true;
+  } catch { return false; }
+}
+
+// Best-effort SMS alongside key emails — clients can't miss the notification.
+// DISABLED per Tiffany (7/23): flip SMS_ENABLED to true to turn texts back on.
+const SMS_ENABLED = false;
+async function trySMS(ghl, db, clientId, contactId, message) {
+  if (!SMS_ENABLED) return false;
+  try {
+    await ghl.sendSMS({ contactId, message });
+    await logEvent(db, clientId, 'sms_sent', `📱 Text sent: "${message.slice(0, 70)}…"`);
+    return true;
+  } catch (e) {
+    await logEvent(db, clientId, 'sms_skipped', `Text not sent (${String(e.message || e).slice(0, 120)})`);
+    return false;
+  }
+}
+
+// ---------------- Stripe billing ----------------
+function getBilling(client) { try { return JSON.parse(client.billing || '{}'); } catch { return {}; } }
+
+app.post('/api/clients/:id/invoice', async (c) => {
+  if (!c.env.STRIPE_SECRET_KEY) return c.json({ error: 'Add the STRIPE_SECRET_KEY secret to the worker first (Cloudflare → worker → Settings → Variables)' }, 400);
+  const id = Number(c.req.param('id'));
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  const tierKey = (client.tier === 'premium') ? 'premium' : 'standard';
+  let which = 'deposit';
+  try { which = (await c.req.json())?.which || 'deposit'; } catch {}
+  if (which !== 'final') which = 'deposit';
+  try {
+    const cust = await ensureCustomer(c.env.STRIPE_SECRET_KEY, client.email, client.name || client.business_name || '');
+    const inv = await sendInvoice(c.env.STRIPE_SECRET_KEY, cust.id, tierKey, client.business_name || '', which);
+    const billing = getBilling(client);
+    billing.customer_id = cust.id; billing.invoice_tier = tierKey;
+    if (which === 'deposit') { billing.dep_id = inv.id; billing.dep_status = inv.status; billing.dep_url = inv.url; }
+    else { billing.fin_id = inv.id; billing.fin_status = inv.status; billing.fin_url = inv.url; }
+    await touchClient(db, id, { billing: JSON.stringify(billing) });
+    const halfLabel = which === 'deposit' ? '50% deposit' : 'final 50% balance';
+    await logEvent(db, id, 'invoice_sent', `Stripe invoice sent — ${halfDisplay(tierKey)} ${halfLabel} (${PRICES[tierKey].label}) 💳`);
+    return c.json({ ok: true, url: inv.url, display: halfDisplay(tierKey), which });
+  } catch (e) {
+    return c.json({ error: 'Stripe: ' + e.message }, 502);
+  }
+});
+
+app.post('/api/clients/:id/hosting', async (c) => {
+  if (!c.env.STRIPE_SECRET_KEY) return c.json({ error: 'Add the STRIPE_SECRET_KEY secret to the worker first' }, 400);
+  const id = Number(c.req.param('id'));
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  let planKey = 'hosting';
+  try { planKey = (await c.req.json())?.plan || 'hosting'; } catch {}
+  if (!['hosting', 'care199', 'care399'].includes(planKey)) planKey = 'hosting';
+  try {
+    const cust = await ensureCustomer(c.env.STRIPE_SECRET_KEY, client.email, client.name || client.business_name || '');
+    const ret = client.live_url || client.preview_url || 'https://conversionco918.com';
+    const sess = await hostingCheckout(c.env.STRIPE_SECRET_KEY, cust.id, client.business_name || '', ret, planKey);
+    const billing = getBilling(client);
+    billing.customer_id = cust.id;
+    billing.sub_session_id = sess.id; billing.sub_link = sess.url; billing.sub_status = 'pending'; billing.sub_plan = planKey;
+    await touchClient(db, id, { billing: JSON.stringify(billing) });
+    await logEvent(db, id, 'hosting_link', `${PRICES[planKey].label} (${PRICES[planKey].display}) — checkout link created 🔒`);
+    return c.json({ ok: true, url: sess.url, plan: planKey });
+  } catch (e) {
+    return c.json({ error: 'Stripe: ' + e.message }, 502);
+  }
+});
+
+async function pollBilling(env) {
+  if (!env.STRIPE_SECRET_KEY) return 0;
+  const db = env.DB;
+  const clients = (await db.prepare(`SELECT * FROM clients WHERE billing LIKE '%"invoice_status":"open"%' OR billing LIKE '%"dep_status":"open"%' OR billing LIKE '%"fin_status":"open"%' OR billing LIKE '%"sub_status":"pending"%'`).all()).results || [];
+  let changed = 0;
+  for (const client of clients) {
+    const billing = getBilling(client);
+    let dirty = 0;
+    const tierKey = billing.invoice_tier || 'standard';
+    try {
+      // legacy full invoice
+      if (billing.invoice_id && billing.invoice_status === 'open') {
+        const st = await invoiceStatus(env.STRIPE_SECRET_KEY, billing.invoice_id);
+        if (st.status !== billing.invoice_status) {
+          billing.invoice_status = st.status;
+          if (st.paid) {
+            billing.paid_at = new Date().toISOString();
+            await logEvent(db, client.id, 'invoice_paid', `Invoice PAID — ${PRICES[tierKey].display} 🎉💰`);
+            const settingsP = await getSettings(db);
+            await sendPortalEmail(env, db, client, settingsP);
+          }
+          dirty++;
+        }
+      }
+      // 50% deposit — payment unlocks the build + portal
+      if (billing.dep_id && billing.dep_status === 'open') {
+        const st = await invoiceStatus(env.STRIPE_SECRET_KEY, billing.dep_id);
+        if (st.status !== billing.dep_status) {
+          billing.dep_status = st.status;
+          if (st.paid) {
+            billing.dep_paid_at = new Date().toISOString();
+            await logEvent(db, client.id, 'invoice_paid', `50% deposit PAID (${halfDisplay(tierKey)}) — build unlocked 🎉💰`);
+            const settingsP = await getSettings(db);
+            await sendPortalEmail(env, db, client, settingsP);
+          }
+          dirty++;
+        }
+      }
+      // final 50% balance
+      if (billing.fin_id && billing.fin_status === 'open') {
+        const st = await invoiceStatus(env.STRIPE_SECRET_KEY, billing.fin_id);
+        if (st.status !== billing.fin_status) {
+          billing.fin_status = st.status;
+          if (st.paid) {
+            billing.fin_paid_at = new Date().toISOString();
+            await logEvent(db, client.id, 'invoice_paid', `Final balance PAID (${halfDisplay(tierKey)}) — project paid in full 💰✅`);
+          }
+          dirty++;
+        }
+      }
+      if (billing.sub_session_id && billing.sub_status === 'pending') {
+        const st = await checkoutStatus(env.STRIPE_SECRET_KEY, billing.sub_session_id);
+        if (st.complete) {
+          billing.sub_status = 'active'; billing.subscription_id = st.subscription;
+          await logEvent(db, client.id, 'hosting_active', 'Care & Hosting Plan $99/mo ACTIVE 🔒✅');
+          dirty++;
+        }
+      }
+      if (dirty) { changed += dirty; await touchClient(db, client.id, { billing: JSON.stringify(billing) }); }
+    } catch { /* keep polling others */ }
+  }
+  return changed;
+}
+
+// Manual bypass: mark paid / hosting active when handled outside Stripe (cash, Venmo, comp)
+app.post('/api/clients/:id/billing-bypass', async (c) => {
+  const id = Number(c.req.param('id'));
+  const { what, quiet } = await c.req.json();
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  const billing = getBilling(client);
+  if (what === 'hosting') {
+    billing.sub_status = 'active'; billing.sub_bypass = true;
+    await logEvent(db, id, 'hosting_active', 'Hosting marked ACTIVE manually (bypass — handled outside Stripe) 🔓');
+  } else if (what === 'final') {
+    billing.fin_status = 'paid'; billing.fin_bypass = true; billing.fin_paid_at = new Date().toISOString();
+    await logEvent(db, id, 'invoice_paid', 'Final balance marked PAID manually (bypass — paid outside Stripe) 🔓💰');
+  } else {
+    billing.dep_status = 'paid'; billing.dep_bypass = true; billing.dep_paid_at = new Date().toISOString();
+    await logEvent(db, id, 'invoice_paid', `50% deposit marked PAID manually (bypass — paid outside Stripe) 🔓💰 — build unlocked${quiet ? ' (quiet: no portal email)' : ''}`);
+    if (!quiet) {
+      const settingsB = await getSettings(db);
+      await sendPortalEmail(c.env, db, client, settingsB);
+    }
+  }
+  await touchClient(db, id, { billing: JSON.stringify(billing) });
+  return c.json({ ok: true });
+});
+
+// 🌐 GO-LIVE AUTOPILOT: attach a client's domain to direct hosting — zone check,
+// Workers custom domains for apex + www (DNS + SSL automatic), live-host serving
+// mapping, optional hello@ email forward, card flipped live + instant GSC.
+app.post('/api/clients/:id/golive-domain', async (c) => {
+  const id = Number(c.req.param('id'));
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  let f = {}; try { f = await c.req.json(); } catch {}
+  const domain = String(f.domain || '').toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '').replace(/^www\./, '');
+  if (!domain || !domain.includes('.')) return c.json({ error: 'domain required (e.g. herbusiness.com)' }, 400);
+  if (!c.env.CLOUDFLARE_API_TOKEN || !c.env.CF_ACCOUNT_ID) return c.json({ error: 'Cloudflare token/account not configured' }, 400);
+  const slug = await slugForClient(db, id);
+  if (!slug) return c.json({ error: 'no built site for this client yet' }, 400);
+  const cf = async (path, method, body) => {
+    const res = await fetch(`https://api.cloudflare.com/client/v4${path}`, {
+      method: method || 'GET',
+      headers: { Authorization: `Bearer ${c.env.CLOUDFLARE_API_TOKEN}`, 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined });
+    return res.json().catch(() => ({}));
+  };
+  const steps = [];
+  // 1. the zone must already be in the Cloudflare account (nameservers moved)
+  const zones = await cf(`/zones?name=${domain}`);
+  const zone = zones && zones.result && zones.result[0];
+  if (!zone) {
+    return c.json({ ok: false, steps, error: `${domain} is not in the Cloudflare account yet (or the API token cannot list zones). One-time setup: add the domain as a zone in Cloudflare + point its nameservers there, and give the token Zone:Read + Workers Custom Domains:Edit + Email Routing:Edit.` });
+  }
+  steps.push(`zone found (status: ${zone.status})`);
+  // 2. attach apex + www to this worker (creates DNS records + SSL automatically)
+  for (const host of [domain, `www.${domain}`]) {
+    const att = await cf(`/accounts/${c.env.CF_ACCOUNT_ID}/workers/domains`, 'PUT', {
+      environment: 'production', hostname: host, service: 'conversionco-mission-control', zone_id: zone.id });
+    steps.push(`${host}: ${att.success ? 'attached ✓' : 'FAILED — ' + JSON.stringify(att.errors || att.messages || []).slice(0, 160)}`);
+    if (!att.success && host === domain) {
+      return c.json({ ok: false, steps, error: 'Could not attach the domain — the token likely needs Workers Custom Domains edit permission.' });
+    }
+  }
+  // 3. map the hostnames to the site so the worker serves it
+  await setSetting(db, `livehost_${domain}`, slug);
+  await setSetting(db, `livehost_www.${domain}`, slug);
+  steps.push('direct serving mapped');
+  // 4. optional branded inbox: hello@domain forwards to the client's email
+  if (f.emailForward && client.email) {
+    const er = await cf(`/zones/${zone.id}/email/routing/rules`, 'POST', {
+      enabled: true, name: 'hello forward',
+      matchers: [{ type: 'literal', field: 'to', value: `hello@${domain}` }],
+      actions: [{ type: 'forward', value: [client.email] }] });
+    steps.push(`hello@${domain}: ${er && er.success ? `forwards to ${client.email} ✓` : 'not set (enable Email Routing on the zone once, then re-run)'}`);
+  }
+  // 5. flip the card live + instant GSC enrollment (quiet — no launch email here)
+  await touchClient(db, id, { live_url: `https://${domain}`, stage: 'live', launched_at: new Date().toISOString() });
+  await logEvent(db, id, 'launched', `🌐 ${domain} attached to direct hosting — DNS, SSL, serving, and Google enrollment all automatic`);
+  c.executionCtx.waitUntil((async () => {
+    try { const s2 = await getSettings(db); await gscEnsureClient(c.env, s2, { ...client, live_url: `https://${domain}`, stage: 'live' }); } catch {}
+  })());
+  return c.json({ ok: true, steps, url: `https://${domain}` });
+});
+
+// ⏪ Panic button: restore the client's site to its previous version (new commit,
+// never a force-push) — auto-publish then reimports it within 5 minutes.
+app.post('/api/clients/:id/rollback', async (c) => {
+  const id = Number(c.req.param('id'));
+  const db = c.env.DB;
+  if (!c.env.GITHUB_TOKEN) return c.json({ error: 'GitHub not configured' }, 500);
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  // resolve slug from imported metas
+  const metas = (await db.prepare(`SELECT slug, content FROM site_files WHERE path='site-meta.json'`).all()).results || [];
+  let slug = null;
+  for (const m of metas) { try { if (JSON.parse(m.content).client_id === id) { slug = m.slug; break; } } catch {} }
+  if (!slug) return c.json({ error: 'no site found for this client yet' }, 400);
+  const settings = await getSettings(db);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  const gh = ghFetcher(c.env);
+  const ghPost = async (path, method, body) => {
+    const res = await fetch(`https://api.github.com${path}`, {
+      method, headers: { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json', 'Content-Type': 'application/json' },
+      body: JSON.stringify(body) });
+    const data = await res.json();
+    if (!res.ok) throw new Error(`GitHub ${method} ${path} -> ${res.status}: ${data.message || ''}`);
+    return data;
+  };
+  try {
+    const commits = await gh(`/repos/${repo}/commits?path=sites/${slug}&per_page=3&sha=main`);
+    if (!Array.isArray(commits) || commits.length < 2) return c.json({ error: 'No earlier version exists yet for this site' }, 400);
+    const prev = commits[1]; // the version before the latest change
+    const prevCommit = await gh(`/repos/${repo}/git/commits/${prev.sha}`);
+    const prevTree = await gh(`/repos/${repo}/git/trees/${prevCommit.tree.sha}?recursive=0`);
+    const sitesEntry = (prevTree.tree || []).find((t) => t.path === 'sites');
+    const prevSites = await gh(`/repos/${repo}/git/trees/${sitesEntry.sha}`);
+    const slugEntry = (prevSites.tree || []).find((t) => t.path === slug && t.type === 'tree');
+    if (!slugEntry) return c.json({ error: 'Previous version not found in history' }, 400);
+    const headRef = await gh(`/repos/${repo}/git/ref/heads/main`);
+    const headCommit = await gh(`/repos/${repo}/git/commits/${headRef.object.sha}`);
+    const newTree = await ghPost(`/repos/${repo}/git/trees`, 'POST', {
+      base_tree: headCommit.tree.sha,
+      tree: [{ path: `sites/${slug}`, mode: '040000', type: 'tree', sha: slugEntry.sha }],
+    });
+    const newCommit = await ghPost(`/repos/${repo}/git/commits`, 'POST', {
+      message: `⏪ Rollback sites/${slug} to ${prev.sha.slice(0, 7)} (panic button from Mission Control)`,
+      tree: newTree.sha, parents: [headRef.object.sha],
+    });
+    await ghPost(`/repos/${repo}/git/refs/heads/main`, 'PATCH', { sha: newCommit.sha, force: false });
+    await logEvent(db, id, 'site_rolled_back', `⏪ Site restored to the previous version (${prev.sha.slice(0, 7)}: "${(prev.commit?.message || '').split('\n')[0].slice(0, 70)}") — republishing within 5 min`);
+    return c.json({ ok: true, restored: prev.sha.slice(0, 7), was: (prev.commit?.message || '').split('\n')[0].slice(0, 90) });
+  } catch (e) { return c.json({ error: 'Rollback failed: ' + String(e.message).slice(0, 200) }, 502); }
+});
+
+app.get('/api/clients/:id/score', async (c) => {
+  const id = Number(c.req.param('id'));
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  const settings = await getSettings(db);
+  const score = await computeScore(db, client, settings);
+  return c.json(score || { error: 'no site yet' });
+});
+
+// 📤 APPROVE PREVIEW — Tiffany's send button. Until this is called, the client
+// knows nothing: no reveal email, no final invoice, portal still shows "building".
+app.post('/api/clients/:id/approve-preview', async (c) => {
+  const db = c.env.DB;
+  const id = Number(c.req.param('id'));
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ ok: false, error: 'not found' }, 404);
+  if (!client.preview_url) return c.json({ ok: false, error: 'no preview to send yet' }, 400);
+  const settings = await getSettings(db);
+  const b = getBilling(client);
+  if (b.preview_approved) return c.json({ ok: true, already: true });
+  b.preview_approved = new Date().toISOString();
+  await touchClient(db, id, { billing: JSON.stringify(b) });
+  await logEvent(db, id, 'preview_approved', '📤 Tiffany approved the preview — sending it to the client now');
+  // 1) final balance invoice (was auto at publish; now rides on her approval)
+  let invoiceSent = false;
+  try {
+    if (c.env.STRIPE_SECRET_KEY && b.dep_status === 'paid' && !b.fin_id && !b.fin_status && b.invoice_status !== 'paid') {
+      const tierKey = b.invoice_tier || (client.tier === 'premium' ? 'premium' : 'standard');
+      const custId = b.customer_id || (await ensureCustomer(c.env.STRIPE_SECRET_KEY, client.email, client.name || client.business_name || '')).id;
+      const inv = await sendInvoice(c.env.STRIPE_SECRET_KEY, custId, tierKey, client.business_name || '', 'final');
+      b.customer_id = custId; b.fin_id = inv.id; b.fin_status = inv.status; b.fin_url = inv.url;
+      await touchClient(db, id, { billing: JSON.stringify(b) });
+      await logEvent(db, id, 'invoice_sent', `Preview approved — final balance invoice sent (${halfDisplay(tierKey)}) 💳`);
+      invoiceSent = true;
+    }
+  } catch (e) { await logEvent(db, id, 'error', `Final invoice send failed: ${e.message}`); }
+  // 2) the reveal email — their first look at their own website
+  const first = (client.name || '').split(' ')[0] || 'there';
+  const biz = client.business_name || client.name || 'your business';
+  const purl = `${BASE_URL}/portal/${id}/${await portalToken(c.env, 'portal', id)}`;
+  const emailed = await emailClient(c.env, db, client, settings,
+    `${biz} — your new website is ready to see 👀`,
+    `<p>Hi ${first},</p>
+     <p>It's here. Your new website for <b>${biz}</b> is built and waiting for you:</p>
+     <p style="font-size:16px;"><a href="${client.preview_url}"><b>${client.preview_url}</b></a></p>
+     <p>Click through every page — on your phone too, since that's where most of your clients will see it. If anything isn't exactly how you want it (a price, a photo, a word), just reply to this email and we'll change it. Revisions at this stage are included.</p>
+     <p>Your client portal has the full picture any time: <a href="${purl}">${purl}</a></p>
+     <p>Talk soon,<br>The ConversionCo Team</p>`,
+    'preview_sent', `📤 Preview reveal email sent to ${client.email}`);
+  return c.json({ ok: true, emailed, invoiceSent });
+});
+
+// 🔥 FIRE ANYWAY — Tiffany's manual override. Writes a fire-request flag into the
+// sites repo; Claude's standing watch sees the commit within ~a minute and kicks
+// the builder immediately instead of waiting for the next hourly alarm.
+// Shared fire-cord: commit a fire-request flag to the mission-control repo's
+// fire-signal branch (NOT main — no deploys). Claude's standing watch sees the
+// branch move within ~a minute and kicks/does the build. Used by the dashboard
+// button AND by queueWatch's automatic stall recovery.
+async function fireSignal(env, db, by) {
+  if (!env.GITHUB_TOKEN) return { ok: false, error: 'GITHUB_TOKEN secret not set' };
+  const rows = (await db.prepare(`SELECT id, business_name, name, stage FROM clients WHERE stage IN ('intake2_done','generating')`).all()).results || [];
+  const payload = { requested_at: new Date().toISOString(), by,
+    waiting: rows.map((r) => ({ id: r.id, biz: r.business_name || r.name, stage: r.stage })) };
+  const ghHeaders = { Authorization: `Bearer ${env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+  const api = `https://api.github.com/repos/conversionco918/conversionco-mission-control/contents/fire-requests/latest.json`;
+  const getRes = await fetch(api + '?ref=fire-signal', { headers: ghHeaders });
+  const existing = getRes.ok ? await getRes.json() : null;
+  const bytes = new TextEncoder().encode(JSON.stringify(payload, null, 2));
+  let bin = ''; for (let i = 0; i < bytes.length; i += 8192) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+  const putRes = await fetch(api, { method: 'PUT', headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: `🔥 FIRE BUILDER — ${by} (${payload.waiting.length} waiting)`,
+      branch: 'fire-signal', content: btoa(bin), ...(existing && existing.sha ? { sha: existing.sha } : {}) }) });
+  if (!putRes.ok) { const out = await putRes.json().catch(() => ({}));
+    return { ok: false, error: ('flag commit failed: ' + JSON.stringify(out)).slice(0, 200) }; }
+  return { ok: true, waiting: payload.waiting.length };
+}
+
+app.post('/api/fire-builder', async (c) => {
+  const db = c.env.DB;
+  const r = await fireSignal(c.env, db, 'dashboard fire button');
+  if (!r.ok) return c.json(r);
+  await logEvent(db, null, 'fire_requested', `🔥 Manual builder fire requested from the dashboard (${r.waiting} client(s) waiting)`);
+  return c.json(r);
+});
+
+// 🛠 BUILDER HEARTBEAT — "is the machine coming for my queued builds?"
+// The auto-builder scheduled task fires EVERY HOUR at :23 UTC.
+app.get('/api/builder-status', async (c) => {
+  const db = c.env.DB;
+  const now = new Date();
+  let next = null;
+  for (let add = 0; add <= 2 && !next; add++) {
+    const cand = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours() + add, 23, 0));
+    if (cand > now) next = cand;
+  }
+  const lastOf = async (t) => (await db.prepare('SELECT created_at FROM events WHERE type = ? ORDER BY id DESC LIMIT 1').bind(t).first())?.created_at || null;
+  const waiting = [];
+  const rows = (await db.prepare(`SELECT * FROM clients WHERE stage IN ('intake2_done','generating')`).all()).results || [];
+  for (const cl of rows) {
+    let b = {}; try { b = JSON.parse(cl.billing || '{}'); } catch {}
+    const readyAt = Date.parse(String(cl.updated_at || '').replace(' ', 'T') + 'Z') || Date.now();
+    const waitingMins = Math.max(0, Math.round((Date.now() - readyAt) / 60000));
+    waiting.push({ id: cl.id, biz: cl.business_name || cl.name || cl.email, stage: cl.stage,
+      paid: depositPaid(b), waitingMins, overdue: cl.stage === 'intake2_done' && depositPaid(b) && waitingMins > 45 });
+  }
+  return c.json({
+    nextRunAt: next ? next.toISOString() : null,
+    minutesUntil: next ? Math.round((next - now) / 60000) : null,
+    lastBuildStartedAt: await lastOf('build_started'),
+    lastPublishedAt: await lastOf('auto_published'),
+    waiting,
+  });
+});
+
+app.post('/api/clients/:id/revision', async (c) => {
+  const id = Number(c.req.param('id'));
+  const { request } = await c.req.json();
+  if (!request || !String(request).trim()) return c.json({ error: 'describe the change first' }, 400);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  const r = await db.prepare('INSERT INTO revisions (client_id, request) VALUES (?, ?)').bind(id, String(request).slice(0, 2000)).run();
+  await logEvent(db, id, 'revision_requested', `✏️ Revision queued: "${String(request).slice(0, 100)}"`);
+  return c.json({ ok: true, id: r.meta.last_row_id });
+});
+app.get('/api/clients/:id/revisions', async (c) => {
+  const rows = (await c.env.DB.prepare('SELECT * FROM revisions WHERE client_id = ? ORDER BY id DESC LIMIT 10').bind(Number(c.req.param('id'))).all()).results || [];
+  return c.json({ revisions: rows });
+});
+
+// Email the client their portal login (magic link)
+app.post('/api/clients/:id/portal-invite', async (c) => {
+  const id = Number(c.req.param('id'));
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  if (!client.email) return c.json({ error: 'client has no email' }, 400);
+  const settings = await getSettings(db);
+  if (!c.env.GHL_TOKEN || !settings.ghl_location_id) return c.json({ error: 'GHL not configured' }, 500);
+  const url = `${BASE_URL}/portal/${id}/${await portalToken(c.env, 'portal', id)}`;
+  const biz = client.business_name || client.name || 'your business';
+  const first = (client.name || '').split(' ')[0] || 'there';
+  try {
+    const ghl = ghlFor(c.env, settings);
+    const contact = await ghl.upsertContact({ email: client.email, name: client.name || '' });
+    await ghl.sendEmail({
+      contactId: contact.id || contact.contactId,
+      subject: `Your private client portal — ${biz}`,
+      html: `<p>Hi ${first},</p>
+<p>Your project now has a live client portal — your window into everything we're doing for ${biz}: where your project stands, your website's SEO score, uptime monitoring, and everything we publish for you.</p>
+<p><a href="${url}">${url}</a></p>
+<p>That link is your personal key — no password needed. Bookmark it and check in any time; it updates in real time as we work. Or just reply to this email with any question.</p>
+<p>Talk soon,<br>The ConversionCo Team</p>`,
+      emailFrom: settings.email_from || undefined,
+    });
+    await trySMS(ghl, db, id, contact.id || contact.contactId,
+      `Hi ${first}! It's ConversionCo — your private client portal is live (bookmark it): ${url}`);
+    await logEvent(db, id, 'portal_invited', `Portal login emailed to ${client.email} 🔑`);
+    return c.json({ ok: true });
+  } catch (e) {
+    return c.json({ error: 'Email failed: ' + e.message }, 502);
+  }
+});
+
+app.post('/api/clients/:id/agreement-invite', async (c) => {
+  const id = Number(c.req.param('id'));
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client || !client.email) return c.json({ error: 'client/email missing' }, 400);
+  const settings = await getSettings(db);
+  if (!c.env.GHL_TOKEN || !settings.ghl_location_id) return c.json({ error: 'GHL not configured' }, 500);
+  const url = `${BASE_URL}/agreement/${id}/${await portalToken(c.env, 'agr', id)}`;
+  const biz = client.business_name || client.name || 'your business';
+  try {
+    const ghl = ghlFor(c.env, settings);
+    const contact = await ghl.upsertContact({ email: client.email, name: client.name || '' });
+    await ghl.sendEmail({ contactId: contact.id || contact.contactId,
+      subject: `One quick signature before we begin — ${biz}`,
+      html: `<p>Hi ${(client.name || '').split(' ')[0] || 'there'},</p>
+<p>We're excited to build this with you. Before your invoice, here's our service agreement — plain English, about two minutes to read, and it protects both of us. The short version: your domain and your website are yours, and it spells out exactly what our service covers:</p>
+<p><a href="${url}">${url}</a></p>
+<p>Your invoice follows right after you sign. Questions about anything in it? Just reply — happy to walk you through.</p>
+<p>Talk soon,<br>The ConversionCo Team</p>`,
+      emailFrom: settings.email_from || undefined });
+    await trySMS(ghl, db, id, contact.id || contact.contactId,
+      `Hi ${(client.name || '').split(' ')[0] || 'there'}! ConversionCo here — quick e-signature on your service agreement before we begin (2-min read): ${url}`);
+    let billing = {}; try { billing = JSON.parse(client.billing || '{}'); } catch {}
+    billing.agr_sent = new Date().toISOString();
+    await touchClient(db, id, { billing: JSON.stringify(billing) });
+    await logEvent(db, id, 'agreement_sent', `📄 Agreement sent to ${client.email}`);
+    return c.json({ ok: true, url });
+  } catch (e) { return c.json({ error: 'Email failed: ' + e.message }, 502); }
+});
+app.get('/api/clients/:id/agreement', async (c) => {
+  const row = await c.env.DB.prepare('SELECT * FROM agreements WHERE client_id = ? ORDER BY id DESC LIMIT 1').bind(Number(c.req.param('id'))).first();
+  return c.json({ signed: row || null });
+});
+
+app.get('/api/clients/:id/leads', async (c) => {
+  const id = Number(c.req.param('id'));
+  const rows = (await c.env.DB.prepare('SELECT * FROM leads WHERE client_id = ? ORDER BY id DESC LIMIT 12').bind(id).all()).results || [];
+  return c.json({ leads: rows });
+});
+app.get('/api/clients/:id/links', async (c) => {
+  const id = Number(c.req.param('id'));
+  const settingsL = await getSettings(c.env.DB);
+  return c.json({
+    portal: `${BASE_URL}/portal/${id}/${await portalToken(c.env, 'portal', id)}`,
+    pitch: `${BASE_URL}/pitch/${id}/${await portalToken(c.env, 'pitch', id)}`,
+    agreement: `${BASE_URL}/agreement/${id}/${await portalToken(c.env, 'agr', id)}`,
+    gbp: `${BASE_URL}/gbp/${id}/${await portalToken(c.env, 'gbp', id)}`,
+    exit: `${BASE_URL}/exit/${id}/${await portalToken(c.env, 'exit', id)}`,
+    outreach: settingsL[`outreach_${id}`] || '',
+  });
+});
+
+// 📦 Exit package (tokenized download): every page of the client's website, their
+// reports, rank history, and signed agreement — one zip, theirs to keep.
+app.get('/exit/:id/:token', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'exit', id)) return c.text('Not found', 404);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.text('Not found', 404);
+  const biz = client.business_name || client.name || 'your business';
+  const slug = await slugForClient(db, id);
+  const enc = new TextEncoder();
+  const entries = [];
+  if (slug) {
+    const rows = (await db.prepare('SELECT path, content, is_base64 FROM site_files WHERE slug = ?').bind(slug).all()).results || [];
+    for (const r of rows) {
+      const data = r.is_base64 ? Uint8Array.from(atob(r.content), (ch) => ch.charCodeAt(0)) : enc.encode(r.content);
+      entries.push({ name: `website/${r.path}`, data });
+    }
+  }
+  // reports + rank history from the repo (best effort, capped)
+  try {
+    if (slug && c.env.GITHUB_TOKEN) {
+      const settings = await getSettings(db);
+      const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+      const r = await fetch(`https://api.github.com/repos/${repo}/contents/reports/${slug}`, {
+        headers: { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' } });
+      if (r.ok) {
+        for (const f of (await r.json()).slice(0, 15)) {
+          const fr = await fetch(f.download_url, { headers: { 'User-Agent': 'conversionco-mission-control' } });
+          if (fr.ok) entries.push({ name: `reports/${f.name}`, data: new Uint8Array(await fr.arrayBuffer()) });
+        }
+      }
+    }
+  } catch { /* reports are a bonus */ }
+  const agr = await db.prepare('SELECT * FROM agreements WHERE client_id = ? ORDER BY id DESC LIMIT 1').bind(id).first();
+  if (agr) entries.push({ name: 'signed-agreement.txt', data: enc.encode(
+`Service agreement — signed copy of record
+
+Business: ${biz}
+Signed by: ${agr.signed_name}
+Date signed: ${agr.signed_at} UTC
+Agreement version: ${agr.version}${agr.package ? `\nPackage: ${agr.package}` : ''}
+`) });
+  entries.push({ name: 'README.txt', data: enc.encode(
+`${biz} — your complete website package
+=========================================
+
+Everything in this folder is yours to keep.
+
+WHAT'S INSIDE
+- website/  — every page and image of your website${slug ? '' : ' (your website was hosted separately, so this folder may be empty)'}
+- reports/  — your performance reports and Google position history
+- signed-agreement.txt — your signed agreement of record
+
+USING YOUR WEBSITE
+The website folder is plain HTML — any web host can serve it exactly as-is.
+Upload the contents of the website folder to the host of your choice and point
+your domain at it. Any web designer will know exactly what to do with these files.
+
+YOUR DETAILS
+- Business: ${biz}
+- Website address: ${client.live_url || client.preview_url || '—'}
+
+It was a pleasure building for ${biz}. If you ever want us back, the door is open.
+
+— The ConversionCo Team · conversionco918.com
+`) });
+  const zip = buildZip(entries);
+  return new Response(zip, { headers: { 'Content-Type': 'application/zip',
+    'Content-Disposition': `attachment; filename="${(slug || 'website')}-complete-package.zip"` } });
+});
+
+// 📦 Offboarding (admin button): emails the departing client a warm goodbye with
+// their complete package link. Deletes nothing, archives nothing — her call after.
+app.post('/api/clients/:id/exit-package', async (c) => {
+  const id = Number(c.req.param('id'));
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'not found' }, 404);
+  const settings = await getSettings(db);
+  const url = `${BASE_URL}/exit/${id}/${await portalToken(c.env, 'exit', id)}`;
+  const first = (client.name || '').split(' ')[0] || 'there';
+  const biz = client.business_name || client.name || 'your business';
+  const sent = await emailClient(c.env, db, client, settings,
+    `Everything we built for ${biz} — yours to keep`,
+    `<p>Hi ${first},</p>
+<p>Thank you for the time we spent working on ${biz} together. Everything we built for you is yours — no strings.</p>
+<p>This link downloads your complete package: every page of your website, your performance reports, your Google position history, and your signed agreement:</p>
+<p><a href="${url}">${url}</a></p>
+<p>Any web host or designer can take it from here — the files are ready to use exactly as they are. And if you ever want us back, just reply to this email. The door is always open.</p>
+<p>Wishing you and ${biz} nothing but growth,<br>The ConversionCo Team</p>`,
+    'exit_package_sent', `📦 Exit package emailed to ${client.email} — full website + reports + agreement`);
+  if (!sent) return c.json({ error: 'Email could not be sent (check GHL settings)' }, 502);
+  return c.json({ ok: true, url });
+});
+
+app.post('/api/billing/poll', async (c) => {
+  const n = await pollBilling(c.env);
+  return c.json({ ok: true, changed: n });
+});
+
+// Free-text vibe → derived palette. Saves the brief; restyles the site if built.
+app.post('/api/clients/:id/vibe', async (c) => {
+  const id = Number(c.req.param('id'));
+  const { vibe } = await c.req.json();
+  if (!vibe || !String(vibe).trim()) return c.json({ error: 'describe the vibe first' }, 400);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  const { label, tokens } = vibeToTokens(vibe);
+  await touchClient(db, id, { vibe: String(vibe).slice(0, 400), theme: '' });
+  const metas = (await db.prepare(`SELECT slug, content FROM site_files WHERE path='site-meta.json'`).all()).results || [];
+  let slug = null;
+  for (const m of metas) { try { if (JSON.parse(m.content).client_id === id) { slug = m.slug; break; } } catch {} }
+  if (!slug) {
+    await logEvent(db, id, 'vibe_set', `Vibe brief saved: "${String(vibe).slice(0, 80)}" → ${label} 🎨 (applies at build)`);
+    return c.json({ ok: true, applied: false, label });
+  }
+  const cssRow = await db.prepare(`SELECT content FROM site_files WHERE slug=? AND path='site.css'`).bind(slug).first();
+  if (!cssRow) return c.json({ error: 'site.css not found' }, 404);
+  let css = cssRow.content;
+  for (const [k, v] of Object.entries(tokens)) {
+    css = css.replace(new RegExp('(' + k.replace(/-/g, '\\-') + '\\s*:\\s*)#[0-9A-Fa-f]{3,8}'), '$1' + v);
+  }
+  if (!c.env.GITHUB_TOKEN) return c.json({ error: 'GITHUB_TOKEN not set' }, 500);
+  const settings = await getSettings(db);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  const path = `sites/${slug}/site.css`;
+  const ghHeaders = { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+  const getRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, { headers: ghHeaders });
+  const existing = getRes.ok ? await getRes.json() : null;
+  const b64 = btoa(unescape(encodeURIComponent(css)));
+  const putRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+    method: 'PUT', headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: `Vibe: "${String(vibe).slice(0, 50)}" → ${slug}`, content: b64, ...(existing?.sha ? { sha: existing.sha } : {}) }),
+  });
+  if (!putRes.ok) return c.json({ error: `GitHub commit failed: ${putRes.status}` }, 502);
+  await db.prepare(`UPDATE site_files SET content=?, updated_at=datetime('now') WHERE slug=? AND path='site.css'`).bind(css, slug).run();
+  await logEvent(db, id, 'vibe_set', `Vibe applied: "${String(vibe).slice(0, 60)}" → ${label} 🎨`);
+  return c.json({ ok: true, applied: true, label });
+});
+
+// Client logo: upload (stores master copy; also pushes into the client's site if built)
+app.post('/api/clients/:id/logo', async (c) => {
+  const id = Number(c.req.param('id'));
+  const { b64, ext = 'png' } = await c.req.json();
+  if (!b64) return c.json({ error: 'b64 required' }, 400);
+  const safeExt = ['png', 'jpg', 'webp'].includes(ext) ? ext : 'png';
+  const mime = safeExt === 'webp' ? 'image/webp' : safeExt === 'jpg' ? 'image/jpeg' : 'image/png';
+  const clean = b64.replace(/^data:[^,]+,/, '');
+  if (clean.length > 2_600_000) return c.json({ error: 'logo too large — keep it under ~1.8MB' }, 400);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  // master copy (slug outside sites/ namespace, never published)
+  await db.prepare(`INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
+    VALUES (?, 'logo', ?, ?, 1, datetime('now'))
+    ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, content_type=excluded.content_type, updated_at=datetime('now')`)
+    .bind(`_assets-${id}`, clean, mime).run();
+  // if a site exists, push the logo into it (GitHub + D1) as img/logo.<ext>
+  let applied = false;
+  const metas = (await db.prepare(`SELECT slug, content FROM site_files WHERE path='site-meta.json'`).all()).results || [];
+  let slug = null;
+  for (const m of metas) { try { if (JSON.parse(m.content).client_id === id) { slug = m.slug; break; } } catch {} }
+  if (slug && c.env.GITHUB_TOKEN) {
+    const settings = await getSettings(db);
+    const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+    const path = `sites/${slug}/img/logo.${safeExt}`;
+    const ghHeaders = { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+    const getRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, { headers: ghHeaders });
+    const existing = getRes.ok ? await getRes.json() : null;
+    const putRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+      method: 'PUT', headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: `Client logo → ${slug}`, content: clean, ...(existing?.sha ? { sha: existing.sha } : {}) }),
+    });
+    if (putRes.ok) {
+      await db.prepare(`INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
+        VALUES (?, ?, ?, ?, 1, datetime('now'))
+        ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, content_type=excluded.content_type, updated_at=datetime('now')`)
+        .bind(slug, `img/logo.${safeExt}`, clean, mime).run();
+      applied = true;
+    }
+  }
+  await logEvent(db, id, 'logo_uploaded', applied ? 'Logo uploaded and pushed to the live site 🖼' : 'Logo uploaded 🖼 (will be used at build time)');
+  return c.json({ ok: true, applied });
+});
+
+// Client photos: up to 6, same pattern as logo (master copy + push into built site)
+app.post('/api/clients/:id/photo', async (c) => {
+  const id = Number(c.req.param('id'));
+  const { b64, ext = 'jpg', n = 1 } = await c.req.json();
+  if (!b64) return c.json({ error: 'b64 required' }, 400);
+  const slot = Math.min(6, Math.max(1, Number(n) || 1));
+  const safeExt = ['png', 'jpg', 'webp'].includes(ext) ? ext : 'jpg';
+  const mime = safeExt === 'webp' ? 'image/webp' : safeExt === 'png' ? 'image/png' : 'image/jpeg';
+  const clean = b64.replace(/^data:[^,]+,/, '');
+  if (clean.length > 4_000_000) return c.json({ error: 'photo too large — keep under ~3MB' }, 400);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  await db.prepare(`INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
+    VALUES (?, ?, ?, ?, 1, datetime('now'))
+    ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, content_type=excluded.content_type, updated_at=datetime('now')`)
+    .bind(`_assets-${id}`, `photo-${slot}`, clean, mime).run();
+  let applied = false;
+  const metas = (await db.prepare(`SELECT slug, content FROM site_files WHERE path='site-meta.json'`).all()).results || [];
+  let slug = null;
+  for (const m of metas) { try { if (JSON.parse(m.content).client_id === id) { slug = m.slug; break; } } catch {} }
+  if (slug && c.env.GITHUB_TOKEN) {
+    const settings = await getSettings(db);
+    const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+    const path = `sites/${slug}/img/client-photo-${slot}.${safeExt}`;
+    const ghHeaders = { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+    const getRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, { headers: ghHeaders });
+    const existing = getRes.ok ? await getRes.json() : null;
+    const putRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+      method: 'PUT', headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: `Client photo ${slot} → ${slug}`, content: clean, ...(existing?.sha ? { sha: existing.sha } : {}) }),
+    });
+    if (putRes.ok) {
+      await db.prepare(`INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
+        VALUES (?, ?, ?, ?, 1, datetime('now'))
+        ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, content_type=excluded.content_type, updated_at=datetime('now')`)
+        .bind(slug, `img/client-photo-${slot}.${safeExt}`, clean, mime).run();
+      applied = true;
+    }
+  }
+  await logEvent(db, id, 'photo_uploaded', `Client photo ${slot} uploaded 📷${applied ? ' — available on the live site' : ' (used at build time)'}`);
+  return c.json({ ok: true, slot, applied });
+});
+
+app.get('/api/clients/:id/photo/:n', async (c) => {
+  const row = await c.env.DB.prepare(`SELECT content, content_type FROM site_files WHERE slug=? AND path=?`)
+    .bind(`_assets-${Number(c.req.param('id'))}`, `photo-${Math.min(6, Math.max(1, Number(c.req.param('n')) || 1))}`).first();
+  if (!row) return c.text('no photo', 404);
+  const bytes = Uint8Array.from(atob(row.content), (ch) => ch.charCodeAt(0));
+  return c.body(bytes, 200, { 'Content-Type': row.content_type, 'Cache-Control': 'no-store' });
+});
+
+// Serve the stored logo for the dashboard preview
+app.get('/api/clients/:id/logo', async (c) => {
+  const row = await c.env.DB.prepare(`SELECT content, content_type FROM site_files WHERE slug=? AND path='logo'`)
+    .bind(`_assets-${Number(c.req.param('id'))}`).first();
+  if (!row) return c.text('no logo', 404);
+  const bytes = Uint8Array.from(atob(row.content), (ch) => ch.charCodeAt(0));
+  return c.body(bytes, 200, { 'Content-Type': row.content_type, 'Cache-Control': 'no-store' });
+});
+
+// Apply a preset theme to a client's site: rewrites design tokens in site.css,
+// commits to GitHub and updates D1 so the preview restyles immediately.
+app.post('/api/clients/:id/theme', async (c) => {
+  const id = Number(c.req.param('id'));
+  const { theme } = await c.req.json();
+  const t = THEMES[theme];
+  if (!t) return c.json({ error: 'unknown theme' }, 400);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  // always remember the choice — the site generator uses it at build time
+  await touchClient(db, id, { theme });
+  const metas = (await db.prepare(`SELECT slug, content FROM site_files WHERE path='site-meta.json'`).all()).results || [];
+  let slug = null;
+  for (const m of metas) { try { if (JSON.parse(m.content).client_id === id) { slug = m.slug; break; } } catch {} }
+  if (!slug) {
+    await logEvent(db, id, 'theme_changed', `Theme preselected: ${t.label} 🎨 (will style the site at build time)`);
+    return c.json({ ok: true, saved: true, applied: false, theme, label: t.label });
+  }
+  const cssRow = await db.prepare(`SELECT content FROM site_files WHERE slug=? AND path='site.css'`).bind(slug).first();
+  if (!cssRow) return c.json({ error: 'site.css not found' }, 404);
+  let css = cssRow.content;
+  for (const [k, v] of Object.entries(t.tokens)) {
+    css = css.replace(new RegExp('(' + k.replace(/-/g, '\\-') + '\\s*:\\s*)#[0-9A-Fa-f]{3,8}'), '$1' + v);
+  }
+  if (!c.env.GITHUB_TOKEN) return c.json({ error: 'GITHUB_TOKEN not set' }, 500);
+  const settings = await getSettings(db);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  const path = `sites/${slug}/site.css`;
+  const ghHeaders = { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+  const getRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, { headers: ghHeaders });
+  const existing = getRes.ok ? await getRes.json() : null;
+  const b64 = btoa(unescape(encodeURIComponent(css)));
+  const putRes = await fetch(`https://api.github.com/repos/${repo}/contents/${path}`, {
+    method: 'PUT',
+    headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: `Theme: ${t.label} → ${slug}`, content: b64, ...(existing?.sha ? { sha: existing.sha } : {}) }),
+  });
+  if (!putRes.ok) return c.json({ error: `GitHub commit failed: ${putRes.status}` }, 502);
+  await db.prepare(`UPDATE site_files SET content=?, updated_at=datetime('now') WHERE slug=? AND path='site.css'`).bind(css, slug).run();
+  await logEvent(db, id, 'theme_changed', `Theme set to ${t.label} 🎨`);
+  return c.json({ ok: true, saved: true, applied: true, slug, theme, label: t.label });
+});
+
+// ---------------- API: settings & GHL utilities ----------------
+app.post('/api/settings', async (c) => {
+  const body = await c.req.json();
+  const allowed = [
+    'ghl_location_id', 'form1_id', 'form2_id', 'form1_link', 'form2_link', 'email_from',
+    'intake1_subject', 'intake1_body', 'intake2_subject', 'intake2_body',
+    'booking_link', 'booking_subject', 'booking_body',
+    'notify_email', 'sites_repo',
+  ];
+  for (const k of allowed) if (k in body) await setSetting(c.env.DB, k, body[k]);
+  return c.json({ ok: true });
+});
+
+// Test GHL connection + list forms so Tiffany can pick which is which
+app.get('/api/ghl/test', async (c) => {
+  const settings = await getSettings(c.env.DB);
+  if (!c.env.GHL_TOKEN) return c.json({ ok: false, error: 'GHL_TOKEN secret is not set on the worker.' });
+  if (!settings.ghl_location_id) return c.json({ ok: false, error: 'No Location ID saved yet — add it in Settings.' });
+  const ghl = ghlFor(c.env, settings);
+  try {
+    const [loc, sources] = await Promise.all([
+      ghl.getLocation().catch((e) => ({ error: e.message })),
+      ghl.listIntakeSources(),
+    ]);
+    return c.json({
+      ok: true,
+      location: loc?.location?.name || loc?.name || settings.ghl_location_id,
+      forms: sources,
+    });
+  } catch (e) {
+    return c.json({ ok: false, error: e.message });
+  }
+});
+
+// Admin passthrough to the GHL API (session-protected) — used for setup/config tasks
+app.post('/api/ghl/raw', async (c) => {
+  const { method = 'GET', path, query, body } = await c.req.json();
+  if (!path || !path.startsWith('/')) return c.json({ error: 'path required' }, 400);
+  const settings = await getSettings(c.env.DB);
+  const ghl = ghlFor(c.env, settings);
+  try {
+    const data = await ghl.req(method, path, { query, body });
+    return c.json({ ok: true, data });
+  } catch (e) {
+    return c.json({ ok: false, error: e.message, status: e.status, detail: e.data }, 200);
+  }
+});
+
+// Cloudflare API passthrough (session-protected) — for infra automation
+app.post('/api/cf/raw', async (c) => {
+  const { method = 'GET', path, body } = await c.req.json();
+  if (!path || !path.startsWith('/')) return c.json({ error: 'path required' }, 400);
+  const res = await fetch(`https://api.cloudflare.com/client/v4${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${c.env.CLOUDFLARE_API_TOKEN}`,
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  return c.json({ status: res.status, data });
+});
+
+// GitHub API passthrough (session-protected) — for repo automation
+app.post('/api/gh/raw', async (c) => {
+  if (!c.env.GITHUB_TOKEN) return c.json({ error: 'GITHUB_TOKEN secret not set' }, 400);
+  const { method = 'GET', path, body } = await c.req.json();
+  if (!path || !path.startsWith('/')) return c.json({ error: 'path required' }, 400);
+  const res = await fetch(`https://api.github.com${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${c.env.GITHUB_TOKEN}`,
+      'User-Agent': 'conversionco-mission-control',
+      Accept: 'application/vnd.github+json',
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  return c.json({ status: res.status, data });
+});
+
+// ---- site import machinery (shared by API endpoint + cron auto-publish) ----
+const BASE_URL = 'https://conversionco-mission-control.conversionco918.workers.dev';
+
+function ghFetcher(env) {
+  return async function gh(path) {
+    const res = await fetch(`https://api.github.com${path}`, {
+      headers: {
+        Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+        'User-Agent': 'conversionco-mission-control',
+        Accept: 'application/vnd.github+json',
+      },
+    });
+    if (!res.ok) throw new Error(`GitHub ${path} -> ${res.status}`);
+    return res.json();
+  };
+}
+
+async function importSite(env, settings, slug, clientId, treeFiles, opts = {}) {
+  // opts.quiet: republish of an existing site (Publish now / edit-watcher continuation) —
+  // import the files + clear the unpublished badge, but do NOT touch stage/hold/notify.
+  const db = env.DB;
+  const gh = ghFetcher(env);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  let files = treeFiles;
+  if (!files) {
+    const ref = await gh(`/repos/${repo}/git/ref/heads/main`);
+    const commit = await gh(`/repos/${repo}/git/commits/${ref.object.sha}`);
+    const tree = await gh(`/repos/${repo}/git/trees/${commit.tree.sha}?recursive=1`);
+    const prefix = `sites/${slug}/`;
+    files = (tree.tree || []).filter((t) => t.type === 'blob' && t.path.startsWith(prefix));
+  }
+  if (!files.length) throw new Error(`No files for ${slug}`);
+  const prefix = `sites/${slug}/`;
+  // SHA-AWARE INCREMENTAL IMPORT (7/26): only fetch blobs that actually changed,
+  // cap the per-invocation blob fetches (CF subrequest budget), and let the */5
+  // cron finish big imports across ticks. Returns {complete} so callers only
+  // mark the site published when every file is in.
+  const BLOB_BUDGET = 25;
+  const existingRows = (await db.prepare('SELECT path, gh_sha FROM site_files WHERE slug = ?').bind(slug).all()).results || [];
+  const haveSha = {}; for (const r of existingRows) haveSha[r.path] = r.gh_sha || '';
+  const wantPaths = new Set(files.map((f) => f.path.slice(prefix.length)));
+  // remove D1 rows for files deleted from the repo (cheap — no subrequests)
+  for (const r of existingRows) if (!wantPaths.has(r.path)) {
+    await db.prepare('DELETE FROM site_files WHERE slug = ? AND path = ?').bind(slug, r.path).run();
+  }
+  const changed = files.filter((f) => haveSha[f.path.slice(prefix.length)] !== f.sha);
+  const batch = changed.slice(0, BLOB_BUDGET);
+  let count = 0;
+  for (const f of batch) {
+    const blob = await gh(`/repos/${repo}/git/blobs/${f.sha}`);
+    const rel = f.path.slice(prefix.length);
+    const ext = (rel.split('.').pop() || '').toLowerCase();
+    const ctype = MIME[ext] || 'application/octet-stream';
+    const isText = /^(text\/|application\/(javascript|json|xml))/.test(ctype) || ext === 'svg';
+    const content = isText
+      ? new TextDecoder().decode(Uint8Array.from(atob(blob.content.replace(/\n/g, '')), (ch) => ch.charCodeAt(0)))
+      : blob.content.replace(/\n/g, '');
+    await db.prepare(
+      `INSERT INTO site_files (slug, path, content, content_type, is_base64, gh_sha, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+       ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, content_type=excluded.content_type,
+       is_base64=excluded.is_base64, gh_sha=excluded.gh_sha, updated_at=datetime('now')`
+    ).bind(slug, rel, content, ctype, isText ? 0 : 1, f.sha).run();
+    count++;
+  }
+  const metaEntry = files.find((f) => f.path === prefix + 'site-meta.json');
+  const remaining = changed.length - batch.length;
+  if (remaining > 0) {
+    await logEvent(db, clientId ? Number(clientId) : null, 'import_progress',
+      `📦 ${slug}: imported ${count} changed file(s) this pass — ${remaining} to go (continues automatically within 5 min)`);
+    return { files: count, remaining, complete: false, preview_url: `${BASE_URL}/preview/${slug}/`, meta_sha: metaEntry ? metaEntry.sha : '' };
+  }
+  // EDIT VISIBILITY: import is complete — repo and served copy now match, so the
+  // "📝 edits not yet published" badge (if any) clears and the feed gets a ✅.
+  try {
+    if (settings[`editpending_${slug}`]) {
+      await setSetting(db, `editpending_${slug}`, '');
+      await logEvent(db, clientId ? Number(clientId) : null, 'published',
+        `✅ ${slug} published — the edited files are now on the served copy (${BASE_URL}/preview/${slug}/)`);
+    }
+  } catch { /* badge cleanup must never block an import */ }
+  const previewUrl = `${BASE_URL}/preview/${slug}/`;
+  if (clientId && !opts.quiet) {
+    // prospects keep their stage — the demo just attaches to the card
+    const clP = await db.prepare('SELECT stage FROM clients WHERE id = ?').bind(Number(clientId)).first();
+    if (clP && clP.stage === 'prospect') {
+      await touchClient(db, Number(clientId), { preview_url: previewUrl });
+      await logEvent(db, Number(clientId), 'demo_ready', `💡 Prospect demo is live: ${previewUrl}`);
+      return { files: count, preview_url: previewUrl };
+    }
+    await touchClient(db, Number(clientId), { stage: 'preview_ready', preview_url: previewUrl });
+    await logEvent(db, Number(clientId), 'preview_ready', previewUrl);
+    // APPROVAL GATE (Tiffany 7/24): nothing reaches the client until she approves.
+    // The final invoice + the reveal email are sent by /api/clients/:id/approve-preview.
+    // Re-publishes of an already-approved site (revisions etc.) don't re-hold.
+    try {
+      const clientH = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(Number(clientId)).first();
+      const bH = getBilling(clientH);
+      const wasLive = clP && clP.stage === 'live';
+      if (!bH.preview_approved && !wasLive) {
+        if (!bH.preview_hold) {
+          bH.preview_hold = new Date().toISOString();
+          await touchClient(db, Number(clientId), { billing: JSON.stringify(bH) });
+        }
+        await logEvent(db, Number(clientId), 'preview_held', `⏸ Preview is HELD — the client has not been told. Review it, then hit "Send preview to client" on the dashboard.`);
+      }
+    } catch (e) { await logEvent(db, Number(clientId), 'error', `Preview-hold flag failed: ${e.message}`); }
+    if (settings.notify_email && settings.ghl_location_id) {
+      try {
+        const ghl = new GHL(env.GHL_TOKEN, settings.ghl_location_id);
+        const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(Number(clientId)).first();
+        const contact = await ghl.upsertContact({ email: settings.notify_email, name: 'ConversionCo Notifications' });
+        await ghl.sendEmail({
+          contactId: contact.id || contact.contactId,
+          subject: `🎉 Website ready: ${client?.business_name || client?.name || slug}`,
+          html: `<p>The site for <b>${client?.name || slug}</b> (${client?.email || ''}) is built and ready for your review.</p>
+                 <p><b>The client has NOT been told.</b> Nothing goes to them — no preview link, no final invoice, no portal reveal — until you approve it.</p>
+                 <p><a href="${previewUrl}">View the preview</a> &middot; <a href="${BASE_URL}">Open Mission Control</a></p>
+                 <p>Happy with it? Open their card and hit <b>📤 Send preview to client</b> — that sends the reveal email and the final-balance invoice in one go.</p>`,
+          emailFrom: settings.email_from || undefined,
+        });
+        await logEvent(db, Number(clientId), 'notified', `Notification sent to ${settings.notify_email}`);
+      } catch (e) {
+        await logEvent(db, Number(clientId), 'error', `Notify failed: ${e.message}`);
+      }
+    }
+  }
+  return { files: count, complete: true, preview_url: previewUrl, meta_sha: metaEntry ? metaEntry.sha : '' };
+}
+
+// Cron: auto-publish any new/updated site pushed to the client-sites repo
+async function autoPublish(env, settings) {
+  if (!env.GITHUB_TOKEN) return;
+  const db = env.DB;
+  const gh = ghFetcher(env);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  const ref = await gh(`/repos/${repo}/git/ref/heads/main`);
+  const commit = await gh(`/repos/${repo}/git/commits/${ref.object.sha}`);
+  const tree = await gh(`/repos/${repo}/git/trees/${commit.tree.sha}?recursive=1`);
+  const blobs = (tree.tree || []).filter((t) => t.type === 'blob');
+  const metas = blobs.filter((t) => /^sites\/[^/]+\/site-meta\.json$/.test(t.path));
+  for (const m of metas) {
+    const slug = m.path.split('/')[1];
+    const seenKey = `site_sha_${slug}`;
+    const seen = settings[seenKey];
+    if (seen === m.sha) continue; // unchanged
+    try {
+      const metaBlob = await gh(`/repos/${repo}/git/blobs/${m.sha}`);
+      const meta = JSON.parse(new TextDecoder().decode(
+        Uint8Array.from(atob(metaBlob.content.replace(/\n/g, '')), (ch) => ch.charCodeAt(0))));
+      const files = blobs.filter((t) => t.path.startsWith(`sites/${slug}/`));
+      const r = await importSite(env, settings, slug, meta.client_id, files);
+      if (!r.complete) continue; // partial pass — the next cron tick resumes; only mark seen when done
+      await setSetting(db, seenKey, m.sha);
+      await logEvent(db, meta.client_id || null, 'auto_published', `${slug} auto-published from GitHub`);
+    } catch (e) {
+      await logEvent(db, null, 'error', `Auto-publish ${slug} failed: ${e.message}`);
+    }
+  }
+}
+
+// ============================ EDIT VISIBILITY (8/5) ============================
+// Tiffany's law: "I want to SEE edits, not guess."
+// 1) editWatch (cron */5): every new commit touching a client's site folder becomes
+//    a feed event + an owner email — files, message, source, published-or-pending.
+// 2) editpending_<slug> setting powers the amber "📝 edits not yet published" badge
+//    (cleared inside importSite the moment an import completes).
+// 3) continuePublish: finishes multi-pass "Publish now" imports across cron ticks
+//    (autoPublish only resumes on site-meta changes; publish-now must self-drive).
+
+function editSource(cm) {
+  const an = (cm.commit && cm.commit.author && cm.commit.author.name) || '';
+  const cn = (cm.commit && cm.commit.committer && cm.commit.committer.name) || '';
+  const login = (cm.author && cm.author.login) || '';
+  if (cn === 'GitHub' && /conversionco/i.test(an + login)) return 'Claude bridge / builder';
+  if (cn === 'GitHub') return (an || login || 'someone') + ' (web edit)';
+  if (/conversionco|mission-control/i.test(an + login)) return 'Claude bridge / builder';
+  return (an || login || 'unknown') + ' (git push)';
+}
+
+async function slugClientId(db, slug) {
+  try {
+    const row = await db.prepare(`SELECT content FROM site_files WHERE slug = ? AND path = 'site-meta.json'`).bind(slug).first();
+    if (row && row.content) { const m = JSON.parse(row.content); if (m.client_id) return Number(m.client_id); }
+  } catch { /* fall through */ }
+  return null;
+}
+
+async function editWatch(env, settings) {
+  if (!env.GITHUB_TOKEN) return;
+  const db = env.DB;
+  const gh = ghFetcher(env);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  const ref = await gh(`/repos/${repo}/git/ref/heads/main`);
+  const headSha = ref.object.sha;
+  if (settings.editwatch_head === headSha) return; // nothing new anywhere in the repo
+  const commit = await gh(`/repos/${repo}/git/commits/${headSha}`);
+  const tree = await gh(`/repos/${repo}/git/trees/${commit.tree.sha}?recursive=1`);
+  const entries = tree.tree || [];
+  const slugDirs = entries.filter((t) => t.type === 'tree' && /^sites\/[^/]+$/.test(t.path));
+  let mailShas = []; try { mailShas = JSON.parse(settings.editmail_shas || '[]'); } catch {}
+  let mailDirty = false;
+  for (const d of slugDirs) {
+    const slug = d.path.split('/')[1];
+    const key = `editwatch_${slug}`;
+    let st = {}; try { st = JSON.parse(settings[key] || '{}'); } catch {}
+    const folderChanged = st.tree !== d.sha;
+    const clientId = await slugClientId(db, slug);
+    // ---- recompute the unpublished badge (repo shas vs imported shas) ----
+    let staleCount = -1; // -1 = unknown / never imported
+    try {
+      const prefix = `sites/${slug}/`;
+      const repoFiles = entries.filter((t) => t.type === 'blob' && t.path.startsWith(prefix));
+      const dbRows = (await db.prepare('SELECT path, gh_sha FROM site_files WHERE slug = ?').bind(slug).all()).results || [];
+      if (dbRows.length) { // only badge sites that have been imported at least once
+        const have = {}; for (const r of dbRows) have[r.path] = r.gh_sha || '';
+        const stale = repoFiles.filter((f) => have[f.path.slice(prefix.length)] !== f.sha);
+        staleCount = stale.length;
+        let pend = {}; try { pend = JSON.parse(settings[`editpending_${slug}`] || '{}'); } catch {}
+        if (stale.length) {
+          const next = {
+            n: stale.length,
+            since: pend.since || new Date().toISOString(),
+            files: stale.slice(0, 8).map((f) => f.path.slice(prefix.length)),
+            head: headSha.slice(0, 10),
+            client_id: clientId,
+          };
+          await setSetting(db, `editpending_${slug}`, JSON.stringify(next));
+        } else if (pend.n) {
+          await setSetting(db, `editpending_${slug}`, '');
+        }
+      }
+    } catch { /* badge is best-effort; the watcher must keep walking */ }
+    if (!folderChanged) continue;
+    // ---- new commits touching this folder ----
+    if (!st.sha) {
+      // first run: baseline silently so we never spam history as "new edits"
+      await setSetting(db, key, JSON.stringify({ sha: headSha, tree: d.sha, at: new Date().toISOString() }));
+      continue;
+    }
+    let fresh = [];
+    try {
+      const list = await gh(`/repos/${repo}/commits?path=${encodeURIComponent('sites/' + slug)}&per_page=15&sha=${headSha}`);
+      for (const cm of list) { if (cm.sha === st.sha) break; fresh.push(cm); }
+    } catch (e) { await logEvent(db, clientId, 'error', `Edit-watcher commit list failed for ${slug}: ${e.message}`); continue; }
+    // mark seen FIRST — a crash mid-loop must never produce duplicate emails
+    await setSetting(db, key, JSON.stringify({ sha: headSha, tree: d.sha, at: new Date().toISOString() }));
+    fresh.reverse(); // oldest first so the feed reads chronologically
+    for (const cm of fresh) {
+      const short = cm.sha.slice(0, 7);
+      // event dedupe by sha (survives marker resets)
+      const dup = await db.prepare(`SELECT id FROM events WHERE type = 'site_edit' AND detail LIKE ? LIMIT 1`).bind(`%[${short}]%`).first();
+      if (dup) continue;
+      let filesChanged = [], msg = (cm.commit && cm.commit.message) || '';
+      try {
+        const detail = await gh(`/repos/${repo}/commits/${cm.sha}`);
+        filesChanged = (detail.files || []).map((f) => f.filename).filter((p) => p.startsWith(`sites/${slug}/`)).map((p) => p.split('/').slice(2).join('/'));
+        msg = (detail.commit && detail.commit.message) || msg;
+      } catch { /* files list is nice-to-have */ }
+      const src = editSource(cm);
+      const when = (cm.commit && cm.commit.author && cm.commit.author.date) || new Date().toISOString();
+      const fileLine = filesChanged.length ? `${filesChanged.length} file(s): ${filesChanged.slice(0, 6).join(', ')}${filesChanged.length > 6 ? ' +' + (filesChanged.length - 6) + ' more' : ''}` : 'files unavailable';
+      const msgLine = String(msg).split('\n')[0].slice(0, 120);
+      await logEvent(db, clientId, 'site_edit',
+        `📝 ${slug} edited — ${fileLine} — "${msgLine}" — by ${src} [${short}]`);
+      // ---- email (deduped by full sha, rolling window) ----
+      if (mailShas.includes(cm.sha)) continue;
+      mailShas.push(cm.sha); mailDirty = true;
+      const published = staleCount === 0;
+      const filesHtml = filesChanged.length ? filesChanged.slice(0, 12).map((p) => `<li><code>${p.replace(/[<>&]/g, '')}</code></li>`).join('') : '<li>(file list unavailable)</li>';
+      await notifyOwner(env, settings, `📝 Site edited: ${slug} — ${filesChanged.length || '?'} file(s)`,
+        `<p><b>${slug}</b> was just edited by <b>${src.replace(/[<>&]/g, '')}</b> (${new Date(when).toUTCString()}).</p>` +
+        `<ul>${filesHtml}</ul>` +
+        `<p>Commit note: "${msgLine.replace(/[<>&]/g, '')}" <span style="color:#94a3b8">[${short}]</span></p>` +
+        `<p>${published ? '✅ Already published — the served copy matches the repo.' : '⏳ NOT yet published — the live/preview copy does not have this yet. Open the card and hit <b>🚀 Publish now</b>, or it publishes with the next version bump.'}</p>` +
+        `<p><a href="${BASE_URL}/activity">See all site activity</a> · <a href="${BASE_URL}">Open Mission Control</a></p>`);
+    }
+  }
+  if (mailDirty) await setSetting(db, 'editmail_shas', JSON.stringify(mailShas.slice(-120)));
+  await setSetting(db, 'editwatch_head', headSha);
+}
+
+// Cron: finish "Publish now" imports that needed more than one 25-blob pass
+async function continuePublish(env, settings) {
+  if (!env.GITHUB_TOKEN) return;
+  const db = env.DB;
+  const rows = (await db.prepare(`SELECT key, value FROM settings WHERE key LIKE 'pubq_%' AND value != ''`).all()).results || [];
+  for (const row of rows) {
+    const slug = row.key.slice(5);
+    let q = {}; try { q = JSON.parse(row.value || '{}'); } catch {}
+    try {
+      const r = await importSite(env, settings, slug, q.client_id || null, undefined, { quiet: true });
+      if (r.complete) {
+        if (r.meta_sha) await setSetting(db, `site_sha_${slug}`, r.meta_sha);
+        await setSetting(db, row.key, '');
+      }
+    } catch (e) {
+      await setSetting(db, row.key, '');
+      await logEvent(db, q.client_id || null, 'error', `Publish-now continuation failed for ${slug}: ${e.message}`);
+    }
+  }
+}
+
+// Manual import endpoint (session-protected)
+app.post('/api/sites/import', async (c) => {
+  const { slug, client_id } = await c.req.json();
+  if (!slug) return c.json({ error: 'slug required' }, 400);
+  if (!c.env.GITHUB_TOKEN) return c.json({ error: 'GITHUB_TOKEN secret not set' }, 400);
+  const settings = await getSettings(c.env.DB);
+  try {
+    const r = await importSite(c.env, settings, slug, client_id);
+    return c.json({ ok: true, ...r });
+  } catch (e) {
+    return c.json({ ok: false, error: e.message }, 502);
+  }
+});
+
+// 🚀 PUBLISH NOW (session-protected): force the import for a slug WITHOUT a
+// site-meta version bump — the button next to the "edits not yet published" badge.
+// Quiet import: files only; never demotes stage, never re-holds, never emails clients.
+app.post('/api/sites/publish-now', async (c) => {
+  const { slug, client_id } = await c.req.json().catch(() => ({}));
+  if (!slug || !/^[a-z0-9-]+$/.test(String(slug))) return c.json({ error: 'valid slug required' }, 400);
+  if (!c.env.GITHUB_TOKEN) return c.json({ error: 'GITHUB_TOKEN secret not set' }, 400);
+  const db = c.env.DB;
+  const settings = await getSettings(db);
+  const cid = client_id ? Number(client_id) : await slugClientId(db, slug);
+  try {
+    const r = await importSite(c.env, settings, slug, cid, undefined, { quiet: true });
+    if (r.complete) {
+      if (r.meta_sha) await setSetting(db, `site_sha_${slug}`, r.meta_sha); // keep autoPublish in sync
+      await setSetting(db, `pubq_${slug}`, '');
+      return c.json({ ok: true, complete: true, files: r.files, preview_url: r.preview_url });
+    }
+    // more than one 25-blob pass needed — the */5 cron continues it automatically
+    await setSetting(db, `pubq_${slug}`, JSON.stringify({ client_id: cid, started: new Date().toISOString() }));
+    return c.json({ ok: true, complete: false, files: r.files, remaining: r.remaining, preview_url: r.preview_url });
+  } catch (e) {
+    return c.json({ ok: false, error: e.message }, 502);
+  }
+});
+
+// Test Cloudflare API token (used by the site-builder to publish client sites)
+app.get('/api/cf/test', async (c) => {
+  if (!c.env.CLOUDFLARE_API_TOKEN) return c.json({ ok: false, error: 'CLOUDFLARE_API_TOKEN secret is not set yet.' });
+  try {
+    const res = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${c.env.CF_ACCOUNT_ID}/pages/projects`,
+      { headers: { Authorization: `Bearer ${c.env.CLOUDFLARE_API_TOKEN}` } }
+    );
+    const data = await res.json();
+    if (!data.success) return c.json({ ok: false, error: JSON.stringify(data.errors).slice(0, 300) });
+    return c.json({ ok: true, projects: (data.result || []).map((p) => p.name) });
+  } catch (e) {
+    return c.json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/poll-now', async (c) => {
+  const settings = await getSettings(c.env.DB);
+  try {
+    const result = await pollForms(c.env, settings);
+    return c.json({ ok: true, ...result });
+  } catch (e) {
+    return c.json({ ok: false, error: e.message }, 502);
+  }
+});
+
+// ---------------- form submission polling ----------------
+function extractSubmissionFields(sub) {
+  // GHL submissions put answers in `others` plus top-level name/email fields
+  const out = {};
+  const others = sub.others || {};
+  for (const [k, v] of Object.entries(others)) {
+    if (k.startsWith('__') || v === null || v === undefined) continue;
+    out[k] = typeof v === 'object' ? JSON.stringify(v) : String(v);
+  }
+  for (const k of ['name', 'email', 'phone']) if (sub[k]) out[k] = sub[k];
+  return out;
+}
+
+async function pollForms(env, settings) {
+  const db = env.DB;
+  if (!settings.ghl_location_id) return { skipped: 'no location id' };
+  const ghl = new GHL(env.GHL_TOKEN, settings.ghl_location_id);
+
+  // look back 7 days so nothing is missed even after downtime
+  const startAt = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString().slice(0, 10);
+  const endAt = new Date(Date.now() + 24 * 3600 * 1000).toISOString().slice(0, 10);
+
+  let processed = 0;
+  for (const [formKey, dataCol, doneStage, minStages] of [
+    ['form1_id', 'intake1_data', 'intake1_done', ['new', 'intake1_sent']],
+    ['form2_id', 'intake2_data', 'intake2_done', ['new', 'intake1_sent', 'intake1_done', 'intake2_sent']],
+  ]) {
+    const formId = settings[formKey];
+    if (!formId) continue;
+    const subs = await ghl.intakeSubmissions(formId, { startAt, endAt });
+    for (const sub of subs) {
+      const email = (sub.email || sub.others?.email || '').trim();
+      if (!email) continue;
+      const fields = extractSubmissionFields(sub);
+      const client = await db.prepare('SELECT * FROM clients WHERE email = ?').bind(email).first();
+      if (!client) {
+        // Someone found the form on their own — still capture them
+        const r = await db.prepare(
+          `INSERT INTO clients (email, name, phone, stage, ${dataCol}) VALUES (?, ?, ?, ?, ?)`
+        ).bind(email, sub.name || '', sub.phone || '', doneStage, JSON.stringify(fields)).run();
+        await logEvent(db, r.meta.last_row_id, doneStage, 'Form submitted (new contact, captured by poll)');
+        processed++;
+        continue;
+      }
+      const already = client[dataCol] && client[dataCol].length > 2;
+      if (already) continue;
+      const updates = { [dataCol]: JSON.stringify(fields) };
+      if (sub.name && !client.name) updates.name = sub.name;
+      if (sub.phone && !client.phone) updates.phone = sub.phone;
+      if (minStages.includes(client.stage)) updates.stage = doneStage;
+      await touchClient(db, client.id, updates);
+      await logEvent(db, client.id, doneStage, 'Form submission received');
+      processed++;
+    }
+  }
+  await setSetting(db, 'last_poll_at', new Date().toISOString());
+  return { processed };
+}
+
+
+// ---------------- daily uptime monitoring (runs on the daily cron) ----------------
+// One-line email to Tiffany (notify_email) — used by alerts across the system
+async function notifyOwner(env, settings, subject, html) {
+  if (!settings.notify_email || !env.GHL_TOKEN || !settings.ghl_location_id) return false;
+  try {
+    const ghl = new GHL(env.GHL_TOKEN, settings.ghl_location_id);
+    const contact = await ghl.upsertContact({ email: settings.notify_email, name: 'ConversionCo Notifications' });
+    await ghl.sendEmail({ contactId: contact.id || contact.contactId, subject, html, emailFrom: settings.email_from || undefined });
+    return true;
+  } catch { return false; }
+}
+
+// 🗄 NIGHTLY BACKUP: every core table → backups/db-latest.json in the worker's own
+// repo. Git history keeps every day's version, so any date can be restored.
+async function backupDatabase(env) {
+  const db = env.DB;
+  if (!env.GITHUB_TOKEN) return { ok: false, error: 'no GITHUB_TOKEN' };
+  const dump = { at: new Date().toISOString(), tables: {} };
+  const grab = async (name, sql) => {
+    try { dump.tables[name] = (await db.prepare(sql).all()).results || []; } catch (e) { dump.tables[name] = { error: String(e.message).slice(0, 120) }; }
+  };
+  await grab('clients', 'SELECT * FROM clients');
+  await grab('settings', 'SELECT * FROM settings');
+  await grab('leads', 'SELECT * FROM leads');
+  await grab('revisions', 'SELECT * FROM revisions');
+  await grab('agreements', 'SELECT * FROM agreements');
+  await grab('events', 'SELECT * FROM events ORDER BY id DESC LIMIT 5000');
+  await grab('hits', `SELECT * FROM hits WHERE day > date('now','-90 days')`);
+  await grab('email_log', `SELECT id, client_id, to_email, subject, status, attempts, error, created_at, sent_at FROM email_log ORDER BY id DESC LIMIT 2000`);
+  // client asset library (logos + photos live ONLY in D1 — everything else is rebuildable from the sites repo)
+  await grab('site_files_assets', `SELECT * FROM site_files WHERE slug LIKE '_assets-%'`);
+  const bytes = new TextEncoder().encode(JSON.stringify(dump));
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 8192) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+  const content = btoa(bin);
+  const repo = 'conversionco918/conversionco-mission-control';
+  const api = `https://api.github.com/repos/${repo}/contents/backups/db-latest.json`;
+  const ghHeaders = { Authorization: `Bearer ${env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+  const getRes = await fetch(api, { headers: ghHeaders });
+  const existing = getRes.ok ? await getRes.json() : null;
+  const putRes = await fetch(api, { method: 'PUT', headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: `Nightly backup ${dump.at.slice(0, 10)}`, content, ...(existing && existing.sha ? { sha: existing.sha } : {}) }) });
+  if (!putRes.ok) {
+    const err = await putRes.text();
+    await logEvent(db, null, 'error', `🗄⛔ Nightly backup FAILED: HTTP ${putRes.status} ${err.slice(0, 120)}`);
+    return { ok: false, error: `HTTP ${putRes.status}` };
+  }
+  await logEvent(db, null, 'backup_done', `🗄 Nightly backup saved (${Math.round(bytes.length / 1024)} KB, ${Object.keys(dump.tables).length} tables)`);
+  return { ok: true, bytes: bytes.length };
+}
+
+// 🔑 GITHUB KEY HEALTH: runs daily. Checks the worker's token is alive, reads its
+// expiry header when GitHub provides one, and reminds about the engines' key
+// (minted ~7/22, ~90 days) starting Oct 6 — BEFORE anything silently breaks.
+async function githubTokenHealth(env) {
+  const db = env.DB;
+  const settings = await getSettings(db);
+  if (env.GITHUB_TOKEN) {
+    try {
+      const r = await fetch('https://api.github.com/user', { headers: { Authorization: `Bearer ${env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control' } });
+      if (r.status === 401 || r.status === 403) {
+        await logEvent(db, null, 'error', `🔑⛔ The worker's GitHub key is being rejected (HTTP ${r.status}) — publishing, rollback, photos, and backups are all stopped until it's replaced`);
+        await notifyOwner(env, settings, '⛔ ACTION NEEDED: Mission Control GitHub key rejected',
+          `<p>The GitHub key inside Mission Control is being rejected. Publishing, rollbacks, client photos, and nightly backups are paused until it's replaced.</p><p>Fix: GitHub → Settings → Developer settings → Personal access tokens → generate a new token for the two conversionco repos → paste it as the GITHUB_TOKEN secret in the Cloudflare worker.</p>`);
+      } else {
+        const exp = r.headers.get('github-authentication-token-expiration');
+        if (exp) {
+          const days = Math.round((Date.parse(exp) - Date.now()) / 86400000);
+          if (days <= 14 && days >= 0 && settings.gh_exp_warned !== exp) {
+            await setSetting(db, 'gh_exp_warned', exp);
+            await notifyOwner(env, settings, `🔑 Heads up: Mission Control's GitHub key expires in ${days} days`,
+              `<p>The worker's GitHub key expires <b>${exp}</b>. Two-minute fix before then: generate a replacement token on GitHub and paste it as the GITHUB_TOKEN secret in the Cloudflare worker.</p>`);
+          }
+        }
+      }
+    } catch { /* network blip — next daily run catches it */ }
+  }
+  // the report/blog engines' key (embedded in the scheduled tasks) — date-based reminder
+  const today = new Date().toISOString().slice(0, 10);
+  if (today >= '2026-10-06' && !settings.pat_reminder_sent) {
+    await setSetting(db, 'pat_reminder_sent', '1');
+    await logEvent(db, null, 'error', "🔑⏰ The engines' GitHub key (blogs/reports/rank checks) was minted ~July 22 and expires around Oct 20 — rotate it now, before the engines silently stop");
+    await notifyOwner(env, settings, "🔑 ACTION NEEDED SOON: the engines' GitHub key expires around Oct 20",
+      `<p>The GitHub key your weekly blogs, rank checks, and reports use was created around July 22 and expires around <b>October 20</b>. When it dies, those runs stop silently.</p><p>Ask Claude to "rotate the engines' GitHub key" — it knows the 5-minute procedure (new token on GitHub, then update the four scheduled tasks).</p>`);
+  }
+}
+
+// 🚨 QUEUE WATCH: paid clients and queued revisions must NEVER sit silently.
+// If the scheduled build/revision sessions stall for any reason, Tiffany hears
+// about it within the hour — instead of a client quietly waiting.
+async function queueWatch(env, settings) {
+  const db = env.DB;
+  const now = Date.now();
+  // paid + intake2_done clients waiting on a build for 90+ minutes
+  const waiting = (await db.prepare(`SELECT * FROM clients WHERE stage = 'intake2_done'`).all()).results || [];
+  let anyStalled = false;
+  for (const cl of waiting) {
+    let b = {}; try { b = JSON.parse(cl.billing || '{}'); } catch {}
+    if (!depositPaid(b)) continue;
+    const readyAt = Date.parse((cl.updated_at || '').replace(' ', 'T') + 'Z') || now;
+    if (now - readyAt < 40 * 60 * 1000) continue;
+    anyStalled = true;
+    const last = Number(settings[`qw_build_${cl.id}`] || 0);
+    if (now - last < 12 * 60 * 60 * 1000) continue;
+    await setSetting(db, `qw_build_${cl.id}`, String(now));
+    const biz = cl.business_name || cl.name || cl.email;
+    const hrs = Math.round((now - readyAt) / 3600000 * 10) / 10;
+    await logEvent(db, cl.id, 'error', `🚨 BUILD STALLED: ${biz} has been paid + build-ready for ~${hrs}h with no build started — the builder task may not be running`);
+    await notifyOwner(env, settings, `🚨 Build stalled: ${biz} is waiting`,
+      `<p><b>${biz}</b> paid their deposit and finished intake ~${hrs} hours ago, but no build has started. The scheduled builder may be stuck.</p><p>The system is auto-pulling the fire cord every hour until it builds. Backup: open a Claude session and say "build client ${cl.id} now".</p>`);
+  }
+  // SELF-HEALING (7/25): a stalled paid build auto-pulls the fire cord hourly —
+  // same signal as the dashboard 🔥 button — until someone picks it up.
+  if (anyStalled) {
+    const lastFire = Number(settings.qw_autofire || 0);
+    if (now - lastFire > 20 * 60 * 1000) {
+      await setSetting(db, 'qw_autofire', String(now));
+      const r = await fireSignal(env, db, 'AUTO: stalled build recovery').catch((e) => ({ ok: false, error: e.message }));
+      await logEvent(db, null, 'fire_requested', r.ok
+        ? `🔥 AUTO-FIRE: stalled build detected — fire cord pulled automatically (${r.waiting} waiting)`
+        : `⚠️ Auto-fire failed: ${r.error}`);
+    }
+  }
+  // revisions pending for 2+ hours (the runner fires hourly — 2h late = stalled)
+  const oldRevs = (await db.prepare(`SELECT r.*, c.business_name FROM revisions r LEFT JOIN clients c ON c.id = r.client_id WHERE r.status = 'pending' AND r.created_at < datetime('now','-2 hours')`).all()).results || [];
+  if (oldRevs.length) {
+    const last = Number(settings.qw_revisions || 0);
+    if (now - last > 6 * 60 * 60 * 1000) {
+      await setSetting(db, 'qw_revisions', String(now));
+      await logEvent(db, null, 'error', `🚨 REVISIONS STALLED: ${oldRevs.length} change(s) pending 2+ hours — the hourly runner may not be completing`);
+      await notifyOwner(env, settings, `🚨 ${oldRevs.length} website change(s) stuck in the queue`,
+        `<p>These have been waiting 2+ hours (the runner normally clears them hourly):</p><p>${oldRevs.slice(0, 5).map((r) => `• ${r.business_name || 'client ' + r.client_id}: "${String(r.request).slice(0, 70)}"`).join('<br>')}</p><p>Check the revision-runner scheduled task's last run in your Claude app, or ask Claude to apply them directly.</p>`);
+    }
+  }
+}
+
+// ⛑ DOWN WATCH: every 5 minutes, quick check of every LIVE client domain.
+// 2 consecutive fails (~10 min down) → one immediate alert. Recovery → one all-clear.
+async function downWatch(env, settings) {
+  const db = env.DB;
+  const clients = (await db.prepare(`SELECT * FROM clients WHERE stage = 'live' AND live_url != ''`).all()).results || [];
+  for (const client of clients) {
+    let up = true;
+    try { const r = await fetch(client.live_url, { method: 'GET', redirect: 'follow', cf: { cacheTtl: 0 } }); up = r.ok; } catch { up = false; }
+    const key = `downwatch_${client.id}`;
+    let st = {}; try { st = JSON.parse(settings[key] || '{}'); } catch {}
+    const biz = client.business_name || client.name || client.email;
+    if (up) {
+      if (st.alerted) {
+        const mins = st.since ? Math.max(5, Math.round((Date.now() - Date.parse(st.since)) / 60000)) : 0;
+        await logEvent(db, client.id, 'site_recovered', `✅ ${biz} is BACK UP after ~${mins} min`);
+        await notifyOwner(env, settings, `✅ Back up: ${biz}`, `<p><b>${biz}</b> (${client.live_url}) is reachable again after ~${mins} minutes down.</p>`);
+      }
+      if (st.fails || st.alerted) await setSetting(db, key, JSON.stringify({}));
+    } else {
+      st.fails = (st.fails || 0) + 1;
+      if (!st.since) st.since = new Date().toISOString();
+      if (st.fails >= 2 && !st.alerted) {
+        st.alerted = true;
+        await logEvent(db, client.id, 'site_down', `⛔ ${biz} has failed 2 checks in a row (~10 min) — alert sent`);
+        await notifyOwner(env, settings, `⛔ SITE DOWN: ${biz}`,
+          `<p><b>${biz}</b> (${client.live_url}) has failed two checks in a row — it has likely been unreachable for ~10 minutes.</p><p><a href="${BASE_URL}">Open Mission Control</a> · You'll get one more email when it recovers.</p>`);
+      }
+      await setSetting(db, key, JSON.stringify(st));
+    }
+  }
+}
+
+async function dailyUptime(env) {
+  const db = env.DB;
+  const settings = await getSettings(db);
+  const clients = (await db.prepare(`SELECT * FROM clients WHERE preview_url != '' OR live_url != ''`).all()).results || [];
+  const results = [];
+  for (const client of clients) {
+    let up = false, how = '';
+    if (client.live_url) {
+      try {
+        const r = await fetch(client.live_url, { method: 'GET', redirect: 'follow', cf: { cacheTtl: 0 } });
+        up = r.ok; how = `live domain HTTP ${r.status}`;
+      } catch (e) { up = false; how = `live domain unreachable (${String(e.message).slice(0, 60)})`; }
+    } else {
+      // preview-hosted: the worker itself serves it — verify the site files are intact in D1
+      const metas = (await db.prepare(`SELECT slug, content FROM site_files WHERE path='site-meta.json'`).all()).results || [];
+      let slug = null;
+      for (const m of metas) { try { if (JSON.parse(m.content).client_id === client.id) { slug = m.slug; break; } } catch {} }
+      if (slug) {
+        const idx = await db.prepare(`SELECT length(content) AS n FROM site_files WHERE slug=? AND path='index.html'`).bind(slug).first();
+        up = !!(idx && idx.n > 500); how = up ? 'preview serving from storage' : 'site files missing/corrupt';
+      } else { up = true; how = 'no site yet (skipped)'; }
+    }
+    // rolling stats per client
+    const key = `uptime_${client.id}`;
+    let st = {}; try { st = JSON.parse(settings[key] || '{}'); } catch {}
+    st.total = (st.total || 0) + 1;
+    if (!up) st.fails = (st.fails || 0) + 1;
+    st.last = up ? 'up' : 'down'; st.how = how; st.at = new Date().toISOString();
+    await setSetting(db, key, JSON.stringify(st));
+    // score journey: record today's score so the portal can draw the climb
+    try {
+      const sc = await computeScore(db, client, settings);
+      if (sc) {
+        let hist = []; try { hist = JSON.parse(settings[`scorehist_${client.id}`] || '[]'); } catch {}
+        const today = new Date().toISOString().slice(0, 10);
+        if (!hist.length || hist[hist.length - 1].d !== today) hist.push({ d: today, s: sc.total });
+        else hist[hist.length - 1].s = sc.total;
+        await setSetting(db, `scorehist_${client.id}`, JSON.stringify(hist.slice(-90)));
+      }
+    } catch { /* history is best-effort */ }
+    results.push({ id: client.id, name: client.business_name || client.name || client.email, up, how });
+    if (!up) {
+      await logEvent(db, client.id, 'site_down', `⛔ SITE CHECK FAILED — ${how}`);
+      if (settings.notify_email && settings.ghl_location_id && env.GHL_TOKEN) {
+        try {
+          const ghl = new GHL(env.GHL_TOKEN, settings.ghl_location_id);
+          const contact = await ghl.upsertContact({ email: settings.notify_email, name: 'ConversionCo Notifications' });
+          await ghl.sendEmail({
+            contactId: contact.id || contact.contactId,
+            subject: `⛔ Site check failed: ${client.business_name || client.name || client.email}`,
+            html: `<p><b>${client.business_name || client.name || client.email}</b> failed today's automated site check.</p><p>${how}</p><p><a href="${BASE_URL}">Open Mission Control</a></p>`,
+            emailFrom: settings.email_from || undefined,
+          });
+        } catch { /* alert email best-effort */ }
+      }
+    }
+  }
+  const downs = results.filter((r) => !r.up).length;
+  await logEvent(db, null, 'uptime_check', `Daily site check: ${results.length - downs}/${results.length} up ✅${downs ? ` — ${downs} DOWN ⛔` : ''}`);
+  return results;
+}
+
+// Onboarding autopilot (added 7/24): the system sends its own friendly nudges so
+// Tiffany never has to chase people. Each nudge fires at most once (flags in billing
+// JSON), in the personal email style, and is logged to the feed.
+const NUDGES = [
+  { flag: 'n_agr1', days: 2, when: (b, cl, signed) => b.agr_sent && !signed,
+    since: (b) => b.agr_sent,
+    subject: (biz) => `Quick nudge — your agreement is waiting`,
+    body: (first, biz, links) => `<p>Hi ${first},</p><p>Just a friendly nudge — your ConversionCo service agreement is still waiting for a signature. It's a two-minute read, and the moment it's signed we can get ${biz} moving:</p><p><a href="${links.agr}">${links.agr}</a></p><p>Any questions about anything in it, just reply — happy to walk you through.</p><p>Talk soon,<br>The ConversionCo Team</p>` },
+  { flag: 'n_agr2', days: 5, when: (b, cl, signed) => b.agr_sent && !signed,
+    since: (b) => b.agr_sent,
+    subject: (biz) => `Still excited to build ${biz}`,
+    body: (first, biz, links) => `<p>Hi ${first},</p><p>We're still holding your spot in the build calendar for ${biz}. The only thing between you and a start date is the two-minute agreement:</p><p><a href="${links.agr}">${links.agr}</a></p><p>If timing has changed or you have questions, just reply and tell me where you're at — no pressure either way.</p><p>Talk soon,<br>The ConversionCo Team</p>` },
+  { flag: 'n_dep1', days: 3, when: (b) => b.dep_status === 'open',
+    since: (b) => b.agr_sent || b.dep_created || null,
+    subject: () => `Your build spot is reserved — deposit invoice inside`,
+    body: (first, biz, links) => `<p>Hi ${first},</p><p>Your 50% deposit invoice for ${biz} is still open — the build kicks off automatically the moment it's paid, and your preview lands within days:</p><p>${links.dep ? `<a href="${links.dep}">${links.dep}</a>` : 'The invoice is in your inbox from Stripe.'}</p><p>Questions about anything? Just reply.</p><p>Talk soon,<br>The ConversionCo Team</p>` },
+  { flag: 'n_int2', days: 2, when: (b, cl) => depositPaid(b) && cl.stage === 'intake2_sent' && !cl.intake2_data,
+    since: (b, cl) => cl.updated_at,
+    subject: (biz) => `The last form before we start designing`,
+    body: (first, biz, links) => `<p>Hi ${first},</p><p>You're paid up and we're ready to build ${biz} — the only thing we're waiting on is your Website Vision form (menu, prices, look and feel). It takes about 10 minutes and the build starts automatically when you submit:</p><p><a href="${links.form2}">${links.form2}</a></p><p>Stuck on any question? Reply here and we'll fill it in together.</p><p>Talk soon,<br>The ConversionCo Team</p>` },
+];
+
+async function autoNudges(env, settings) {
+  if (!env.GHL_TOKEN || !settings.ghl_location_id) return;
+  const db = env.DB;
+  const dayMs = 86400000;
+  const clients = (await db.prepare(`SELECT * FROM clients WHERE stage NOT IN ('archived','live','prospect')`).all()).results || [];
+  const signedRows = (await db.prepare('SELECT DISTINCT client_id FROM agreements').all()).results || [];
+  const signed = new Set(signedRows.map((r) => r.client_id));
+  for (const cl of clients) {
+    if (!cl.email) continue;
+    const b = getBilling(cl);
+    for (const n of NUDGES) {
+      if (b[n.flag]) continue;
+      if (!n.when(b, cl, signed.has(cl.id))) continue;
+      const sinceIso = n.since(b, cl);
+      if (!sinceIso) continue;
+      const started = Date.parse(String(sinceIso).includes('Z') || String(sinceIso).includes('+') ? sinceIso : sinceIso + 'Z');
+      if (isNaN(started) || Date.now() - started < n.days * dayMs) continue;
+      try {
+        const links = {
+          agr: `${BASE_URL}/agreement/${cl.id}/${await portalToken(env, 'agr', cl.id)}`,
+          dep: b.dep_url || '',
+          form2: settings.form2_link + (settings.form2_link.includes('?') ? '&' : '?') + 'e=' + encodeURIComponent(cl.email),
+        };
+        const first = (cl.name || '').split(' ')[0] || 'there';
+        const biz = cl.business_name || cl.name || 'your business';
+        const ghl = new GHL(env.GHL_TOKEN, settings.ghl_location_id);
+        const contact = await ghl.upsertContact({ email: cl.email, name: cl.name || '' });
+        await ghl.sendEmail({ contactId: contact.id || contact.contactId,
+          subject: n.subject(biz), html: n.body(first, biz, links),
+          emailFrom: settings.email_from || undefined });
+        b[n.flag] = new Date().toISOString();
+        await touchClient(db, cl.id, { billing: JSON.stringify(b) });
+        await logEvent(db, cl.id, 'nudge_sent', `🤖 Auto-nudge sent (${n.flag.replace('n_', '')}) to ${cl.email}`);
+      } catch (e) { await logEvent(db, cl.id, 'error', `Nudge failed: ${String(e.message).slice(0, 120)}`); }
+      break; // at most one nudge per client per pass — never stack emails
+    }
+  }
+}
+
+// Build watchdog (runs every 5 min): a card stuck in "Building" with no progress
+// for 60+ minutes gets re-queued automatically and flagged in the activity feed —
+// a stalled build can never sit silently again.
+async function buildWatchdog(env, settings) {
+  const db = env.DB;
+  const gen = (await db.prepare(`SELECT * FROM clients WHERE stage = 'generating'`).all()).results || [];
+  for (const cl of gen) {
+    let prog = {}; try { prog = JSON.parse(settings[`buildprog_${cl.id}`] || '{}'); } catch {}
+    const lastBeat = Date.parse(prog.updated_at || prog.started_at || cl.updated_at || 0);
+    // 25 min (was 60): builders are required to ping at least every ~15-20 min,
+    // so 25 min of silence = dead with confidence. Faster detection → faster retry.
+    if (!lastBeat || Date.now() - lastBeat < 25 * 60000) continue;
+    const mins = Math.round((Date.now() - lastBeat) / 60000);
+    await touchClient(db, cl.id, { stage: cl.intake2_data ? 'intake2_done' : 'intake2_sent' });
+    await setSetting(db, `buildprog_${cl.id}`, '');
+    await logEvent(db, cl.id, 'build_stalled', `⚠️ Build silent for ${mins} min — re-queued automatically; the fire cord re-pulls within minutes (${cl.business_name || cl.name || cl.email})`);
+    // pull the fire cord IMMEDIATELY on requeue (don't wait for the next queueWatch pass)
+    try { await fireSignal(env, db, `AUTO: build watchdog requeued client ${cl.id}`); } catch {}
+  }
+}
+
+// Monday owner's digest: the week in one email, straight to Tiffany
+async function weeklyOwnerDigest(env) {
+  const db = env.DB;
+  const settings = await getSettings(db);
+  if (!env.GHL_TOKEN || !settings.ghl_location_id) return;
+  const to = settings.notify_email || 'tiffany.anywhereinfusions@gmail.com';
+  const clients = (await db.prepare('SELECT * FROM clients ORDER BY updated_at DESC').all()).results || [];
+  const overview = await computeOverview(db, clients, settings);
+  const wk = (await db.prepare(`SELECT type, COUNT(*) AS n FROM events WHERE created_at > datetime('now','-7 days') GROUP BY type`).all()).results || [];
+  const count = (t) => wk.find((r) => r.type === t)?.n || 0;
+  const leads7 = (await db.prepare(`SELECT COUNT(*) AS n FROM leads WHERE created_at > datetime('now','-7 days')`).first())?.n || 0;
+  const money = overview.money;
+  const row = (k, v) => `<tr><td style="padding:6px 14px 6px 0;color:#64748b;font-size:13px;">${k}</td><td style="padding:6px 0;font-weight:700;font-size:14px;color:#0B1D33;">${v}</td></tr>`;
+  const needsHtml = overview.needs.length
+    ? `<ol style="padding-left:18px;margin:8px 0;">${overview.needs.map((n) => `<li style="margin:6px 0;font-size:13.5px;">${n.msg}</li>`).join('')}</ol>`
+    : `<p style="font-size:13.5px;">Nothing is waiting on you — the machine is humming. 🎉</p>`;
+  try {
+    const ghl = new GHL(env.GHL_TOKEN, settings.ghl_location_id);
+    const contact = await ghl.upsertContact({ email: to, name: 'ConversionCo Owner' });
+    await ghl.sendEmail({
+      contactId: contact.id || contact.contactId,
+      subject: `📊 Your ConversionCo week — $${money.collected} collected · ${leads7} lead${leads7 === 1 ? '' : 's'} · MRR $${money.mrr}`,
+      html: `<h2 style="color:#0B1D33;margin:0 0 4px;">Your week at ConversionCo</h2>
+<p style="color:#64748b;font-size:13px;margin:0 0 16px;">Every number below is live from Mission Control.</p>
+<table style="border-collapse:collapse;">
+${row('Cash collected (all time)', `$${money.collected.toLocaleString()}`)}
+${row('Invoices outstanding', `$${money.outstanding.toLocaleString()}`)}
+${row('Hosting subscriptions', `${money.hostingCount} active — <b>$${money.mrr}/mo recurring</b>`)}
+${row('New leads (7 days)', leads7)}
+${row('Intakes submitted (7 days)', count('intake1_done') + count('intake2_done'))}
+${row('Invoices paid (7 days)', count('invoice_paid'))}
+${row('Sites hitting preview (7 days)', count('preview_ready') || count('site_published'))}
+${row('Revisions applied (7 days)', count('revision_done'))}
+</table>
+<h3 style="color:#0B1D33;margin:18px 0 4px;">Waiting on you</h3>
+${needsHtml}
+<p style="margin:22px 0;"><a href="${BASE_URL}" style="background:#0B1D33;color:#fff;padding:13px 26px;border-radius:8px;text-decoration:none;font-weight:bold;">Open Mission Control &rarr;</a></p>
+<p style="font-size:12.5px;color:#667788;">Button not working? Copy this link into your browser:<br><span style="color:#0B1D33;word-break:break-all;">${BASE_URL}</span></p>`,
+      emailFrom: settings.email_from || undefined,
+    });
+    await logEvent(db, null, 'owner_digest', `📊 Weekly owner digest sent to ${to}`);
+  } catch (e) { await logEvent(db, null, 'error', `Owner digest failed: ${e.message}`); }
+}
+
+// Ensure ONE client's Search Console enrollment: property created, ownership
+// verified (already-verified detection → Cloudflare DNS auto-verify → manual flag),
+// sitemap submitted, launch-checklist gsc/sitemap boxes ticked. Called the MOMENT
+// a site goes live (PATCH hook) AND every Sunday (gscPullAll) as the safety net,
+// so enrollment is guaranteed for every client, always. Returns {domain, st} or null.
+async function gscEnsureClient(env, settings, cl) {
+  if (!gscConfigured(env)) return null;
+  const db = env.DB;
+  let domain = '';
+  try { domain = new URL(cl.live_url).hostname.replace(/^www\./, ''); } catch {}
+  if (!domain || domain.endsWith('workers.dev') || domain.endsWith('conversionco918.com')) return null;
+  const stKey = `gsc_${cl.id}`;
+  let st = {}; try { st = JSON.parse(settings[stKey] || '{}'); } catch {}
+  try {
+    if (st.property !== domain) { await gscAddProperty(env, domain); st.property = domain; st.verified = ''; st.checklist_ticked = false; }
+    if (!st.verified) {
+      // a domain may already be verified outside the auto path (manual TXT / gsc-enroll)
+      try {
+        const props = await gscListProperties(env);
+        const mine = props.find((p) => p.site === `sc-domain:${domain}` && p.permission && p.permission !== 'siteUnverifiedUser');
+        if (mine) st.verified = 'manual';
+      } catch { /* fall through to auto-verify */ }
+    }
+    if (!st.verified) {
+      try { st.verify_attempts = (st.verify_attempts || 0) + 1; await gscVerifyViaCloudflareDns(env, domain); st.verified = new Date().toISOString(); }
+      catch (e) {
+        if (st.verify_attempts >= 3 && !st.manual_flagged) {
+          st.manual_flagged = true;
+          await logEvent(db, cl.id, 'gsc_manual_needed', `⚠️ Search Console can't auto-verify ${domain} (${String(e.message).slice(0, 100)}) — verify this one domain by hand in Search Console (DNS TXT), then everything runs itself forever.`);
+        }
+      }
+    }
+    if (st.verified && !st.checklist_ticked) {
+      let lc = {}; try { lc = JSON.parse(cl.launch_checklist || '{}'); } catch {}
+      try { await gscSubmitSitemap(env, domain); lc.sitemap = true; } catch { /* retried next Sunday via checklist_ticked staying false */ }
+      lc.gsc = true;
+      await touchClient(db, cl.id, { launch_checklist: JSON.stringify(lc) });
+      if (lc.sitemap) st.checklist_ticked = true;
+      await logEvent(db, cl.id, 'gsc_verified', `✅ Search Console live for ${domain} — property verified${lc.sitemap ? ' and sitemap submitted' : ''} automatically`);
+    }
+    st.last_error = '';
+  } catch (e) {
+    st.last_error = String(e.message).slice(0, 160);
+    if (st.err_logged !== st.last_error) {
+      st.err_logged = st.last_error;
+      await logEvent(db, cl.id, 'gsc_error', `Search Console enrollment issue for ${domain}: ${st.last_error} (auto-retries every Sunday)`);
+    }
+  }
+  await setSetting(db, stKey, JSON.stringify(st));
+  return { domain, st };
+}
+
+// Google Search Console autopilot (Sundays inside the noon cron): re-ensures every
+// live client's enrollment (safety net for the instant go-live hook) and pulls the
+// weekly exact-numbers snapshot with week-over-week deltas → settings gsc_data_<id>
+// → portal card + report engines.
+async function gscPullAll(env, settings) {
+  if (!gscConfigured(env)) return;
+  const db = env.DB;
+  const clients = (await db.prepare(`SELECT * FROM clients WHERE live_url != '' AND stage != 'archived'`).all()).results || [];
+  for (const cl of clients) {
+    const ensured = await gscEnsureClient(env, settings, cl);
+    if (!ensured) continue;
+    const { domain } = ensured;
+    const stKey = `gsc_${cl.id}`;
+    let st = ensured.st;
+    try {
+      // pull the numbers (Google only returns rows once the property is verified)
+      const stats = await gscQueryStats(env, domain, 28);
+      let prev = null; try { prev = JSON.parse(settings[`gsc_data_${cl.id}`] || 'null'); } catch {}
+      const prevPos = {}; for (const r of (prev && prev.queries) || []) prevPos[r.q] = r.pos;
+      const queries = stats.rows.map((r) => ({ ...r, prev: prevPos[r.q] ?? null }));
+      await setSetting(db, `gsc_data_${cl.id}`, JSON.stringify({
+        domain, checked_at: new Date().toISOString(), window: stats.window, queries, totals: stats.totals,
+      }));
+      st.last_pull = new Date().toISOString(); st.last_error = ''; st.err_logged = '';
+      // remember the very first non-empty snapshot — powers the "then & now" card forever
+      if (queries.length && !settings[`gsc_first_${cl.id}`]) {
+        await setSetting(db, `gsc_first_${cl.id}`, JSON.stringify({ at: new Date().toISOString(), imp: stats.totals.imp, clicks: stats.totals.clicks }));
+      }
+      if (queries.length) await logEvent(db, cl.id, 'gsc_pulled', `📈 Google's own numbers in for ${domain} — ${queries.length} searches tracked, seen ${stats.totals.imp}×, ${stats.totals.clicks} clicks (28 days)`);
+    } catch (e) {
+      st.last_error = String(e.message).slice(0, 160);
+      if (st.err_logged !== st.last_error) { // log state changes only — keep the feed clean
+        st.err_logged = st.last_error;
+        await logEvent(db, cl.id, 'gsc_error', `Search Console pull failed for ${domain}: ${st.last_error}`);
+      }
+    }
+    await setSetting(db, stKey, JSON.stringify(st));
+  }
+  // Tiffany's own site: same weekly snapshot (gsc_data_self) for the owner digest.
+  // Silently skips until conversionco918.com is verified in her console.
+  try {
+    const stats = await gscQueryStats(env, 'conversionco918.com', 28);
+    let prev = null; try { prev = JSON.parse(settings['gsc_data_self'] || 'null'); } catch {}
+    const prevPos = {}; for (const r of (prev && prev.queries) || []) prevPos[r.q] = r.pos;
+    await setSetting(db, 'gsc_data_self', JSON.stringify({
+      domain: 'conversionco918.com', checked_at: new Date().toISOString(), window: stats.window,
+      queries: stats.rows.map((r) => ({ ...r, prev: prevPos[r.q] ?? null })), totals: stats.totals,
+    }));
+  } catch { /* not verified yet — fine */ }
+}
+
+export default {
+  fetch: app.fetch,
+  async scheduled(event, env, ctx) {
+    await ensureSchema(env.DB);
+    if (event.cron === '0 12 * * *') {
+      ctx.waitUntil(dailyUptime(env).catch((e) =>
+        logEvent(env.DB, null, 'error', `Uptime check failed: ${e.message}`)
+      ));
+      ctx.waitUntil(backupDatabase(env).catch((e) =>
+        logEvent(env.DB, null, 'error', `Backup failed: ${e.message}`)
+      ));
+      ctx.waitUntil(githubTokenHealth(env).catch((e) =>
+        logEvent(env.DB, null, 'error', `Token health check failed: ${e.message}`)
+      ));
+      if (new Date(event.scheduledTime || Date.now()).getUTCDay() === 1) {
+        ctx.waitUntil(weeklyOwnerDigest(env).catch((e) =>
+          logEvent(env.DB, null, 'error', `Owner digest failed: ${e.message}`)
+        ));
+      }
+      if (new Date(event.scheduledTime || Date.now()).getUTCDay() === 0) {
+        // Sunday: pull Google Search Console for every live client — the exact
+        // positions land in settings the day before the Monday weekly reports run
+        ctx.waitUntil(getSettings(env.DB).then((s) => gscPullAll(env, s)).catch((e) =>
+          logEvent(env.DB, null, 'error', `GSC pull failed: ${e.message}`)
+        ));
+      }
+      return;
+    }
+    const settings = await getSettings(env.DB);
+    ctx.waitUntil(pollForms(env, settings).catch((e) =>
+      logEvent(env.DB, null, 'error', `Poll failed: ${e.message}`)
+    ));
+    ctx.waitUntil(autoPublish(env, settings).catch((e) =>
+      logEvent(env.DB, null, 'error', `Auto-publish failed: ${e.message}`)
+    ));
+    ctx.waitUntil(editWatch(env, settings).catch((e) =>
+      logEvent(env.DB, null, 'error', `Edit-watcher failed: ${e.message}`)
+    ));
+    ctx.waitUntil(continuePublish(env, settings).catch((e) =>
+      logEvent(env.DB, null, 'error', `Publish-now continuation failed: ${e.message}`)
+    ));
+    ctx.waitUntil(pollBilling(env).catch((e) =>
+      logEvent(env.DB, null, 'error', `Billing poll failed: ${e.message}`)
+    ));
+    ctx.waitUntil(buildWatchdog(env, settings).catch((e) =>
+      logEvent(env.DB, null, 'error', `Build watchdog failed: ${e.message}`)
+    ));
+    ctx.waitUntil(autoNudges(env, settings).catch((e) =>
+      logEvent(env.DB, null, 'error', `Auto-nudge failed: ${e.message}`)
+    ));
+    ctx.waitUntil(downWatch(env, settings).catch((e) =>
+      logEvent(env.DB, null, 'error', `Down watch failed: ${e.message}`)
+    ));
+    ctx.waitUntil(retryFailedEmails(env, settings).catch((e) =>
+      logEvent(env.DB, null, 'error', `Email retry failed: ${e.message}`)
+    ));
+    ctx.waitUntil(queueWatch(env, settings).catch((e) =>
+      logEvent(env.DB, null, 'error', `Queue watch failed: ${e.message}`)
+    ));
+    ctx.waitUntil(pollAppointments(env, settings).catch(() => { /* self-throttled error logging inside */ }));
+  },
+};
