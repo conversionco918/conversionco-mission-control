@@ -1,11 +1,11 @@
 {
-  "requested_at": "2026-07-27T16:14:24.502Z",
+  "requested_at": "2026-08-08T20:34:13.854Z",
   "by": "dashboard fire button",
   "waiting": [
     {
-      "id": 23,
-      "biz": "",
-      "stage": "intake2_done"
+      "id": 25,
+      "biz": "Tiffany",
+      "stage": "generating"
     }
   ]
 }
