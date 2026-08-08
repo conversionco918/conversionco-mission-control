@@ -1,11 +1,11 @@
 {
-  "requested_at": "2026-08-08T20:34:13.854Z",
-  "by": "dashboard fire button",
+  "requested_at": "2026-08-08T22:36:04.337Z",
+  "by": "AUTO: build watchdog requeued client 25",
   "waiting": [
     {
       "id": 25,
       "biz": "Tiffany",
-      "stage": "generating"
+      "stage": "intake2_done"
     }
   ]
 }
