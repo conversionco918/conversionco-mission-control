@@ -105,7 +105,7 @@ function Engine({ title, subtitle, steps, submitUrl, extra, accent }) {
                   onChange={(e) => { const n = rows.map((x, xi) => xi === ri ? { ...x, [c.k]: e.target.value } : x); save(n); }} />))}
               {rows.length > 1 && <button style={ST.x} onClick={() => save(rows.filter((_, xi) => xi !== ri))}>✕</button>}
             </div>))}
-          {rows.length < (f.max || 10) && <button style={ST.add} onClick={() => save([...rows, {}])}>+ {f.addLabel || 'Add another'}</button>}
+          {rows.length < (f.max || 40) && <button style={ST.add} onClick={() => save([...rows, {}])}>+ {f.addLabel || 'Add another'}</button>}
         </div>);
     },
   };
