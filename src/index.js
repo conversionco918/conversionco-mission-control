@@ -2204,7 +2204,7 @@ app.get('/pitch/:id/:token', async (c) => {
     <div class="p best"><h3>Premium</h3><div class="pr">$999</div><ul><li>Everything in Standard</li><li>A landing page for every drip</li><li>City pages for local Google</li><li>Weekly SEO blog — written for you</li><li>Weekly performance report</li></ul></div>
   </div>
   <p class="sub" style="margin-top:26px"><b>Simple, fair payments:</b> 50% to begin, 50% only when your finished website is delivered — you never pay in full for something you haven't seen.</p>
-  <p class="sub" style="margin-top:10px">+ $49/month hosting &amp; security — daily uptime checks, monitoring, and updates. Starts only when your site is live.</p></div>
+  <p class="sub" style="margin-top:10px">+ $99/month Website Care Plan — hosting, a complete backup of your website, and your own client portal, plus security and daily uptime monitoring. Starts only when your site is live.</p></div>
   <div class="cta"><h2 style="color:inherit">Ready when you are, ${(client.name || 'friend').split(' ')[0]}.</h2>
   <p style="opacity:.75">Grab a time and we'll walk through it together.</p>
   ${settings.booking_link ? `<a class="btn" href="${settings.booking_link}">Book your call</a>` : ''}</div>
