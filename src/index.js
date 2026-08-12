@@ -1078,6 +1078,8 @@ app.get('/api/send-agreement/:key', async (c) => {
   const db = c.env.DB;
   const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
   if (!client || !client.email) return c.json({ ok: false, error: 'client/email missing' });
+  if (!client || !client.email) return c.json({ ok: false, error: 'client/email missing' });
+if (client.tier !== 'premium' && client.tier !== 'standard') return c.json({ ok: false, error: 'Pick the package (standard or premium) on the client card first — the agreement price comes from it.' });
   const settings = await getSettings(db);
   if (!c.env.GHL_TOKEN || !settings.ghl_location_id) return c.json({ ok: false, error: 'GHL not configured' });
   const url = `${BASE_URL}/agreement/${id}/${await portalToken(c.env, 'agr', id)}`;
