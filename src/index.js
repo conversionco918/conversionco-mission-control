@@ -1220,7 +1220,7 @@ const AGREEMENT_VERSION = 'v2-2026-07-23-split';
 function agreementTerms(biz, pkgLabel, pkgPrice) {
   return [
     ['1. What we are building', `ConversionCo will design, write, and build the ${pkgLabel} for ${biz}: a custom, mobile-first website with full search-engine setup as described in your proposal. Your one-time project fee is ${pkgPrice}, paid in two equal halves: 50% as a deposit before the build begins, and the remaining 50% when your finished website preview is delivered to you.`],
-    ['2. Website Care Plan — $49/month', `Keeping your website live with us is covered by the Website Care Plan: hosting, security, daily uptime monitoring, performance reports, and ongoing platform updates (Premium plans also include weekly published content). It is month-to-month, starts only when your site is ready and you confirm, and you may cancel any time — cancellation takes effect at the end of the current billing period.`],
+    ['22. Website Care Plan — $99/month', `Your website stays live, protected, and fully looked after on the Website Care Plan. It covers your hosting, a complete backup of your entire website, and your own client portal where you can check your site's health, reports, and activity any time, along with security, daily uptime monitoring, and ongoing platform updates (Premium plans also include weekly published content). It is month-to-month, starts only when your site is ready and you confirm, and you may cancel any time — cancellation takes effect at the end of the current billing period.`],
     ['3. Payment & refunds', `The build starts once your 50% deposit is received. Because our build process begins immediately and produces custom work, the deposit is non-refundable once your build has started — with one exception in your favor: if we fail to deliver a preview of your website within 14 days of your deposit, you may request a full refund of it. The remaining 50% is invoiced when your website preview is delivered, and is due within 7 days. Your website goes live on your domain once the balance is paid.`],
     ['4. Revisions', `Your project includes two full rounds of revisions before launch, plus reasonable adjustments during your first 30 days live. After that, changes are handled through your Care Plan (reasonable monthly volume) or quoted separately for larger redesigns. This keeps every project fair — for you and for our other clients.`],
     ['5. What you own', `Your domain name is yours — registered for your business, and transferable to your direct control on request at any time. Your content is yours — your logo, photos, story, and business information. And once your project fee is paid in full, the finished website code (the HTML, CSS, JavaScript, and images that make up your site) is yours as well.`],
@@ -1265,7 +1265,7 @@ app.get('/agreement/:id/:token', async (c) => {
 <div class="card">
   <div class="eyebrow">CONVERSION CO</div>
   <h1>Website Service Agreement</h1>
-  <p class="sub">Between <b>ConversionCo</b> and <b>${biz}</b> · ${pkgLabel} · ${pkgPrice} + $49/mo Care Plan at launch</p>
+  <p class="sub">Between <b>ConversionCo</b> and <b>${biz}</b> · ${pkgLabel} · ${pkgPrice} + $99/mo Care Plan at launchch</p>
   ${terms.map(([h, t]) => `<h2>${h}</h2><p>${t}</p>`).join('')}
   <div class="sig">
   ${signed ? `<div class="ok">✓ Signed by ${signed.signed_name} on ${signed.signed_at} UTC</div>` : `
@@ -3029,7 +3029,7 @@ async function pollBilling(env) {
         const st = await checkoutStatus(env.STRIPE_SECRET_KEY, billing.sub_session_id);
         if (st.complete) {
           billing.sub_status = 'active'; billing.subscription_id = st.subscription;
-          await logEvent(db, client.id, 'hosting_active', 'Hosting & security $49/mo ACTIVE 🔒✅');
+          await logEvent(db, client.id, 'hosting_active', 'Hosting & security $$99/mo ACTIVE 🔒✅');
           dirty++;
         }
       }
