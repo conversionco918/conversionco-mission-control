@@ -3802,7 +3802,7 @@ async function importSite(env, settings, slug, clientId, treeFiles, opts = {}) {
   // cap the per-invocation blob fetches (CF subrequest budget), and let the */5
   // cron finish big imports across ticks. Returns {complete} so callers only
   // mark the site published when every file is in.
-  const BLOB_BUDGET = 25;
+  const BLOB_BUDGET = 12;
   const existingRows = (await db.prepare('SELECT path, gh_sha FROM site_files WHERE slug = ?').bind(slug).all()).results || [];
   const haveSha = {}; for (const r of existingRows) haveSha[r.path] = r.gh_sha || '';
   const wantPaths = new Set(files.map((f) => f.path.slice(prefix.length)));
@@ -4012,7 +4012,7 @@ async function editWatch(env, settings) {
     } catch (e) { await logEvent(db, clientId, 'error', `Edit-watcher commit list failed for ${slug}: ${e.message}`); continue; }
     // mark seen FIRST — a crash mid-loop must never produce duplicate emails
     await setSetting(db, key, JSON.stringify({ sha: headSha, tree: d.sha, at: new Date().toISOString() }));
-    fresh.reverse(); // oldest first so the feed reads chronologically
+    fresh = fresh.slice(0, 5); fresh.reverse(); // oldest first so the feed reads chronologically
     for (const cm of fresh) {
       const short = cm.sha.slice(0, 7);
       // event dedupe by sha (survives marker resets)
