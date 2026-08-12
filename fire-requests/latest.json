@@ -1,10 +1,10 @@
 {
-  "requested_at": "2026-08-08T22:36:04.337Z",
-  "by": "AUTO: build watchdog requeued client 25",
+  "requested_at": "2026-08-12T01:50:27.965Z",
+  "by": "AUTO: build watchdog requeued client 30",
   "waiting": [
     {
-      "id": 25,
-      "biz": "Tiffany",
+      "id": 30,
+      "biz": "Bill Crosby",
       "stage": "intake2_done"
     }
   ]
