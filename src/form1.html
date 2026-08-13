@@ -147,6 +147,8 @@ const STEPS1 = [
     fields: [{ k: 'Services Offered', t: 'chips', req: 1, opts: ['Mobile IV therapy', 'In-office IV therapy', 'Injections / vitamin shots', 'NAD+ therapy', 'Weight loss support', 'Aesthetics / injectables', 'Memberships', 'Other (tell us in notes)'] }] },
   { q: "Which package are you leaning toward?", hint: "No commitment — this just helps us prepare for your call.",
     fields: [{ k: 'Package Interest', t: 'select', req: 1, opts: ['Standard — $649 (6-page custom website)', 'Premium — $999 (website + SEO engine: drip pages, city pages, weekly blog)', "Not sure yet — let's talk it through"] }] },
+  { q: "Want extra lead generation with your site?", hint: "Optional add-ons. Both are built to send you trackable calls and bookings. Pick any that interest you.",
+    fields: [{ k: "Add-Ons", t: "chips", opts: ["Add a high-converting landing page ($250 one-time)", "Add Google Ads management ($249/mo + your ad budget)"] }] },
   { q: "Do you have a website domain?", fields: [
     { k: 'Has Domain', t: 'select', req: 1, opts: ['Yes — I own one', 'No — I need one (we handle it)'] },
     { k: 'Domain Name', label: 'If yes, what is it?', ph: 'e.g. gloivtulsa.com' }] },
