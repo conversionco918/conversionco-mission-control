@@ -122,3 +122,59 @@ export async function gscQueryStats(env, domain, days = 28) {
   const totals = rows.reduce((a, r) => ({ imp: a.imp + r.imp, clicks: a.clicks + r.clicks }), { imp: 0, clicks: 0 });
   return { rows, totals, window: `${fmt(start)}..${fmt(end)}` };
 }
+
+
+// ---------------- LP CONNECT: live tag verification (added by Claude 8/12, LP+Ads spec section 3) ----------------
+// Fetches a live landing page and verifies the tracking stack is actually on it.
+// db is optional: lets us read our own /preview/<slug>/ pages straight from D1
+// (a Cloudflare worker cannot fetch its own workers.dev hostname).
+export async function lpVerify(url, db) {
+  const checks = {
+    page: { status: 0, bytes: 0, via: 'fetch' },
+    ga4: { present: false, id: '' },
+    clarity: { present: false, id: '' },
+    events: { call_click: false, sms_click: false, form_submit: false, book_click: false },
+    phone: { present: false, number: '' },
+  };
+  let html = '';
+  try {
+    const res = await fetch(url, { headers: { 'User-Agent': 'ConversionCo-Watchdog/1.0' }, redirect: 'follow' });
+    checks.page.status = res.status;
+    if (res.ok) html = await res.text();
+  } catch (e) {
+    checks.page.error = String((e && e.message) || e);
+  }
+  if (!html && db) {
+    const m = url.match(/\/preview\/([^/]+)\/(.+?)(?:[?#]|$)/);
+    if (m) {
+      try {
+        const row = await db.prepare('SELECT content FROM site_files WHERE slug = ? AND path = ?').bind(m[1], m[2]).first();
+        if (row && row.content) { html = row.content; checks.page.status = 200; checks.page.via = 'internal'; delete checks.page.error; }
+      } catch (e) { /* keep fetch error */ }
+    }
+  }
+  checks.page.bytes = html.length;
+  if (html) {
+    const ga = html.match(/googletagmanager\.com\/gtag\/js\?id=(G-[A-Z0-9]+)/i);
+    if (ga) { checks.ga4.present = true; checks.ga4.id = ga[1]; }
+    const cl = html.match(/clarity\.ms\/tag\/([a-zA-Z0-9]+)/);
+    if (cl) { checks.clarity.present = true; checks.clarity.id = cl[1]; }
+    for (const k of Object.keys(checks.events)) checks.events[k] = html.includes(k);
+    const tel = html.match(/href="tel:(\+?[0-9]{7,15})"/);
+    if (tel) { checks.phone.present = true; checks.phone.number = tel[1]; }
+  }
+  const missing = [];
+  if (checks.page.status !== 200) missing.push('page not reachable (' + (checks.page.error || checks.page.status || 'no response') + ')');
+  if (!checks.ga4.present) missing.push('Google Analytics tag');
+  if (!checks.clarity.present) missing.push('Clarity tag');
+  for (const [k, v] of Object.entries(checks.events)) if (!v) missing.push(k.replace('_', ' ') + ' handler');
+  if (!checks.phone.present) missing.push('tap-to-call number');
+  const allGreen = missing.length === 0;
+  return {
+    allGreen,
+    checks,
+    missing,
+    summary: allGreen ? 'ALL GREEN' : ('missing: ' + missing.join(', ')),
+    checkedAt: new Date().toISOString(),
+  };
+}
