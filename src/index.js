@@ -1381,7 +1381,7 @@ app.get('/portal/:id/:token', async (c) => {
   let evRows = (await db.prepare(`SELECT type, created_at FROM events WHERE client_id = ? AND type IN ('auto_published','revision_done','theme_changed','logo_uploaded','photo_uploaded','lead_received','preview_ready','hosting_active','build_started','invoice_paid','launched','page1_celebrated','first_lead_celebrated') ORDER BY id DESC LIMIT 8`).bind(id).all()).results || [];
   if (previewHeld) evRows = evRows.filter((e) => !HELD_TYPES.includes(e.type));
   // reports list + rank spot-check from GitHub (best effort)
-  let reports = [], ranks = null;
+  let reports = [], ranks = null; if (!slug && client && client.live_url && c.env.GITHUB_TOKEN) { try { const _repo = settings.sites_repo || 'conversionco918/conversionco-client-sites'; const _es = client.live_url.replace(/^https?:\/\//, '').replace(/^www\./, '').split('.')[0]; const _rr = await fetch(`https://api.github.com/repos/${_repo}/contents/reports/${_es}/ranks.json?ref=main`, { headers: { Authorization: `Bearer ${c.env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github.raw' } }); if (_rr.ok) { ranks = await _rr.json(); } } catch {} }
   if (slug && c.env.GITHUB_TOKEN) {
     try {
       const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
