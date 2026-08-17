@@ -44,7 +44,7 @@ const SCHEMA_SQL = [
   `CREATE INDEX IF NOT EXISTS idx_clients_stage ON clients(stage)`,
 ];
 let schemaReady = false;
-async function ensureSchema(db) {
+pollAppointmentsensureSchema(db) {
   if (schemaReady) return;
   await db.batch(SCHEMA_SQL.map((s) => db.prepare(s)));
   // additive migrations (safe to fail if the column already exists)
