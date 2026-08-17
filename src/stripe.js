@@ -1,5 +1,5 @@
 // Minimal Stripe REST client (no SDK) for invoices + hosting subscription.
-// Pricing: Standard $499, Premium $649 one-time; hosting $49/mo (started manually at the end).
+// Pricing (ratified 8/5-8/6): Standard $649, Premium $999 one-time, 50/50 split; Care Plan $99/mo. PRICES below is the single source of truth.
 
 const API = 'https://api.stripe.com/v1';
 
