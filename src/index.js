@@ -2877,10 +2877,15 @@ app.patch('/api/clients/:id', async (c) => {
 
 app.delete('/api/clients/:id', async (c) => {
   const id = Number(c.req.param('id'));
+  // 8/17 GUARD: deleting a card mid-build orphans the site + the signed agreement.
+  const clD = await c.env.DB.prepare('SELECT stage FROM clients WHERE id = ?').bind(id).first();
+  if (clD && clD.stage === 'generating' && c.req.query('force') !== 'yes')
+    return c.json({ error: 'A build is RUNNING for this client. Deleting now would orphan the site and the signed agreement. Wait for the build to finish (or re-request with ?force=yes).' }, 409);
   await c.env.DB.prepare('DELETE FROM clients WHERE id = ?').bind(id).run();
   await logEvent(c.env.DB, id, 'client_deleted');
   return c.json({ ok: true });
 });
+
 
 async function sendPortalEmail(env, db, client, settings) {
   if (!client?.email || !env.GHL_TOKEN || !settings.ghl_location_id) return false;
