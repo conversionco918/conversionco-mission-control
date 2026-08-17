@@ -280,6 +280,19 @@ app.post('/intake/:n', async (c) => {
     await logEvent(db, null, 'error', `Intake ${n} submission had no email: ${JSON.stringify(stored).slice(0, 500)}`);
   }
 
+  // 📦 PACKAGE SELF-SERVE (Tiffany 8/17): the client picks Standard or Premium
+  // inside Intake 2, so the tier lands on their card automatically and the agreement
+  // chain below can fire with the RIGHT package instead of pausing for her hands.
+  // Her manual tier control on the dashboard still works and still wins if she changes it.
+  if (n === 2 && clientId) {
+    const pkgRaw = String(lower['package'] || '').toLowerCase();
+    if (pkgRaw.includes('premium') || pkgRaw.includes('standard')) {
+      const pick = pkgRaw.includes('premium') ? 'premium' : 'standard';
+      await touchClient(db, clientId, { tier: pick });
+      await logEvent(db, clientId, 'tier_set', `📦 Client chose the ${pick === 'premium' ? 'Premium $999' : 'Standard $649'} package in Intake 2`);
+    }
+  }
+
   // ⛓ CHAIN (Tiffany 7/27): Intake 2 submitted → the agreement goes out IMMEDIATELY
   // (unless already signed or already sent). Signature then auto-fires the deposit invoice.
   if (n === 2 && clientId) {

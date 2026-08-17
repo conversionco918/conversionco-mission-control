@@ -168,6 +168,11 @@ const STEPS2 = [
     { k: 'Email', label: 'Email', req: 1, mode: 'email', ph: 'you@example.com' },
     { k: 'Contact Number', label: 'Best number', req: 1, mode: 'tel', ph: '(918) 555-0100' },
     { k: 'Call or Text Preference', t: 'select', req: 1, opts: ['Text me', 'Call me', 'Either is fine'] }] },
+  { q: "Pick your package.", hint: "This is the package your agreement and invoice will use. Not sure yet? Pick your best guess and we can talk it through on your call before you sign anything.",
+    fields: [
+    { k: 'Package', t: 'select', req: 1, opts: [
+      'Standard $649: 6-page custom website, glowing drip menu, booking built in, full SEO foundation, monthly performance report',
+      'Premium $999: everything in Standard, plus a landing page for every drip, city pages for local Google, a weekly SEO blog written for you, and weekly performance reports'] }] },
   { q: "Build your drip menu.", hint: "One row per drip — name, price, and a few words on what it's for. This becomes your glowing menu, exactly as you write it.",
     fields: [{ k: 'IV Menu', t: 'rows', req: 1, addLabel: 'Add another drip', max: 10, cols: [
       { k: 'name', ph: 'Drip name (e.g. The Hydration)', flex: 2, w: 150 },
