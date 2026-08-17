@@ -1083,7 +1083,7 @@ async function lpInject(id){
     });
   }
   const _rb = renderBoard;
-  renderBoard = function () { _rb(); decoratePay(); };
+  renderBoard = function () { _rb(); try { decoratePay(); } catch (e) {} };
   const _od = openDrawer;
   openDrawer = function (id) {
     const r = _od(id);
@@ -1106,9 +1106,11 @@ async function lpInject(id){
   };
   window.resendFinalEmail = async function (id, btn) {
     btn.disabled = true;
-    const r = await api('/api/clients/' + id + '/final-remind', { method: 'POST' });
-    if (r && r.error) { toast('⚠ ' + r.error); btn.disabled = false; return; }
-    toast('Final invoice email resent 📨');
+    try {
+      const r = await api('/api/clients/' + id + '/final-remind', { method: 'POST' });
+      if (r && r.error) { toast('⚠ ' + r.error); btn.disabled = false; return; }
+      toast('Final invoice email resent 📨');
+    } catch (e) { toast('⚠ resend failed, try again'); btn.disabled = false; }
   };
 })();
 </script>
