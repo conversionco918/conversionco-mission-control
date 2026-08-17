@@ -35,10 +35,10 @@ async function stripeReq(key, method, path, params) {
 export const PRICES = {
   standard: { amount: 64900, label: 'Standard Website Package', display: '$649' },
   premium: { amount: 99900, label: 'Premium Website + SEO Engine', display: '$999' },
-  hosting: { amount: 9900, label: 'Website Care Plan — Hosting, Backups + Client Portal', display: '$99/mo' },
+  hosting: { amount: 9900, label: 'Website Care Plan: Hosting, Backups + Client Portal', display: '$99/mo' },
   // dormant tiers — not shown anywhere; re-enable in the card UI if Tiffany's situation changes
-  care199: { amount: 19900, label: 'Care Plan — Growth (content + reviews)', display: '$199/mo' },
-  care399: { amount: 39900, label: 'Care Plan — Dominance (full service)', display: '$399/mo' },
+  care199: { amount: 19900, label: 'Care Plan: Growth (content + reviews)', display: '$199/mo' },
+  care399: { amount: 39900, label: 'Care Plan: Dominance (full service)', display: '$399/mo' },
 };
 
 export async function ensureCustomer(key, email, name) {
@@ -56,21 +56,21 @@ export function halfDisplay(tierKey) {
 export async function sendInvoice(key, customerId, tierKey, businessName, half) {
   const p = PRICES[tierKey] || PRICES.standard;
   const amount = half ? Math.round(p.amount / 2) : p.amount;
-  const suffix = half === 'deposit' ? ' — 50% deposit (build begins on payment)'
-    : half === 'final' ? ' — final 50% balance (your website is ready)' : '';
+  const suffix = half === 'deposit' ? ', 50% deposit (build begins on payment)'
+    : half === 'final' ? ', final 50% balance (your website is ready)' : '';
   // draft invoice first, then attach the item to it, then finalize + send
   const invoice = await stripeReq(key, 'POST', '/invoices', {
     customer: customerId,
     collection_method: 'send_invoice',
     days_until_due: 7,
-    description: `ConversionCo — ${p.label}${suffix}${businessName ? ` for ${businessName}` : ''}`,
+    description: `ConversionCo: ${p.label}${suffix}${businessName ? ` for ${businessName}` : ''}`,
   });
   await stripeReq(key, 'POST', '/invoiceitems', {
     customer: customerId,
     invoice: invoice.id,
     amount,
     currency: 'usd',
-    description: `${p.label}${suffix}${businessName ? ` — ${businessName}` : ''}`,
+    description: `${p.label}${suffix}${businessName ? ` for ${businessName}` : ''}`,
   });
   const finalized = await stripeReq(key, 'POST', `/invoices/${invoice.id}/finalize`, {});
   let sent = finalized;
@@ -93,7 +93,7 @@ export async function hostingCheckout(key, customerId, businessName, returnUrl, 
     line_items: { 0: { quantity: 1, price_data: {
       currency: 'usd', unit_amount: plan.amount,
       recurring: { interval: 'month' },
-      product_data: { name: `${plan.label}${businessName ? ` — ${businessName}` : ''}` },
+      product_data: { name: `${plan.label}${businessName ? ` for ${businessName}` : ''}` },
     } } },
   });
   return { id: session.id, url: session.url };
