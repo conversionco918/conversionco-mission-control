@@ -4593,6 +4593,10 @@ async function paymentFollowups(env, settings) {
     const biz = cl.business_name || cl.name || 'your business';
     const amount = halfDisplay(b.invoice_tier || (cl.tier === 'premium' ? 'premium' : 'standard'));
     try {
+      // race guard: re-read flags just before sending (overlapping cron ticks) and
+      // skip if payment landed or another invocation already sent this email.
+      try { const fr = await db.prepare('SELECT billing FROM clients WHERE id = ?').bind(cl.id).first(); Object.assign(b, JSON.parse((fr && fr.billing) || '{}')); } catch {}
+      if (finalPaid(b) || b.fin_status !== 'open') continue;
       if (!b.fin_email_sent) {
         await emailClient(env, db, cl, settings, PAY_EMAILS.delivery.subject(biz), PAY_EMAILS.delivery.body(first, biz, amount, b.fin_url), 'final_invoice_email', `Delivery email + final invoice link sent (${amount})`);
         b.fin_email_sent = new Date().toISOString();
