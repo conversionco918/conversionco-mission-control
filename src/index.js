@@ -3284,7 +3284,7 @@ async function fireSignal(env, db, by) {
   const payload = { requested_at: new Date().toISOString(), by,
     waiting: rows.map((r) => ({ id: r.id, biz: r.business_name || r.name, stage: r.stage })) };
   const ghHeaders = { Authorization: `Bearer ${env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
-  const api = `https://api.github.com/repos/conversionco918/conversionco-mission-control/contents/fire-requests/latest.json`;
+  const api = `https://api.github.com/repos/conversionco918/conversionco-client-sites/contents/fire-requests/latest.json`;
   const getRes = await fetch(api + '?ref=fire-signal', { headers: ghHeaders });
   const existing = getRes.ok ? await getRes.json() : null;
   const bytes = new TextEncoder().encode(JSON.stringify(payload, null, 2));
