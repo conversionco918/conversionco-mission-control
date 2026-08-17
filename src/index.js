@@ -2941,6 +2941,56 @@ app.post('/api/clients/:id/send-intake2', async (c) => {
 // 📅 AFTER-CALL AUTOPILOT (Tiffany 7/27): the moment the planning call ends,
 // Intake 2 goes out automatically — no waiting on a manual send.
 // Polls the GHL booking calendar every 5 min for recently-ended appointments.
+// 🌟 REVIEW ENGINE (Tiffany 8/17/2026, five-upgrades #5): ask happy clients for a
+// Google review at genuine WIN moments only: a keyword newly on Page 1, their first
+// lead, launch day, a lead they marked BOOKED, or the day-30 mark after their deposit.
+// LAWS: at most ONE ask per client per QUARTER (revask_<id> flag, written before
+// sending so a crash can never double-ask); completely DORMANT until the Google
+// Business Profile is verified and settings.review_link is set; never invent urgency;
+// the quote-permission line collects verbatim testimonials by reply. Daily noon cron.
+async function reviewAskSweep(env) {
+  const db = env.DB;
+  const settings = await getSettings(db);
+  const link = String(settings.review_link || '').trim();
+  if (!link) return;
+  const clients = (await db.prepare('SELECT * FROM clients').all()).results || [];
+  const now = Date.now();
+  for (const client of clients) {
+    if (!client.email) continue;
+    if (!['preview_ready', 'live'].includes(client.stage)) continue;
+    const last = Date.parse(settings['revask_' + client.id] || '') || 0;
+    if (last && now - last < 90 * 24 * 3600 * 1000) continue;
+    let winLine = '';
+    try {
+      const ev = await db.prepare(`SELECT type, detail FROM events WHERE client_id = ? AND type IN ('page1_celebrated','first_lead_celebrated','launched','lead_booked') AND created_at > datetime('now','-7 days') ORDER BY id DESC LIMIT 1`).bind(client.id).first();
+      if (ev) {
+        winLine = ev.type === 'page1_celebrated' ? 'We just watched one of your searches hit Page 1 of Google, and it made our week'
+          : ev.type === 'first_lead_celebrated' ? 'Your first lead just came in through your website, and it made our week'
+          : ev.type === 'lead_booked' ? 'You just booked a customer who found you through your website, and that is exactly why we do this'
+          : 'Your website is officially out in the world, and it made our week';
+      }
+    } catch { /* events hiccup: the day-30 check below still applies */ }
+    if (!winLine) {
+      const billing = getBilling(client);
+      const paidAt = Date.parse(billing.dep_paid_at || billing.paid_at || '') || 0;
+      const days = paidAt ? (now - paidAt) / (24 * 3600 * 1000) : 0;
+      if (days >= 30 && days <= 40) winLine = 'It has been a month since we started working together, and watching your site grow has been a highlight for us';
+    }
+    if (!winLine) continue;
+    await setSetting(db, 'revask_' + client.id, new Date().toISOString());
+    const firstName = String(client.name || '').trim().split(' ')[0] || 'there';
+    const html = `<p>Hi ${firstName}!</p>
+<p>${winLine}.</p>
+<p>Can we ask a small favor while the win is fresh? A quick Google review helps other practitioners like you find us, and it takes about a minute:</p>
+<p><a href="${link}" style="display:inline-block;background:#0f172a;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:600">Leave ConversionCo a review</a></p>
+<p>Prefer to skip the form? Just hit reply with two or three sentences about your experience. And one extra question if you do: are you okay with us putting your words on our website, with your name and business? Totally fine to say no.</p>
+<p>Thank you for trusting us with your website!</p>
+<p>The ConversionCo Team</p>`;
+    await emailClient(env, db, client, settings, 'A quick favor from ConversionCo', html,
+      'review_ask_sent', `🌟 Review ask sent to ${client.email} (win: ${winLine.slice(0, 60)}...)`);
+  }
+}
+
 // \u{1F4EE} REVISION ROUND ONE (Tiffany 8/17/2026): exactly 14 days after a client's FIRST
 // payment (the 50% deposit, or a legacy full invoice), send them ONE revisions email.
 // Two paths per her design: more than five changes -> type them all in the portal
@@ -4009,7 +4059,7 @@ app.post('/api/settings', async (c) => {
     'ghl_location_id', 'form1_id', 'form2_id', 'form1_link', 'form2_link', 'email_from',
     'intake1_subject', 'intake1_body', 'intake2_subject', 'intake2_body',
     'booking_link', 'booking_subject', 'booking_body',
-    'notify_email', 'sites_repo',
+    'notify_email', 'sites_repo', 'review_link',
   ];
   for (const k of allowed) if (k in body) await setSetting(c.env.DB, k, body[k]);
   return c.json({ ok: true });
@@ -5096,6 +5146,9 @@ export default {
     if (event.cron === '0 12 * * *') {
       ctx.waitUntil(dailyUptime(env).catch((e) =>
         logEvent(env.DB, null, 'error', `Uptime check failed: ${e.message}`)
+      ));
+      ctx.waitUntil(reviewAskSweep(env).catch((e) =>
+        logEvent(env.DB, null, 'error', `Review ask sweep failed: ${e.message}`)
       ));
       ctx.waitUntil(backupDatabase(env).catch((e) =>
         logEvent(env.DB, null, 'error', `Backup failed: ${e.message}`)
