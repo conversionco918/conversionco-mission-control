@@ -5019,6 +5019,6 @@ export default {
     ctx.waitUntil(queueWatch(env, settings).catch((e) =>
       logEvent(env.DB, null, 'error', `Queue watch failed: ${e.message}`)
     ));
-    ctx.waitUntil(pollAppointments(env, settings).catch(() => { /* self-throttled error logging inside */ }));
+    pollGoogleMeet(env, settings).catch(() => { /* self-throttled error logging inside */ }));
   },
 };
