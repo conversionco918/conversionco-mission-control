@@ -4511,6 +4511,95 @@ async function autoNudges(env, settings) {
   }
 }
 
+// 💵 SECOND-PAYMENT COLLECTION (Feature 1): once the final 50% invoice exists
+// (auto-created at Approve Preview, or via the manual button), this sends
+// Tiffany's delivery email with the invoice link, then warm reminders on
+// day 3, 7, and 12 while it stays unpaid. After day 12 it stops emailing,
+// flags the card, and tells Tiffany to make a personal call.
+// Wording approved by Tiffany 8/16/2026. No em dashes. Never threatening.
+const PAY_EMAILS = {
+  delivery: {
+    subject: (biz) => `Your site is delivered! Final invoice inside`,
+    body: (first, biz, amount, url) => `<p>Hi ${first},</p><p>Your website for ${biz} is officially delivered. I'm really proud of how it turned out, and I hope you are too.</p><p>Per our agreement, the remaining balance of ${amount} is due at delivery. You can pay securely right here:</p><p><a href="${url}">${url}</a></p><p>Once that's in, we're all set, and your Care Plan kicks in so your site stays backed up, hosted, and looked after every single day.</p><p>Thank you for trusting me with this. If anything on the invoice looks off, just reply and I'll sort it out.</p><p>Tiffany</p>`,
+  },
+  r3: {
+    subject: (biz) => `Quick note on your final invoice`,
+    body: (first, biz, amount, url) => `<p>Hi ${first},</p><p>Just a friendly nudge that the final invoice for your ${biz} site is still open. Here's the link whenever you have a minute:</p><p><a href="${url}">${url}</a></p><p>No rush at all if life got busy. And if you have any questions before paying, I'm happy to answer them.</p><p>Tiffany</p>`,
+  },
+  r7: {
+    subject: (biz) => `Checking in on the balance for ${biz}`,
+    body: (first, biz, amount, url) => `<p>Hi ${first},</p><p>Circling back on the remaining balance for your website. The invoice is here:</p><p><a href="${url}">${url}</a></p><p>If something is holding things up, whether it's a question about the site or the payment itself, just reply and tell me. I'd much rather talk it through than have you stuck.</p><p>Tiffany</p>`,
+  },
+  r12: {
+    subject: (biz) => `One more note from me`,
+    body: (first, biz, amount, url) => `<p>Hi ${first},</p><p>I wanted to reach out one more time about the open balance for ${biz}:</p><p><a href="${url}">${url}</a></p><p>This is the last automatic reminder you'll get from me. If now's a hard time or anything needs to be worked out, reply to this email or give me a call and we'll figure it out together.</p><p>Tiffany</p>`,
+  },
+};
+
+async function paymentFollowups(env, settings) {
+  if (!env.GHL_TOKEN || !settings.ghl_location_id) return;
+  const db = env.DB;
+  const dayMs = 86400000;
+  const clients = (await db.prepare(`SELECT * FROM clients WHERE billing LIKE '%"fin_status":"open"%'`).all()).results || [];
+  for (const cl of clients) {
+    if (!cl.email) continue;
+    const b = getBilling(cl);
+    if (!b.fin_id || !b.fin_url || b.fin_status !== 'open' || finalPaid(b)) continue;
+    let dirty = false;
+    const first = (cl.name || '').split(' ')[0] || 'there';
+    const biz = cl.business_name || cl.name || 'your business';
+    const amount = halfDisplay(b.invoice_tier || (cl.tier === 'premium' ? 'premium' : 'standard'));
+    try {
+      if (!b.fin_email_sent) {
+        await emailClient(env, db, cl, settings, PAY_EMAILS.delivery.subject(biz), PAY_EMAILS.delivery.body(first, biz, amount, b.fin_url), 'final_invoice_email', `Delivery email + final invoice link sent (${amount})`);
+        b.fin_email_sent = new Date().toISOString();
+        dirty = true;
+      } else {
+        const days = (Date.now() - Date.parse(b.fin_email_sent)) / dayMs;
+        const steps = [['fin_r3', 3, PAY_EMAILS.r3], ['fin_r7', 7, PAY_EMAILS.r7], ['fin_r12', 12, PAY_EMAILS.r12]];
+        for (const [flag, day, tpl] of steps) {
+          if (b[flag] || days < day) continue;
+          await emailClient(env, db, cl, settings, tpl.subject(biz), tpl.body(first, biz, amount, b.fin_url), 'final_invoice_reminder', `Payment reminder day ${day} sent (${amount} still open)`);
+          b[flag] = new Date().toISOString();
+          dirty = true;
+          break; // at most one payment email per client per pass, never stack
+        }
+        if (!b.fin_call_flag && b.fin_r12 && days >= 13) {
+          b.fin_call_flag = new Date().toISOString();
+          dirty = true;
+          await logEvent(db, cl.id, 'call_them', `📞 Final balance ${amount} still unpaid after all three reminders. Time for a personal call.`);
+          await notifyOwner(env, settings, `Call ${biz}: final balance ${amount} unpaid`, `<p>${biz} has an open final invoice (${amount}) after the day 3, 7, and 12 reminders. Their card is flagged. A personal call usually closes this.</p><p>Invoice: <a href="${b.fin_url}">${b.fin_url}</a></p>`);
+        }
+      }
+    } catch (e) {
+      await logEvent(db, cl.id, 'error', `Payment follow-up failed: ${String(e.message).slice(0, 120)}`);
+    }
+    if (dirty) await touchClient(db, cl.id, { billing: JSON.stringify(b) });
+  }
+}
+
+// 📨 Resend the final-invoice email (same invoice, same link, no new charge).
+app.post('/api/clients/:id/final-remind', async (c) => {
+  const db = c.env.DB;
+  const id = Number(c.req.param('id'));
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  if (!client.email) return c.json({ error: 'client has no email on file' }, 400);
+  const b = getBilling(client);
+  if (!b.fin_id || b.fin_status !== 'open' || !b.fin_url) return c.json({ error: 'no open final invoice on this client' }, 400);
+  const settings = await getSettings(db);
+  const first = (client.name || '').split(' ')[0] || 'there';
+  const biz = client.business_name || client.name || 'your business';
+  const amount = halfDisplay(b.invoice_tier || (client.tier === 'premium' ? 'premium' : 'standard'));
+  const ok = await emailClient(c.env, db, client, settings, PAY_EMAILS.delivery.subject(biz), PAY_EMAILS.delivery.body(first, biz, amount, b.fin_url), 'final_invoice_resend', `Final invoice email resent by Tiffany (${amount})`);
+  if (!ok) return c.json({ error: 'email could not send (check GHL settings)' }, 500);
+  if (!b.fin_email_sent) {
+    b.fin_email_sent = new Date().toISOString();
+    await touchClient(db, id, { billing: JSON.stringify(b) });
+  }
+  return c.json({ ok: true });
+});
+
 // Build watchdog (runs every 5 min): a card stuck in "Building" with no progress
 // for 60+ minutes gets re-queued automatically and flagged in the activity feed —
 // a stalled build can never sit silently again.
@@ -4728,6 +4817,9 @@ export default {
     ));
     ctx.waitUntil(autoNudges(env, settings).catch((e) =>
       logEvent(env.DB, null, 'error', `Auto-nudge failed: ${e.message}`)
+    ));
+    ctx.waitUntil(paymentFollowups(env, settings).catch((e) =>
+      logEvent(env.DB, null, 'error', `Payment follow-up failed: ${e.message}`)
     ));
     ctx.waitUntil(downWatch(env, settings).catch((e) =>
       logEvent(env.DB, null, 'error', `Down watch failed: ${e.message}`)
