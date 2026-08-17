@@ -290,9 +290,26 @@ app.post('/intake/:n', async (c) => {
         const signed = await db.prepare('SELECT id FROM agreements WHERE client_id = ? LIMIT 1').bind(clientId).first();
         if (signed) return;
         const bC = getBilling(cl);
-        if (bC.agr_sent) return; // already out — the nudges chase it
+                if (bC.agr_sent) return; // already out — the nudges chase it
         const settingsC = await getSettings(db);
         if (!c.env.GHL_TOKEN || !settingsC.ghl_location_id) return;
+        // 8/17 TIER GATE: never auto-send a contract before the package is chosen. The
+        // agreement prints the package from client.tier and silently defaults to
+        // Standard $649 when tier is empty (this already bit one premium client).
+        if (cl.tier !== 'premium' && cl.tier !== 'standard') {
+          await logEvent(db, clientId, 'error', `⚠ Agreement NOT auto-sent — no package set on the card. Pick Standard or Premium on the client card, then hit Resend agreement.`);
+          try {
+            if (settingsC.notify_email) {
+              const ghlN = ghlFor(c.env, settingsC);
+              const contactN = await ghlN.upsertContact({ email: settingsC.notify_email, name: 'ConversionCo Notifications' });
+              await ghlN.sendEmail({ contactId: contactN.id || contactN.contactId,
+                subject: `⏸ Set the package for ${cl.business_name || cl.name || 'new client'} — agreement is waiting`,
+                html: `<p>Intake 2 just landed for <b>${cl.business_name || cl.name || 'a client'}</b>, but no package (Standard or Premium) is set on their card, so the agreement was NOT sent — it would have printed Standard $649 by default.</p><p>Open Mission Control, set the tier on their card, then hit <b>Resend agreement</b>.</p>`,
+                emailFrom: settingsC.email_from || undefined });
+            }
+          } catch { /* the log line above is the guarantee; email is best-effort */ }
+          return;
+        }
         const url = `${BASE_URL}/agreement/${clientId}/${await portalToken(c.env, 'agr', clientId)}`;
         const biz = cl.business_name || cl.name || 'your business';
         const ghl = ghlFor(c.env, settingsC);
@@ -1097,7 +1114,9 @@ app.get('/api/send-agreement/:key', async (c) => {
   const id = Number(c.req.query('id'));
   const db = c.env.DB;
   const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
-  if (!client || !client.email) return c.json({ ok: false, error: 'client/email missing' });   if (client.tier !== 'premium' && client.tier !== 'standard')     return c.json({ ok: false, error: 'Set the package (Standard or Premium) on the card first — the contract prints the package from it.' });
+  if (!client || !client.email) return c.json({ ok: false, error: 'client/email missing' });
+  if (client.tier !== 'premium' && client.tier !== 'standard')
+    return c.json({ ok: false, error: 'Set the package (Standard or Premium) on the card first — the contract prints the package from it.' });
   if (!client || !client.email) return c.json({ ok: false, error: 'client/email missing' });
 if (client.tier !== 'premium' && client.tier !== 'standard') return c.json({ ok: false, error: 'Pick the package (standard or premium) on the client card first — the agreement price comes from it.' });
   const settings = await getSettings(db);
@@ -3932,25 +3951,49 @@ async function autoPublish(env, settings) {
   const commit = await gh(`/repos/${repo}/git/commits/${ref.object.sha}`);
   const tree = await gh(`/repos/${repo}/git/trees/${commit.tree.sha}?recursive=1`);
   const blobs = (tree.tree || []).filter((t) => t.type === 'blob');
-  const metas = blobs.filter((t) => /^sites\/[^/]+\/site-meta\.json$/.test(t.path));
-  for (const m of metas) {
+    const metas = blobs.filter((t) => /^sites\/[^/]+\/site-meta\.json$/.test(t.path));
+  // 8/17 CEILING FIX: one shared blob budget per invocation (several changed slugs can
+  // never stack past the Worker subrequest ceiling) + a rotating start cursor so a
+  // failing or oversized slug can never starve the rest of the fleet every tick.
+  let budget = 12;
+  let start = 0;
+  const cur = settings.autopub_cursor || '';
+  const curIdx = metas.findIndex((mm) => mm.path.split('/')[1] === cur);
+  if (curIdx >= 0) start = curIdx;
+  let cursorSet = false;
+  for (let k = 0; k < metas.length; k++) {
+    if (budget <= 0) {
+      if (!cursorSet) { await setSetting(db, 'autopub_cursor', metas[(start + k) % metas.length].path.split('/')[1]); cursorSet = true; }
+      break;
+    }
+    const m = metas[(start + k) % metas.length];
     const slug = m.path.split('/')[1];
     const seenKey = `site_sha_${slug}`;
     const seen = settings[seenKey];
     if (seen === m.sha) continue; // unchanged
     try {
-      const metaBlob = await gh(`/repos/${repo}/git/blobs/${m.sha}`);
+      const metaBlob = await gh(`/repos/${repo}/git/blobs/${m.sha}`); budget--;
       const meta = JSON.parse(new TextDecoder().decode(
         Uint8Array.from(atob(metaBlob.content.replace(/\n/g, '')), (ch) => ch.charCodeAt(0))));
       const files = blobs.filter((t) => t.path.startsWith(`sites/${slug}/`));
-      const r = await importSite(env, settings, slug, meta.client_id, files);
-      if (!r.complete) continue; // partial pass — the next cron tick resumes; only mark seen when done
+      const r = await importSite(env, settings, slug, meta.client_id, files, { blobBudget: budget });
+      budget -= (r.files || 0);
+      if (!r.complete) {
+        if (!cursorSet) { await setSetting(db, 'autopub_cursor', slug); cursorSet = true; }
+        continue; // partial pass — the next tick resumes HERE with a fresh budget
+      }
       await setSetting(db, seenKey, m.sha);
       await logEvent(db, meta.client_id || null, 'auto_published', `${slug} auto-published from GitHub`);
     } catch (e) {
+      if (!cursorSet) {
+        const nxt = metas[(start + k + 1) % metas.length];
+        await setSetting(db, 'autopub_cursor', nxt ? nxt.path.split('/')[1] : '');
+        cursorSet = true;
+      }
       await logEvent(db, null, 'error', `Auto-publish ${slug} failed: ${e.message}`);
     }
   }
+  if (!cursorSet) { try { await setSetting(db, 'autopub_cursor', ''); } catch {} }
 }
 
 // ============================ EDIT VISIBILITY (8/5) ============================
