@@ -361,6 +361,14 @@ function colFor(c) {
   if (c.stage === 'intake1_sent') return 'Intake 1';
   return 'New';
 }
+function meetChip(c) {
+  let m = null; try { m = JSON.parse((STATE.settings || {})['meet_' + c.id] || 'null'); } catch (e) {}
+  if (!m || !m.at) return '';
+  const d = new Date(m.at);
+  if (isNaN(d) || d.getTime() < Date.now() - 2 * 3600 * 1000) return '';
+  const when = d.toLocaleString('en-US', { timeZone: 'America/Chicago', weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  return `<div style="font-size:12px;color:#0f766e;margin-top:3px;">📅 Call booked: ${when}${m.link ? ` · <a href="${m.link}" target="_blank" rel="noopener" onclick="event.stopPropagation()">Meet link</a>` : ''}</div>`;
+}
 function renderBoard() {
   const el = document.getElementById('board');
   const active = STATE.clients.filter(c => c.stage !== 'archived');
@@ -373,7 +381,7 @@ function renderBoard() {
         <b>${dot(c)}${esc(c.business_name || c.name || c.email)}</b>
         <span class="em">${esc(c.email)}</span>
         ${c.tier === 'premium' ? '<span class="tier">★ PREMIUM</span>' : ''}
-        ${buildBar(c)}
+        ${buildBar(c)}${meetChip(c)}
         <div style="font-size:11px;color:var(--muted);margin-top:3px;">${ago(c.updated_at)}</div>
       </div>`).join('') || '<div style="font-size:12px;color:#94a3b8;padding:6px;">—</div>'}
     </div>`).join('');
@@ -386,7 +394,7 @@ function renderClients() {
     const st = STAGES[c.stage] || STAGES.new;
     return `<tr class="rowclick" onclick="openDrawer(${c.id})">
       <td>${dot(c)}<b>${esc(c.name || c.email)}</b>${c.name ? `<br><span style="color:var(--muted);font-size:12px;margin-left:16px;">${esc(c.email)}</span>` : ''}</td>
-      <td><span class="chip" style="background:${st.bg};color:${st.fg}">${st.label}</span>${editChip(c)}${buildBar(c)}</td>
+      <td><span class="chip" style="background:${st.bg};color:${st.fg}">${st.label}</span>${editChip(c)}${buildBar(c)}${meetChip(c)}</td>
       <td style="color:var(--muted);font-size:13px">${ago(c.updated_at)}</td>
       <td><button class="peek" style="position:static" title="Open their portal — admin view" onclick="event.stopPropagation();openLink(${c.id}, 'portal', this)">👁</button> ${c.stage === 'intake1_done' ? `<button class="btn btn-green" onclick="event.stopPropagation();sendIntake2(${c.id}, this)">Approve → Intake 2</button>` : ''}</td>
     </tr>`;

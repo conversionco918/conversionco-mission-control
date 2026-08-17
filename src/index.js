@@ -44,7 +44,7 @@ const SCHEMA_SQL = [
   `CREATE INDEX IF NOT EXISTS idx_clients_stage ON clients(stage)`,
 ];
 let schemaReady = false;
-pollAppointmentsensureSchema(db) {
+async function ensureSchema(db) {
   if (schemaReady) return;
   await db.batch(SCHEMA_SQL.map((s) => db.prepare(s)));
   // additive migrations (safe to fail if the column already exists)
@@ -2941,6 +2941,98 @@ app.post('/api/clients/:id/send-intake2', async (c) => {
 // 📅 AFTER-CALL AUTOPILOT (Tiffany 7/27): the moment the planning call ends,
 // Intake 2 goes out automatically — no waiting on a manual send.
 // Polls the GHL booking calendar every 5 min for recently-ended appointments.
+// 📅 GOOGLE MEET WATCHER (8/17/2026) — replaces the GHL calendar poll. Tiffany's
+// planning-call booking runs entirely on Google Calendar/Meet now. Uses the same
+// GOOGLE_* OAuth secrets as Search Console (refresh token must include the
+// calendar.readonly scope). Two jobs per cron tick:
+//   1. Upcoming booked calls -> settings meet_<clientId> so the dashboard card can
+//      show "Call booked: <day/time>" with the Meet link.
+//   2. After-call autopilot: a call that ENDED and matches a client who has not done
+//      Intake 2 -> send Intake 2 automatically (same gates + dedupe as before).
+async function pollGoogleMeet(env, settings) {
+  if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET || !env.GOOGLE_REFRESH_TOKEN) return;
+  const db = env.DB;
+  const now = Date.now();
+  const throttleErr = async (msg) => {
+    const last = Number(settings.appt_poll_err || 0);
+    if (now - last > 6 * 3600 * 1000) {
+      await setSetting(db, 'appt_poll_err', String(now));
+      await logEvent(db, null, 'error', msg);
+    }
+  };
+  let token = '';
+  try {
+    const tr = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET, refresh_token: env.GOOGLE_REFRESH_TOKEN, grant_type: 'refresh_token' }),
+    });
+    const td = await tr.json();
+    token = td.access_token || '';
+    if (!token) throw new Error(td.error_description || td.error || 'no access token');
+  } catch (e) {
+    await throttleErr(`After-call autopilot: Google sign-in failed (${String(e.message).slice(0, 80)}) — Intake 2 auto-send paused; manual send still works`);
+    return;
+  }
+  const url = new URL('https://www.googleapis.com/calendar/v3/calendars/primary/events');
+  url.searchParams.set('timeMin', new Date(now - 48 * 3600 * 1000).toISOString());
+  url.searchParams.set('timeMax', new Date(now + 60 * 24 * 3600 * 1000).toISOString());
+  url.searchParams.set('singleEvents', 'true');
+  url.searchParams.set('orderBy', 'startTime');
+  url.searchParams.set('maxResults', '100');
+  const res = await fetch(url.toString(), { headers: { Authorization: 'Bearer ' + token } });
+  if (!res.ok) {
+    await throttleErr(`After-call autopilot: Google Calendar poll failed (${res.status}) — Intake 2 auto-send paused; manual send still works. If this says 403, the refresh token is missing the calendar.readonly scope.`);
+    return;
+  }
+  const data = await res.json().catch(() => ({}));
+  const events = data.items || [];
+  const clients = (await db.prepare('SELECT * FROM clients').all()).results || [];
+  const byEmail = {};
+  for (const cl of clients) { if (cl.email) byEmail[String(cl.email).toLowerCase().trim()] = cl; }
+  const upcoming = {};
+  for (const ev of events) {
+    if (String(ev.status || '') === 'cancelled') continue;
+    const startT = Date.parse((ev.start && (ev.start.dateTime || ev.start.date)) || 0) || 0;
+    const endT = Date.parse((ev.end && (ev.end.dateTime || ev.end.date)) || 0) || 0;
+    let client = null;
+    for (const a of (ev.attendees || [])) {
+      const em = String(a.email || '').toLowerCase().trim();
+      if (em && byEmail[em]) { client = byEmail[em]; break; }
+    }
+    if (!client) continue;
+    const vid = (ev.conferenceData && ev.conferenceData.entryPoints || []).find((p) => p.entryPointType === 'video');
+    const link = ev.hangoutLink || (vid && vid.uri) || '';
+    if (startT > now) {
+      const cur = upcoming[client.id];
+      if (!cur || startT < cur.at) upcoming[client.id] = { at: startT, end: endT, link, summary: String(ev.summary || '').slice(0, 80) };
+      continue;
+    }
+    if (!endT || endT > now) continue;
+    const evId = String(ev.id || '');
+    if (!evId || settings['appt_done_' + evId]) continue;
+    await setSetting(db, 'appt_done_' + evId, new Date().toISOString());
+    if (!['new', 'intake1_sent', 'intake1_done'].includes(client.stage)) continue;
+    if (client.intake2_data && client.intake2_data.length > 2) continue;
+    try {
+      await sendIntake2Flow(env, db, client, settings);
+      await logEvent(db, client.id, 'intake2_sent', `🤖 Planning call ended — Intake 2 sent automatically to ${client.email}`);
+    } catch (e) {
+      await logEvent(db, client.id, 'error', `After-call Intake 2 auto-send failed: ${String(e.message).slice(0, 140)}`);
+    }
+  }
+  for (const cl of clients) {
+    const key = 'meet_' + cl.id;
+    const up = upcoming[cl.id];
+    if (up) {
+      await setSetting(db, key, JSON.stringify({ at: new Date(up.at).toISOString(), end: up.end ? new Date(up.end).toISOString() : '', link: up.link, summary: up.summary }));
+    } else if (settings[key]) {
+      let old = null; try { old = JSON.parse(settings[key]); } catch {}
+      const oldEnd = (old && Date.parse(old.end || old.at)) || 0;
+      if (!oldEnd || oldEnd < now - 2 * 3600 * 1000) await setSetting(db, key, '');
+    }
+  }
+}
 async function pollAppointments(env, settings) {
   if (!env.GHL_TOKEN || !settings.ghl_location_id) return;
   const db = env.DB;
@@ -5019,6 +5111,6 @@ export default {
     ctx.waitUntil(queueWatch(env, settings).catch((e) =>
       logEvent(env.DB, null, 'error', `Queue watch failed: ${e.message}`)
     ));
-    pollGoogleMeet(env, settings).catch(() => { /* self-throttled error logging inside */ }));
+    ctx.waitUntil(pollGoogleMeet(env, settings).catch(() => { /* self-throttled error logging inside */ }));
   },
 };
