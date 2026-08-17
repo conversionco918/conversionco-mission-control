@@ -3829,7 +3829,7 @@ async function importSite(env, settings, slug, clientId, treeFiles, opts = {}) {
   // cap the per-invocation blob fetches (CF subrequest budget), and let the */5
   // cron finish big imports across ticks. Returns {complete} so callers only
   // mark the site published when every file is in.
-  const BLOB_BUDGET = Math.max(0, Number(opts.blobBudget ?? 12)); = 12;
+  const BLOB_BUDGET = Math.max(0, Number(opts.blobBudget ?? 12));
   const existingRows = (await db.prepare('SELECT path, gh_sha FROM site_files WHERE slug = ?').bind(slug).all()).results || [];
   const haveSha = {}; for (const r of existingRows) haveSha[r.path] = r.gh_sha || '';
   const wantPaths = new Set(files.map((f) => f.path.slice(prefix.length)));
