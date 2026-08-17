@@ -3835,7 +3835,7 @@ async function importSite(env, settings, slug, clientId, treeFiles, opts = {}) {
   const metaEntry = files.find((f) => f.path === prefix + 'site-meta.json');
   const remaining = changed.length - batch.length;
   if (remaining > 0) {
-    await logEvent(db, clientId ? Number(clientId) : null, 'import_progress',
+    if (count > 0) await logEvent(db, clientId ? Number(clientId) : null, 'import_progress',
       `📦 ${slug}: imported ${count} changed file(s) this pass — ${remaining} to go (continues automatically within 5 min)`);
     return { files: count, remaining, complete: false, preview_url: `${BASE_URL}/preview/${slug}/`, meta_sha: metaEntry ? metaEntry.sha : '' };
   }
