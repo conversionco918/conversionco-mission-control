@@ -2941,6 +2941,46 @@ app.post('/api/clients/:id/send-intake2', async (c) => {
 // 📅 AFTER-CALL AUTOPILOT (Tiffany 7/27): the moment the planning call ends,
 // Intake 2 goes out automatically — no waiting on a manual send.
 // Polls the GHL booking calendar every 5 min for recently-ended appointments.
+// \u{1F4EE} REVISION ROUND ONE (Tiffany 8/17/2026): exactly 14 days after a client's FIRST
+// payment (the 50% deposit, or a legacy full invoice), send them ONE revisions email.
+// Two paths per her design: more than five changes -> type them all in the portal
+// (lands in revisionQueue, the revision runner applies them); five or fewer -> book a
+// quick call on the Google booking link, or just reply. Copy law: warm, her voice, no
+// em dashes, asks the client to BE SPECIFIC. Dedupe flag rev1_sent_<id> is written
+// BEFORE sending so a crash can never cause a double-send. The 45-day cap stops the
+// feature from blasting long-since-paid clients on its first deploy.
+async function revisionRoundOneEmails(env, settings) {
+  const db = env.DB;
+  const clients = (await db.prepare('SELECT * FROM clients').all()).results || [];
+  const now = Date.now();
+  for (const client of clients) {
+    if (!client.email) continue;
+    if (settings['rev1_sent_' + client.id]) continue;
+    if (!['preview_ready', 'live'].includes(client.stage)) continue;
+    const billing = getBilling(client);
+    const paidAt = Date.parse(billing.dep_paid_at || billing.paid_at || '') || 0;
+    if (!paidAt) continue;
+    const age = now - paidAt;
+    if (age < 14 * 24 * 3600 * 1000) continue;
+    if (age > 45 * 24 * 3600 * 1000) continue;
+    await setSetting(db, 'rev1_sent_' + client.id, new Date().toISOString());
+    const firstName = String(client.name || '').trim().split(' ')[0] || 'there';
+    const biz = client.business_name || 'your website';
+    const portalUrl = `${BASE_URL}/portal/${client.id}/${await portalToken(env, 'portal', client.id)}`;
+    const bookLink = settings.booking_link || '';
+    const html = `<p>Hi ${firstName}!</p>
+<p>It has been two weeks since your ${biz} project kicked off, so it is officially time for your first revision round. This is the part where we polish anything you want changed.</p>
+<p><b>One favor that makes a big difference: be specific.</b> "Change the second headline on the home page to say X" gets done exactly right the first time. "Make it pop more" takes us a few guesses. Exact words, exact page, exact spot.</p>
+<p><b>If you have more than five changes:</b> open your portal and type them all in one list, one change per line. They go straight to the build team.</p>
+<p><a href="${portalUrl}" style="display:inline-block;background:#0f172a;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:600">Open your portal</a></p>
+<p><b>If you have five or fewer:</b> easiest is a quick call so we can walk through them together${bookLink ? ` <a href="${bookLink}">grab a time here</a>` : ''}. Or just reply to this email with your list, whichever you prefer.</p>
+<p>Your package includes two refinement rounds, and this starts round one whenever you are ready.</p>
+<p>Talk soon,<br>The ConversionCo Team</p>`;
+    await emailClient(env, db, client, settings, `Revision round one for ${biz}: what would you like changed?`, html,
+      'rev1_sent', `\u{1F4EE} Revision round one email sent (14 days after first payment) to ${client.email}`);
+  }
+}
+
 // 📅 GOOGLE MEET WATCHER (8/17/2026) — replaces the GHL calendar poll. Tiffany's
 // planning-call booking runs entirely on Google Calendar/Meet now. Uses the same
 // GOOGLE_* OAuth secrets as Search Console (refresh token must include the
@@ -5110,6 +5150,9 @@ export default {
     ));
     ctx.waitUntil(queueWatch(env, settings).catch((e) =>
       logEvent(env.DB, null, 'error', `Queue watch failed: ${e.message}`)
+    ));
+    ctx.waitUntil(revisionRoundOneEmails(env, settings).catch((e) =>
+      logEvent(env.DB, null, 'error', `Revision round one email failed: ${e.message}`)
     ));
     ctx.waitUntil(pollGoogleMeet(env, settings).catch(() => { /* self-throttled error logging inside */ }));
   },
