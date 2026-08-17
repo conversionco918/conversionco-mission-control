@@ -1259,16 +1259,16 @@ const AGREEMENT_VERSION = 'v2-2026-07-23-split';
 function agreementTerms(biz, pkgLabel, pkgPrice) {
   return [
     ['1. What we are building', `ConversionCo will design, write, and build the ${pkgLabel} for ${biz}: a custom, mobile-first website with full search-engine setup as described in your proposal. Your one-time project fee is ${pkgPrice}, paid in two equal halves: 50% as a deposit before the build begins, and the remaining 50% when your finished website preview is delivered to you.`],
-    ['2. Website Care Plan: $99/month', `Your website stays live, protected, and fully looked after on the Website Care Plan. It covers your hosting, a complete backup of your entire website, and your own client portal where you can check your site's health, reports, and activity any time, along with security, daily uptime monitoring, and ongoing platform updates (Premium plans also include weekly published content). It is month-to-month, starts only when your site is ready and you confirm, and you may cancel any time, cancellation takes effect at the end of the current billing period.`],
-    ['3. Payment & refunds', `The build starts once your 50% deposit is received. Because our build process begins immediately and produces custom work, the deposit is non-refundable once your build has started, with one exception in your favor: if we fail to deliver a preview of your website within 14 days of your deposit, you may request a full refund of it. The remaining 50% is invoiced when your website preview is delivered, and is due within 7 days. Your website goes live on your domain once the balance is paid.`],
-    ['4. Revisions', `Your project includes two full rounds of revisions before launch, plus reasonable adjustments during your first 30 days live. After that, changes are handled through your Care Plan (reasonable monthly volume) or quoted separately for larger redesigns. This keeps every project fair, for you and for our other clients.`],
-    ['5. What you own', `Your domain name is yours, registered for your business, and transferable to your direct control on request at any time. Your content is yours, your logo, photos, story, and business information. And once your project fee is paid in full, the finished website code (the HTML, CSS, JavaScript, and images that make up your site) is yours as well.`],
+    ['22. Website Care Plan — $99/month', `Your website stays live, protected, and fully looked after on the Website Care Plan. It covers your hosting, a complete backup of your entire website, and your own client portal where you can check your site's health, reports, and activity any time, along with security, daily uptime monitoring, and ongoing platform updates (Premium plans also include weekly published content). It is month-to-month, starts only when your site is ready and you confirm, and you may cancel any time — cancellation takes effect at the end of the current billing period.`],
+    ['3. Payment & refunds', `The build starts once your 50% deposit is received. Because our build process begins immediately and produces custom work, the deposit is non-refundable once your build has started — with one exception in your favor: if we fail to deliver a preview of your website within 14 days of your deposit, you may request a full refund of it. The remaining 50% is invoiced when your website preview is delivered, and is due within 7 days. Your website goes live on your domain once the balance is paid.`],
+    ['4. Revisions', `Your project includes two full rounds of revisions before launch, plus reasonable adjustments during your first 30 days live. After that, changes are handled through your Care Plan (reasonable monthly volume) or quoted separately for larger redesigns. This keeps every project fair — for you and for our other clients.`],
+    ['5. What you own', `Your domain name is yours — registered for your business, and transferable to your direct control on request at any time. Your content is yours — your logo, photos, story, and business information. And once your project fee is paid in full, the finished website code (the HTML, CSS, JavaScript, and images that make up your site) is yours as well.`],
     ['6. What remains ours', `The ConversionCo platform is licensed to you while you are a client, and is never transferred: our client portal and dashboards, our automated build, content, and reporting systems, our monitoring tools, and our internal processes. These power your service; they are not part of the website deliverable.`],
-    ['7. If you ever leave', `You can leave whenever you want, no lock-in. On cancellation we provide a complete export of your website code and assist in pointing your domain wherever you direct. What ends with the service: hosting, the client portal, monitoring, reports, and future content or updates. Your website files are yours to host anywhere.`],
-    ['8. Your content & your practice', `You confirm that materials you provide (photos, logo, reviews, text) are yours to use. You remain solely responsible for the clinical and legal operation of your practice, including licensure, protocols, and advertising compliance. We build health-content-compliant websites and may decline content that violates Google or health-advertising policies, that protection benefits us both.`],
+    ['7. If you ever leave', `You can leave whenever you want — no lock-in. On cancellation we provide a complete export of your website code and assist in pointing your domain wherever you direct. What ends with the service: hosting, the client portal, monitoring, reports, and future content or updates. Your website files are yours to host anywhere.`],
+    ['8. Your content & your practice', `You confirm that materials you provide (photos, logo, reviews, text) are yours to use. You remain solely responsible for the clinical and legal operation of your practice, including licensure, protocols, and advertising compliance. We build health-content-compliant websites and may decline content that violates Google or health-advertising policies — that protection benefits us both.`],
     ['9. Portfolio', `We may display the finished website in the ConversionCo portfolio and marketing materials. If you prefer we do not, tell us in writing and we will remove it.`],
     ['10. Reasonable limits', `We target excellent uptime and monitor your site daily, but no provider can guarantee against third-party outages. Each party's total liability under this agreement is capped at the fees paid in the six months prior to a claim, and neither party is liable for indirect or consequential damages.`],
-    ['11. Non-payment', `If a Care Plan payment is more than 15 days late, we may pause the website until the account is current, we will always reach out first.`],
+    ['11. Non-payment', `If a Care Plan payment is more than 15 days late, we may pause the website until the account is current — we will always reach out first.`],
     ['12. The basics', `ConversionCo is an independent contractor. This is the entire agreement between us, governed by Oklahoma law; changes must be in writing (email counts). If any part is unenforceable, the rest stands.`],
   ];
 }
@@ -1285,7 +1285,7 @@ app.get('/agreement/:id/:token', async (c) => {
   const terms = agreementTerms(biz, pkgLabel, pkgPrice);
   const tok = c.req.param('token');
   return c.html(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="robots" content="noindex"><title>Service Agreement, ${biz} × ConversionCo</title>
+<meta name="robots" content="noindex"><title>Service Agreement — ${biz} × ConversionCo</title>
 <style>
   *{box-sizing:border-box;margin:0}body{font-family:-apple-system,'Segoe UI',sans-serif;background:linear-gradient(170deg,#0C1A30,#0F2847);color:#1A2433;line-height:1.65;padding:30px 14px 60px}
   .card{max-width:680px;margin:0 auto;background:#fff;border-radius:16px;padding:30px 26px;box-shadow:0 20px 60px rgba(0,0,0,.35)}
@@ -1304,7 +1304,7 @@ app.get('/agreement/:id/:token', async (c) => {
 <div class="card">
   <div class="eyebrow">CONVERSION CO</div>
   <h1>Website Service Agreement</h1>
-  <p class="sub">Between <b>ConversionCo</b> and <b>${biz}</b> · ${pkgLabel} · ${pkgPrice} + $99/mo Care Plan at launch</p>
+  <p class="sub">Between <b>ConversionCo</b> and <b>${biz}</b> · ${pkgLabel} · ${pkgPrice} + $99/mo Care Plan at launchch</p>
   ${terms.map(([h, t]) => `<h2>${h}</h2><p>${t}</p>`).join('')}
   <div class="sig">
   ${signed ? `<div class="ok">✓ Signed by ${signed.signed_name} on ${signed.signed_at} UTC</div>` : `
@@ -3285,13 +3285,13 @@ async function fireSignal(env, db, by) {
     waiting: rows.map((r) => ({ id: r.id, biz: r.business_name || r.name, stage: r.stage })) };
   const ghHeaders = { Authorization: `Bearer ${env.GITHUB_TOKEN}`, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
   const api = `https://api.github.com/repos/conversionco918/conversionco-client-sites/contents/fire-requests/latest.json`;
-  const getRes = await fetch(api + '?ref=fire-signal', { headers: ghHeaders });
+  const getRes = await fetch(api + '?ref=main', { headers: ghHeaders });
   const existing = getRes.ok ? await getRes.json() : null;
   const bytes = new TextEncoder().encode(JSON.stringify(payload, null, 2));
   let bin = ''; for (let i = 0; i < bytes.length; i += 8192) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
   const putRes = await fetch(api, { method: 'PUT', headers: { ...ghHeaders, 'Content-Type': 'application/json' },
     body: JSON.stringify({ message: `🔥 FIRE BUILDER — ${by} (${payload.waiting.length} waiting)`,
-      branch: 'fire-signal', content: btoa(bin), ...(existing && existing.sha ? { sha: existing.sha } : {}) }) });
+      branch: 'main', content: btoa(bin), ...(existing && existing.sha ? { sha: existing.sha } : {}) }) });
   if (!putRes.ok) { const out = await putRes.json().catch(() => ({}));
     return { ok: false, error: ('flag commit failed: ' + JSON.stringify(out)).slice(0, 200) }; }
   return { ok: true, waiting: payload.waiting.length };
