@@ -725,6 +725,76 @@ app.get('/api/gread/:key', async (c) => {
   return c.text(new TextDecoder().decode(bytes));
 });
 
+// ---- Server-side repo file COPY (images/binaries never pass through the AI) ----
+// /api/gcopy/<key>?from=<repo path>&to=<repo path>&msg=<enc commit message>
+// Reads the source blob via the GitHub contents API and PUTs it at the new path.
+app.get('/api/gcopy/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  if (!c.env.GITHUB_TOKEN) return c.json({ ok: false, error: 'GITHUB_TOKEN secret not set' });
+  const from = String(c.req.query('from') || '');
+  const to = String(c.req.query('to') || '');
+  const message = String(c.req.query('msg') || ('copy ' + from + ' -> ' + to));
+  if (!from || !to) return c.json({ ok: false, error: 'from + to required' }, 400);
+  const settings = await getSettings(c.env.DB);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  const ghHeaders = { Authorization: 'Bearer ' + c.env.GITHUB_TOKEN, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+  const srcRes = await fetch('https://api.github.com/repos/' + repo + '/contents/' + from, { headers: ghHeaders });
+  if (!srcRes.ok) return c.json({ ok: false, error: 'source not found: ' + from + ' (' + srcRes.status + ')' }, 404);
+  const src = await srcRes.json();
+  let content = String(src.content || '').replace(/\n/g, '');
+  if (!content && src.git_url) {
+    const blobRes = await fetch(src.git_url, { headers: ghHeaders });
+    if (blobRes.ok) { const blob = await blobRes.json(); content = String(blob.content || '').replace(/\n/g, ''); }
+  }
+  if (!content) return c.json({ ok: false, error: 'could not read source blob' });
+  const destApi = 'https://api.github.com/repos/' + repo + '/contents/' + to;
+  const destRes = await fetch(destApi, { headers: ghHeaders });
+  const existing = destRes.ok ? await destRes.json() : null;
+  let out = null, okFlag = false;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const putRes = await fetch(destApi, { method: 'PUT', headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message, content, ...(existing && existing.sha ? { sha: existing.sha } : {}) }) });
+    out = await putRes.json();
+    if (putRes.ok) { okFlag = true; break; }
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  if (!okFlag) return c.json({ ok: false, error: JSON.stringify(out).slice(0, 300) });
+  return c.json({ ok: true, commit: ((out.commit && out.commit.sha) || '').slice(0, 10), from, to, bytes: src.size || 0 });
+});
+ 
+// ---- Sliced repo reads (safe for big files; plain gread may truncate in transit) ----
+// /api/gread2/<key>?path=<repo path>&stat=1            → {size, sha} only
+// /api/gread2/<key>?path=<repo path>&start=<n>&len=<n> → exact byte slice as text
+//   (add &b64=1 to get the slice base64-encoded instead — for binary checks)
+app.get('/api/gread2/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  if (!c.env.GITHUB_TOKEN) return c.json({ ok: false, error: 'GITHUB_TOKEN secret not set' });
+  const path = String(c.req.query('path') || '');
+  if (!path) return c.json({ ok: false, error: 'path required' }, 400);
+  const settings = await getSettings(c.env.DB);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  const ghHeaders = { Authorization: 'Bearer ' + c.env.GITHUB_TOKEN, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+  const res = await fetch('https://api.github.com/repos/' + repo + '/contents/' + path, { headers: ghHeaders });
+  if (!res.ok) return c.json({ ok: false, error: 'GitHub ' + res.status + ' for ' + path }, 404);
+  const j = await res.json();
+  let content = String(j.content || '').replace(/\n/g, '');
+  if (!content && j.git_url) {
+    const blobRes = await fetch(j.git_url, { headers: ghHeaders });
+    if (blobRes.ok) { const blob = await blobRes.json(); content = String(blob.content || '').replace(/\n/g, ''); }
+  }
+  const bytes = Uint8Array.from(atob(content), (ch) => ch.charCodeAt(0));
+  if (c.req.query('stat')) return c.json({ ok: true, path, size: bytes.length, sha: j.sha });
+  const start = Math.max(0, Number(c.req.query('start')) || 0);
+  const len = Math.min(200000, Number(c.req.query('len')) || 8000);
+  const slice = bytes.subarray(start, start + len);
+  if (c.req.query('b64')) {
+    let bin = '';
+    for (let i = 0; i < slice.length; i += 8192) bin += String.fromCharCode.apply(null, slice.subarray(i, i + 8192));
+    return c.text(btoa(bin));
+  }
+  return c.text(new TextDecoder().decode(slice));
+});
+
 // ---- AI image generation (OpenAI) → commits PNG into the client-sites repo ----
 // Keyed endpoint so the builder can trigger it without a browser session.
 app.post('/api/genimage/:key', async (c) => {
