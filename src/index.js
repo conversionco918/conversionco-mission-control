@@ -424,6 +424,26 @@ app.post('/webhooks/ghl/:secret', async (c) => {
   return c.json({ ok: true });
 });
 
+// 8/17 Keyed: retire a slug from the SERVED copy (D1 site_files + watcher state).
+// Full retirement order: delete the folder from the GitHub repo FIRST (otherwise the
+// next auto-publish tick just re-imports it), then call this endpoint.
+app.get('/api/delete-site/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const db = c.env.DB;
+  const slug = String(c.req.query('slug') || '').trim();
+  if (!/^[a-z0-9][a-z0-9-]{2,60}$/.test(slug)) return c.json({ error: 'bad slug' }, 400);
+  const KEEP = ['anywhere-infusions', 'anywhere-infusions-v3', 'template-999-premium', 'deboer-iv', 'glow', 'ivy-portal', 'lp-250-template'];
+  if (KEEP.includes(slug) && c.req.query('force') !== 'yes')
+    return c.json({ error: 'protected slug — add &force=yes only if you are absolutely sure' }, 400);
+  const row = await db.prepare('SELECT COUNT(*) AS n FROM site_files WHERE slug = ?').bind(slug).first();
+  await db.prepare('DELETE FROM site_files WHERE slug = ?').bind(slug).run();
+  await setSetting(db, `site_sha_${slug}`, '');
+  await setSetting(db, `editpending_${slug}`, '');
+  await setSetting(db, `editwatch_${slug}`, '');
+  await logEvent(db, null, 'site_deleted', `🗑 ${slug} retired from the served copy (${(row && row.n) || 0} file(s) removed); repo cleanup handled separately`);
+  return c.json({ ok: true, slug, removed: (row && row.n) || 0 });
+});
+
 // Diagnostic endpoint (keyed, GET so it can be fetched externally)
 app.get('/debug/:key', async (c) => {
   if (c.req.param('key') !== 'dbg-7c1f4a9e2b') return c.text('nope', 403);
