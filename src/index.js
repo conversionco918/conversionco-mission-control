@@ -653,6 +653,78 @@ app.post('/api/commit-file/:key', async (c) => {
   return c.json({ ok: true, commit: (out.commit && out.commit.sha || '').slice(0, 10), path });
 });
 
+// ---- GET-based chunked commit lane (scheduled Claude sessions: WebFetch is GET-only) ----
+// Upload: /api/gcommit/<key>?id=<file-id>&part=<i>&of=<n>&data=<b64url chunk, URL-encoded>
+// The FINAL part (part == of) must also carry &path=<enc repo path>&msg=<enc commit message>.
+// Worker assembles the parts in order, commits via the GitHub contents API (3 retries),
+// then deletes the chunk rows. Single small file: part=1&of=1 with data+path+msg together.
+// data accepts base64url (- and _ for + and /); stray spaces are restored to +.
+app.get('/api/gcommit/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  if (!c.env.GITHUB_TOKEN) return c.json({ ok: false, error: 'GITHUB_TOKEN secret not set' });
+  const db = c.env.DB;
+  const id = String(c.req.query('id') || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40);
+  const part = Number(c.req.query('part'));
+  const of = Number(c.req.query('of'));
+  const data = String(c.req.query('data') || '').replace(/ /g, '+').replace(/-/g, '+').replace(/_/g, '/');
+  if (!id || !part || !of || part < 1 || part > of || of > 400) return c.json({ ok: false, error: 'id, part, of required (of <= 400)' }, 400);
+  if (data) await setSetting(db, 'gchunk_' + id + '_' + part, data);
+  if (part !== of) return c.json({ ok: true, stored: part, of });
+  const rows = (await db.prepare('SELECT key, value FROM settings WHERE key LIKE ?').bind('gchunk_' + id + '_%').all()).results || [];
+  const parts = {};
+  for (const r of rows) parts[Number(r.key.slice(('gchunk_' + id + '_').length))] = r.value;
+  let full = '';
+  for (let i = 1; i <= of; i++) {
+    if (!(i in parts)) return c.json({ ok: false, error: 'missing part ' + i + ' - resend it, then re-call the final part' });
+    full += parts[i];
+  }
+  const path = String(c.req.query('path') || '');
+  const message = String(c.req.query('msg') || '');
+  if (!path || !message) return c.json({ ok: false, error: 'path + msg required on the final part' }, 400);
+  const settings = await getSettings(db);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  const ghHeaders = { Authorization: 'Bearer ' + c.env.GITHUB_TOKEN, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+  const api = 'https://api.github.com/repos/' + repo + '/contents/' + path;
+  let out = null, okFlag = false;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const getRes = await fetch(api, { headers: ghHeaders });
+    const existing = getRes.ok ? await getRes.json() : null;
+    const putRes = await fetch(api, { method: 'PUT', headers: { ...ghHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message, content: full, ...(existing && existing.sha ? { sha: existing.sha } : {}) }) });
+    out = await putRes.json();
+    if (putRes.ok) { okFlag = true; break; }
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  for (let i = 1; i <= of; i++) await db.prepare('DELETE FROM settings WHERE key = ?').bind('gchunk_' + id + '_' + i).run();
+  if (!okFlag) return c.json({ ok: false, error: JSON.stringify(out).slice(0, 300) });
+  await logEvent(db, null, 'gcommit', 'GET-lane commit ' + ((out.commit && out.commit.sha) || '').slice(0, 10) + ' ' + path);
+  return c.json({ ok: true, commit: ((out.commit && out.commit.sha) || '').slice(0, 10), path });
+});
+ 
+// ---- GET-based repo read lane (scheduled sessions can no longer git clone) ----
+// /api/gread/<key>?path=<repo path>            → raw file text (up to ~1MB)
+// /api/gread/<key>?path=<repo path>&b64=1      → base64 of the bytes (for binary files)
+// /api/gread/<key>?dir=<repo directory path>   → JSON list of {name, path, size, type}
+app.get('/api/gread/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  if (!c.env.GITHUB_TOKEN) return c.json({ ok: false, error: 'GITHUB_TOKEN secret not set' });
+  const settings = await getSettings(c.env.DB);
+  const repo = settings.sites_repo || 'conversionco918/conversionco-client-sites';
+  const ghHeaders = { Authorization: 'Bearer ' + c.env.GITHUB_TOKEN, 'User-Agent': 'conversionco-mission-control', Accept: 'application/vnd.github+json' };
+  const dir = String(c.req.query('dir') || '');
+  const path = String(c.req.query('path') || '');
+  if (!dir && !path) return c.json({ ok: false, error: 'path or dir required' }, 400);
+  const target = dir || path;
+  const res = await fetch('https://api.github.com/repos/' + repo + '/contents/' + target, { headers: ghHeaders });
+  if (!res.ok) return c.json({ ok: false, error: 'GitHub ' + res.status + ' for ' + target }, 404);
+  const j = await res.json();
+  if (Array.isArray(j)) return c.json(j.map((e) => ({ name: e.name, path: e.path, size: e.size, type: e.type })));
+  const b64 = String(j.content || '').replace(/\n/g, '');
+  if (c.req.query('b64')) return c.text(b64);
+  const bytes = Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0));
+  return c.text(new TextDecoder().decode(bytes));
+});
+
 // ---- AI image generation (OpenAI) → commits PNG into the client-sites repo ----
 // Keyed endpoint so the builder can trigger it without a browser session.
 app.post('/api/genimage/:key', async (c) => {
