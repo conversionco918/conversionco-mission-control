@@ -1058,7 +1058,7 @@ async function lpInject(id){
   var inp=document.getElementById('lpurl_'+id);if(s&&s.url&&inp)inp.value=s.url;
   var box=document.getElementById('lplights_'+id);if(box)box.innerHTML=lpLightsHtml(s);
 }
-(function(){var _od=openDrawer;window.openDrawer=function(id){_od(id);try{lpInject(id);}catch(e){}};})();
+// (8/18/2026) lpInject retired — superseded by the Ads Engine panel; the lp-* backend routes never shipped.
 </script>
 <script>
 // 💵 Feature 1 UI: unpaid-balance badge on board cards + resend-email button in the drawer.
@@ -1197,6 +1197,28 @@ async function lpInject(id){
     var code = '<script defer src="' + base + '/t/' + id + '/t.js"><\/script>';
     navigator.clipboard.writeText(code).then(function () { toast('Tracking code copied — paste it into the page header code box'); }, function () { prompt('Copy this:', code); });
   };
+  function adsChip(id) {
+    var rep = null;
+    try { rep = JSON.parse((STATE.settings || {})['ads_' + id] || 'null'); } catch (e) {}
+    if (!rep || !rep.url) return '';
+    var green = !!rep.ok;
+    return '<span class="adschip chip" style="background:' + (green ? '#ecfdf5' : '#fffbeb') + ';color:' + (green ? '#047857' : '#b45309') + ';font-weight:600;font-size:10.5px;">&#128640; ads ' + (green ? 'ready' : 'setup') + '</span>';
+  }
+  function decorateAds() {
+    document.querySelectorAll('.bcard').forEach(function (el) {
+      if (el.querySelector('.adschip')) return;
+      var m = (el.getAttribute('onclick') || '').match(/openDrawer\((\d+)\)/);
+      if (!m) return;
+      var htmlChip = adsChip(Number(m[1]));
+      if (!htmlChip) return;
+      var s = document.createElement('span');
+      s.innerHTML = htmlChip;
+      el.appendChild(s.firstChild);
+    });
+  }
+  var _rb = renderBoard;
+  renderBoard = function () { _rb(); try { decorateAds(); } catch (e) {} };
+  try { decorateAds(); } catch (e) {}
   window.adsBuildRequest = async function (id, btn) {
     btn.disabled = true;
     try {
