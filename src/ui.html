@@ -1156,6 +1156,10 @@ async function lpInject(id){
     h += '<button class="btn btn-ghost" style="font-size:12.5px"' + (rep && rep.ok ? '' : ' disabled title="Connect must be green first"') + ' onclick="adsBuildRequest(' + id + ', this)">&#128226; Request campaign build</button>';
     h += '</div>';
     if (rep && rep.build_requested) h += '<div style="font-size:11.5px;color:#047857;margin-top:8px">Campaign build requested ' + new Date(rep.build_requested).toLocaleString('en-US', { timeZone: 'America/Chicago', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) + ' &middot; it will land PAUSED for your approval</div>';
+    var gsc = (STATE.settings || {})['gsc_' + id] || '';
+    h += '<div style="display:flex;gap:8px;margin-top:12px;align-items:center"><input id="gscProp' + id + '" type="text" placeholder="Search Console property (sc-domain:their-site.com)" value="' + gsc.replace(/"/g, '&quot;') + '" style="flex:1;font-size:12.5px;padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:#fff">';
+    h += '<button class="btn btn-ghost" style="font-size:12.5px;white-space:nowrap" onclick="gscSave(' + id + ', this)">Save</button></div>';
+    h += '<div id="gscInfo' + id + '" style="font-size:11.5px;color:var(--muted);margin-top:6px">' + (gsc ? '&#11088; Rankings snapshots run daily from this property.' : 'Set the verified Search Console property to turn on the daily keyword rankings (standard for every client).') + '</div>';
     h += '<div style="font-size:11px;color:var(--muted);margin-top:8px">Flow: tracking green &#8594; research &#8594; build sheet &#8594; campaign lands PAUSED &#8594; you enable. No guarantees in client-facing copy, ever.</div>';
     h += '</div>';
     return h;
@@ -1219,6 +1223,21 @@ async function lpInject(id){
   var _rb = renderBoard;
   renderBoard = function () { _rb(); try { decorateAds(); } catch (e) {} };
   try { decorateAds(); } catch (e) {}
+  window.gscSave = async function (id, btn) {
+    var inp = document.getElementById('gscProp' + id);
+    var prop = inp ? inp.value.trim() : '';
+    btn.disabled = true;
+    try {
+      var r = await api('/api/clients/' + id + '/gsc-property', { method: 'POST', body: JSON.stringify({ property: prop }) });
+      if (r && r.error) { toast('⚠ ' + r.error); } else {
+        STATE.settings['gsc_' + id] = prop;
+        toast(prop ? 'Search Console connected ⭐ — first snapshot is running now' : 'Search Console property cleared');
+        var info = document.getElementById('gscInfo' + id);
+        if (info) info.innerHTML = prop ? '&#11088; Rankings snapshots run daily from this property.' : 'Set the verified Search Console property to turn on the daily keyword rankings (standard for every client).';
+      }
+    } catch (e) { toast('⚠ Save failed, try again'); }
+    btn.disabled = false;
+  };
   window.adsBuildRequest = async function (id, btn) {
     btn.disabled = true;
     try {

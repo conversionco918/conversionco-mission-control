@@ -83,6 +83,11 @@ async function ensureSchema(db) {
   // fixed-window rate limiting for the public endpoints (lead form, portal boxes)
   try { await db.prepare(`CREATE TABLE IF NOT EXISTS ratelimit (
     k TEXT PRIMARY KEY, n INTEGER NOT NULL DEFAULT 0, win TEXT NOT NULL DEFAULT '')`).run(); } catch {}
+  // ⭐ rankings history: one row per client/keyword/day, straight from GSC (accuracy law)
+  try { await db.prepare(`CREATE TABLE IF NOT EXISTS rank_history (
+    client_id INTEGER NOT NULL, q TEXT NOT NULL, day TEXT NOT NULL,
+    pos REAL NOT NULL DEFAULT 0, clicks INTEGER NOT NULL DEFAULT 0, impr INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (client_id, q, day))`).run(); } catch {}
   schemaReady = true;
 }
 
@@ -5270,6 +5275,129 @@ app.get('/api/clients/:id/ga4-daily', async (c) => {
   } catch (e) { return c.json({ pending: 'error', note: String(e && e.message || e).slice(0, 120) }); }
 });
 
+
+// ════════════════════════════════════════════════════════════════════════════
+// 🐶 ADS TAG-HEALTH WATCHDOG (8/18/2026, daily noon cron) — re-verifies every
+// connected landing page (settings ads_<id>). A light that was green and went
+// red = regression: logged per client + one owner email with the exact fixes.
+async function adsWatchdog(env) {
+  const db = env.DB;
+  const settings = await getSettings(db);
+  const keys = Object.keys(settings).filter((k) => /^ads_\d+$/.test(k));
+  const problems = [];
+  for (const k of keys) {
+    let prev = {}; try { prev = JSON.parse(settings[k] || '{}'); } catch {}
+    if (!prev.url) continue;
+    const id = Number(k.slice(4));
+    const rep = await adsVerify(env, id, prev.url);
+    await setSetting(db, k, JSON.stringify({ ...prev, ...rep }));
+    const regress = [];
+    for (const lk of ['ga4', 'clarity', 'phone', 'form', 'policy']) {
+      const was = prev.checks && prev.checks[lk] && prev.checks[lk].ok;
+      const now = rep.checks && rep.checks[lk] && rep.checks[lk].ok;
+      if (was && !now) regress.push(lk === 'ga4' ? 'Google Analytics tag GONE' : lk === 'clarity' ? 'Clarity tag GONE' : lk + ' check failed');
+    }
+    if (rep.error) regress.push('page unreachable: ' + rep.error);
+    if (rep.checks && rep.checks.rx && !rep.checks.rx.ok && !(prev.checks && prev.checks.rx && !prev.checks.rx.ok)) {
+      regress.push('Google-policy words appeared: ' + rep.checks.rx.found.join(', '));
+    }
+    if (regress.length) {
+      problems.push({ id, url: prev.url, regress });
+      await logEvent(db, id, 'error', `🚨 Ads watchdog: tracking regression on ${prev.url} — ${regress.join('; ')}`);
+    }
+  }
+  if (problems.length) {
+    const html = '<p>The daily tag-health check found problems on ' + problems.length + ' connected page(s):</p>' +
+      problems.map((p) => '<p><b>Client #' + p.id + '</b> — ' + p.url + '<br>' + p.regress.join('<br>') + '</p>').join('') +
+      '<p>Open the client card → Ads Engine → Connect to re-check after fixing. If a tag vanished, re-paste the tracking code into the page header.</p>';
+    await notifyOwner(env, settings, '🚨 Ads watchdog: ' + problems.length + ' page(s) lost tracking', html);
+  }
+  return problems.length;
+}
+
+// ⭐ GSC RANKINGS SNAPSHOT (8/18/2026, daily noon cron) — the moneymaker lane.
+// For every client with settings gsc_<id> = their VERIFIED Search Console
+// property (e.g. sc-domain:example.com), pull the last 28 days of query data
+// and store today's snapshot in rank_history. ACCURACY LAW: only Google's own
+// numbers are stored; clients with no property or no data store nothing.
+async function gscRankSnapshot(env) {
+  const db = env.DB;
+  if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET || !env.GOOGLE_REFRESH_TOKEN) return;
+  const settings = await getSettings(db);
+  const props = Object.keys(settings).filter((k) => /^gsc_\d+$/.test(k) && settings[k]);
+  if (!props.length) return;
+  let token = '';
+  try {
+    const tr = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET, refresh_token: env.GOOGLE_REFRESH_TOKEN, grant_type: 'refresh_token' }),
+    });
+    const td = await tr.json();
+    token = td.access_token || '';
+    if (!token) throw new Error(td.error || 'no token');
+  } catch (e) {
+    await logEvent(db, null, 'error', `Rankings snapshot: Google sign-in failed (${String(e.message).slice(0, 80)})`);
+    return;
+  }
+  const day = new Date().toISOString().slice(0, 10);
+  const start = new Date(Date.now() - 28 * 86400 * 1000).toISOString().slice(0, 10);
+  for (const k of props) {
+    const id = Number(k.slice(4));
+    const site = settings[k];
+    try {
+      const r = await fetch('https://www.googleapis.com/webmasters/v3/sites/' + encodeURIComponent(site) + '/searchAnalytics/query', {
+        method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ startDate: start, endDate: day, dimensions: ['query'], rowLimit: 25 }),
+      });
+      if (!r.ok) { await logEvent(db, id, 'error', `Rankings snapshot failed for ${site}: HTTP ${r.status}`); continue; }
+      const data = await r.json();
+      const rows = data.rows || [];
+      for (const row of rows) {
+        await db.prepare(`INSERT INTO rank_history (client_id, q, day, pos, clicks, impr) VALUES (?, ?, ?, ?, ?, ?)
+          ON CONFLICT(client_id, q, day) DO UPDATE SET pos = excluded.pos, clicks = excluded.clicks, impr = excluded.impr`)
+          .bind(id, String(row.keys[0]).slice(0, 120), day, Math.round((row.position || 0) * 10) / 10, row.clicks || 0, row.impressions || 0).run();
+      }
+    } catch (e) {
+      await logEvent(db, id, 'error', `Rankings snapshot error for ${site}: ${String(e && e.message || e).slice(0, 100)}`);
+    }
+  }
+}
+
+// Set/read a client's Search Console property (admin session required).
+app.post('/api/clients/:id/gsc-property', async (c) => {
+  const id = Number(c.req.param('id')) || 0;
+  let body = {}; try { body = await c.req.json(); } catch {}
+  const prop = String(body.property || '').trim().slice(0, 200);
+  await setSetting(c.env.DB, 'gsc_' + id, prop);
+  await logEvent(c.env.DB, id, 'gsc_property', prop ? `⭐ Search Console property set: ${prop} — daily rankings snapshots begin at the next noon check` : 'Search Console property cleared');
+  if (prop) c.executionCtx.waitUntil(gscRankSnapshot(c.env).catch(() => {}));
+  return c.json({ ok: true, property: prop });
+});
+
+// Rankings read: latest day per keyword + movement vs ~7 days earlier.
+app.get('/api/clients/:id/rankings', async (c) => {
+  const id = Number(c.req.param('id')) || 0;
+  const settings = await getSettings(c.env.DB);
+  const prop = settings['gsc_' + id] || '';
+  if (!prop) return c.json({ pending: 'no-property' });
+  const rows = (await c.env.DB.prepare(
+    `SELECT q, day, pos, clicks, impr FROM rank_history WHERE client_id = ? AND day >= date('now','-35 days') ORDER BY day ASC`
+  ).bind(id).all()).results || [];
+  if (!rows.length) return c.json({ property: prop, pending: 'no-data', note: 'Connected — first snapshot lands at the next daily check.' });
+  const byQ = {};
+  for (const r of rows) { (byQ[r.q] = byQ[r.q] || []).push(r); }
+  const latestDay = rows[rows.length - 1].day;
+  const list = Object.entries(byQ).map(([q, hist]) => {
+    const cur = hist[hist.length - 1];
+    const prior = hist.length > 7 ? hist[hist.length - 8] : hist[0];
+    return { q, pos: cur.pos, clicks: cur.clicks, impr: cur.impr, day: cur.day,
+      delta: (hist.length > 1 && prior) ? Math.round((prior.pos - cur.pos) * 10) / 10 : 0,
+      spark: hist.slice(-14).map((x) => x.pos) };
+  }).filter((x) => x.day === latestDay)
+    .sort((a, b) => b.impr - a.impr).slice(0, 15);
+  return c.json({ property: prop, day: latestDay, keywords: list });
+});
+
 export default {
   fetch: app.fetch,
   async scheduled(event, env, ctx) {
@@ -5280,6 +5408,12 @@ export default {
       ));
       ctx.waitUntil(reviewAskSweep(env).catch((e) =>
         logEvent(env.DB, null, 'error', `Review ask sweep failed: ${e.message}`)
+      ));
+      ctx.waitUntil(adsWatchdog(env).catch((e) =>
+        logEvent(env.DB, null, 'error', `Ads watchdog failed: ${e.message}`)
+      ));
+      ctx.waitUntil(gscRankSnapshot(env).catch((e) =>
+        logEvent(env.DB, null, 'error', `Rankings snapshot failed: ${e.message}`)
       ));
       ctx.waitUntil(backupDatabase(env).catch((e) =>
         logEvent(env.DB, null, 'error', `Backup failed: ${e.message}`)
