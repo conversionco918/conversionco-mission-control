@@ -5158,6 +5158,114 @@ async function gscPullAll(env, settings) {
   } catch { /* not verified yet — fine */ }
 }
 
+
+// ════════════════════════════════════════════════════════════════════════════
+// 🚀 ADS ENGINE v1 (8/18/2026) — Tiffany-only panel inside Mission Control.
+// She pastes a landing-page URL on a client card → live tracking verification
+// (GA4 / Clarity / call-text links / form / privacy+terms / healthcare-policy
+// word scan / our own /t/ beacon) → report stored in settings key ads_<id> →
+// status lights render in the drawer. Campaign builds are produced by the
+// ads-builder scheduled task under claude/ads-setup-doctrine.md; every build
+// lands PAUSED and only Tiffany enables it. GA4 numbers route is dormant
+// until the analytics scopes land on GOOGLE_REFRESH_TOKEN (her one consent).
+async function adsVerify(env, id, url) {
+  const report = { url: String(url).slice(0, 300), at: new Date().toISOString(), ok: false, checks: {} };
+  let html = '';
+  try {
+    const u = new URL(url);
+    const ownHost = new URL(BASE_URL).host;
+    if (u.host === ownHost) {
+      // Worker cannot fetch its own hostname — read preview-hosted pages from D1.
+      const m = u.pathname.match(/^\/preview\/([^/]+)\/?(.*)$/);
+      if (m) {
+        const slug = m[1]; let p = m[2] || 'index.html'; if (p === '' || p.endsWith('/')) p += 'index.html';
+        const row = await env.DB.prepare('SELECT content, is_base64 FROM site_files WHERE slug = ? AND path = ?').bind(slug, p).first();
+        if (!row) { report.error = 'No file at that preview path'; return report; }
+        html = row.is_base64 ? '' : String(row.content || '');
+        report.status = 200;
+      } else { report.error = 'Unrecognized worker-hosted path'; return report; }
+    } else {
+      const r = await fetch(u.toString(), { redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ConversionCo-Connect/1.0)' } });
+      report.status = r.status;
+      if (!r.ok) { report.error = 'Page returned HTTP ' + r.status; return report; }
+      html = await r.text();
+    }
+  } catch (e) { report.error = 'Could not reach page: ' + String(e && e.message || e).slice(0, 120); return report; }
+  const ga = html.match(/G-[A-Z0-9]{6,14}/);
+  report.checks.ga4 = { ok: !!ga, id: ga ? ga[0] : '' };
+  const cl = html.match(/clarity\.ms\/tag\/([A-Za-z0-9]+)/) || html.match(/["']clarity["']\s*,\s*["']script["']\s*,\s*["']([A-Za-z0-9]+)["']/);
+  report.checks.clarity = { ok: !!cl, id: cl ? cl[1] : '' };
+  report.checks.phone = { ok: /href=["'](?:tel:|sms:)/i.test(html) };
+  report.checks.form = { ok: /<form[\s>]/i.test(html) || /janeapp\.com|calendar\.google\.com\/calendar\/appointments/i.test(html) };
+  report.checks.policy = { ok: /privacy/i.test(html) && /terms/i.test(html) };
+  report.checks.tracker = { ok: html.indexOf('/t/' + id + '/t.js') !== -1 };
+  const rxHits = html.match(/\b(zofran|ondansetron|toradol|ketorolac)\b/gi) || [];
+  const claimHits = html.match(/\b(cures?|guaranteed?|treats? (?:illness|disease|migraines|infections))\b/gi) || [];
+  const flagged = [...new Set([...rxHits, ...claimHits].map((w) => w.toLowerCase()))];
+  report.checks.rx = { ok: flagged.length === 0, found: flagged.slice(0, 10) };
+  report.ok = !!(report.checks.ga4.ok && report.checks.clarity.ok && report.checks.phone.ok);
+  return report;
+}
+
+app.post('/api/clients/:id/ads-connect', async (c) => {
+  const id = Number(c.req.param('id')) || 0;
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'no such client' }, 404);
+  let body = {}; try { body = await c.req.json(); } catch {}
+  let url = String(body.url || '').trim();
+  if (url && !/^https?:\/\//i.test(url)) url = 'https://' + url;
+  try { new URL(url); } catch { return c.json({ error: 'That does not look like a URL' }, 400); }
+  const prev = (await getSettings(db))['ads_' + id];
+  let prevObj = {}; try { prevObj = JSON.parse(prev || '{}'); } catch {}
+  const report = await adsVerify(c.env, id, url);
+  const merged = { ...prevObj, ...report, ga4_property: prevObj.ga4_property || '', build_requested: prevObj.build_requested || '' };
+  await setSetting(db, 'ads_' + id, JSON.stringify(merged));
+  const lights = ['ga4', 'clarity', 'phone', 'form', 'policy'].map((k) => (report.checks[k] && report.checks[k].ok ? '✓' : '✗') + k).join(' ');
+  await logEvent(db, id, 'ads_connect', `🚀 Ads Engine connect check on ${merged.url} — ${lights}${report.checks.rx && !report.checks.rx.ok ? ' ⚠ policy words: ' + report.checks.rx.found.join(', ') : ''}`);
+  return c.json(merged);
+});
+
+app.post('/api/clients/:id/ads-build-request', async (c) => {
+  const id = Number(c.req.param('id')) || 0;
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'no such client' }, 404);
+  const settings = await getSettings(db);
+  let obj = {}; try { obj = JSON.parse(settings['ads_' + id] || '{}'); } catch {}
+  if (!obj.url) return c.json({ error: 'Connect a landing page first — the doctrine requires verified tracking before any build.' }, 400);
+  if (!obj.ok) return c.json({ error: 'Tracking is not green yet (GA4 + Clarity + call links must verify). Fix the page, re-connect, then request the build.' }, 400);
+  obj.build_requested = new Date().toISOString();
+  await setSetting(db, 'ads_' + id, JSON.stringify(obj));
+  await logEvent(db, id, 'ads_build_requested', `📢 Campaign build requested for ${client.name || client.email} — ads-builder will produce the build sheet (doctrine: claude/ads-setup-doctrine.md); campaign lands PAUSED for Tiffany's approval.`);
+  return c.json({ ok: true, requested: obj.build_requested });
+});
+
+app.get('/api/clients/:id/ga4-daily', async (c) => {
+  const id = Number(c.req.param('id')) || 0;
+  const settings = await getSettings(c.env.DB);
+  let obj = {}; try { obj = JSON.parse(settings['ads_' + id] || '{}'); } catch {}
+  if (!obj.ga4_property) return c.json({ pending: 'no-property', note: 'No GA4 property saved for this client yet.' });
+  if (!c.env.GOOGLE_CLIENT_ID || !c.env.GOOGLE_CLIENT_SECRET || !c.env.GOOGLE_REFRESH_TOKEN) return c.json({ pending: 'no-google-auth' });
+  try {
+    const tr = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ client_id: c.env.GOOGLE_CLIENT_ID, client_secret: c.env.GOOGLE_CLIENT_SECRET, refresh_token: c.env.GOOGLE_REFRESH_TOKEN, grant_type: 'refresh_token' }),
+    });
+    const td = await tr.json();
+    if (!td.access_token) return c.json({ pending: 'token-failed' });
+    const rr = await fetch(`https://analyticsdata.googleapis.com/v1beta/properties/${encodeURIComponent(obj.ga4_property)}:runReport`, {
+      method: 'POST', headers: { Authorization: 'Bearer ' + td.access_token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dateRanges: [{ startDate: '28daysAgo', endDate: 'today' }], dimensions: [{ name: 'date' }], metrics: [{ name: 'sessions' }, { name: 'keyEvents' }] }),
+    });
+    if (rr.status === 403) return c.json({ pending: 'scope', note: 'GOOGLE_REFRESH_TOKEN is missing the analytics scope — one re-consent lights this up.' });
+    if (!rr.ok) return c.json({ pending: 'api-' + rr.status });
+    const data = await rr.json();
+    const rows = (data.rows || []).map((r) => ({ date: r.dimensionValues[0].value, sessions: Number(r.metricValues[0].value), keyEvents: Number(r.metricValues[1].value) }));
+    return c.json({ ok: true, rows });
+  } catch (e) { return c.json({ pending: 'error', note: String(e && e.message || e).slice(0, 120) }); }
+});
+
 export default {
   fetch: app.fetch,
   async scheduled(event, env, ctx) {

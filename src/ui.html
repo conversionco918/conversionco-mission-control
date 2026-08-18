@@ -1121,6 +1121,93 @@ async function lpInject(id){
     } catch (e) { toast('⚠ resend failed, try again'); btn.disabled = false; }
   };
 })();
+<script>
+// 🚀 ADS ENGINE PANEL (8/18/2026) — Tiffany-only section in the client drawer.
+// Paste landing page URL → Connect → tracking lights. Cohesive with dashboard
+// styles: same buttons, same muted labels, same card language.
+(function () {
+  var LKEYS = [
+    ['ga4', 'Google Analytics'], ['clarity', 'Clarity'], ['phone', 'Call & text links'],
+    ['form', 'Booking / form'], ['policy', 'Privacy + Terms'], ['rx', 'Ads policy scan']
+  ];
+  function light(rep, k, label) {
+    var c = rep && rep.checks && rep.checks[k];
+    var state = !rep ? 'wait' : (c && c.ok ? 'ok' : 'bad');
+    var col = state === 'ok' ? ['#ecfdf5', '#047857', '#a7f3d0'] : state === 'bad' ? ['#fef2f2', '#b91c1c', '#fecaca'] : ['#f8fafc', '#64748b', '#e2e8f0'];
+    var extra = '';
+    if (c && k === 'ga4' && c.id) extra = ' ' + c.id;
+    if (c && k === 'rx' && !c.ok) extra = ' ' + (c.found || []).join(', ');
+    return '<span style="display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:600;padding:4px 10px;border-radius:999px;background:' + col[0] + ';color:' + col[1] + ';border:1px solid ' + col[2] + ';">' + (state === 'ok' ? '&#10003;' : state === 'bad' ? '&#10007;' : '&middot;') + ' ' + label + extra + '</span>';
+  }
+  function panelHtml(id) {
+    var rep = null;
+    try { rep = JSON.parse((STATE.settings || {})['ads_' + id] || 'null'); } catch (e) {}
+    var url = rep && rep.url ? rep.url : '';
+    var when = rep && rep.at ? new Date(rep.at).toLocaleString('en-US', { timeZone: 'America/Chicago', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '';
+    var h = '<div style="border-top:1px solid var(--line);margin-top:18px;padding-top:16px">';
+    h += '<div style="font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);font-weight:700;margin-bottom:10px">&#128640; Ads Engine <span style="font-weight:400;letter-spacing:0;text-transform:none">&middot; your eyes only</span></div>';
+    h += '<div style="display:flex;gap:8px;margin-bottom:10px"><input id="adsUrl' + id + '" type="text" placeholder="Paste the landing page URL" value="' + (url ? url.replace(/"/g, '&quot;') : '') + '" style="flex:1;font-size:13px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:#fff">';
+    h += '<button class="btn btn-primary" style="white-space:nowrap" onclick="adsConnect(' + id + ', this)">Connect</button></div>';
+    h += '<div id="adsLights' + id + '" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">' + LKEYS.map(function (p) { return light(rep, p[0], p[1]); }).join('') + '</div>';
+    if (when) h += '<div style="font-size:11.5px;color:var(--muted);margin-bottom:10px">Last checked ' + when + (rep && rep.ok ? ' &middot; tracking is green' : rep ? ' &middot; not green yet' : '') + '</div>';
+    h += '<div style="display:flex;flex-wrap:wrap;gap:8px">';
+    h += '<button class="btn btn-ghost" style="font-size:12.5px" onclick="adsCopySnippet(' + id + ')">&#128203; Copy tracking code</button>';
+    h += '<button class="btn btn-ghost" style="font-size:12.5px"' + (rep && rep.ok ? '' : ' disabled title="Connect must be green first"') + ' onclick="adsBuildRequest(' + id + ', this)">&#128226; Request campaign build</button>';
+    h += '</div>';
+    if (rep && rep.build_requested) h += '<div style="font-size:11.5px;color:#047857;margin-top:8px">Campaign build requested ' + new Date(rep.build_requested).toLocaleString('en-US', { timeZone: 'America/Chicago', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) + ' &middot; it will land PAUSED for your approval</div>';
+    h += '<div style="font-size:11px;color:var(--muted);margin-top:8px">Flow: tracking green &#8594; research &#8594; build sheet &#8594; campaign lands PAUSED &#8594; you enable. No guarantees in client-facing copy, ever.</div>';
+    h += '</div>';
+    return h;
+  }
+  function addPanel(id) {
+    if (document.getElementById('adsEngine' + id)) return;
+    var body = document.querySelector('#drawer .dbody');
+    if (!body) return;
+    var d = document.createElement('div');
+    d.id = 'adsEngine' + id;
+    d.innerHTML = panelHtml(id);
+    body.appendChild(d);
+  }
+  var _od = openDrawer;
+  openDrawer = function (id) {
+    var r = _od(id);
+    setTimeout(function () { try { addPanel(id); } catch (e) {} }, 350);
+    return r;
+  };
+  window.adsConnect = async function (id, btn) {
+    var inp = document.getElementById('adsUrl' + id);
+    var url = inp ? inp.value.trim() : '';
+    if (!url) { toast('Paste the landing page URL first'); return; }
+    btn.disabled = true; btn.textContent = 'Checking…';
+    try {
+      var r = await api('/api/clients/' + id + '/ads-connect', { method: 'POST', body: JSON.stringify({ url: url }) });
+      if (r && r.error) { toast('⚠ ' + r.error); }
+      else {
+        STATE.settings['ads_' + id] = JSON.stringify(r);
+        var wrap = document.getElementById('adsEngine' + id);
+        if (wrap) wrap.innerHTML = panelHtml(id);
+        toast(r.ok ? 'Tracking is green ✅' : 'Checked — some lights are red, see the panel');
+      }
+    } catch (e) { toast('⚠ Connect failed, try again'); }
+    btn.disabled = false; btn.textContent = 'Connect';
+  };
+  window.adsCopySnippet = function (id) {
+    var base = location.origin;
+    var code = '<script defer src="' + base + '/t/' + id + '/t.js"><\/script>';
+    navigator.clipboard.writeText(code).then(function () { toast('Tracking code copied — paste it into the page header code box'); }, function () { prompt('Copy this:', code); });
+  };
+  window.adsBuildRequest = async function (id, btn) {
+    btn.disabled = true;
+    try {
+      var r = await api('/api/clients/' + id + '/ads-build-request', { method: 'POST' });
+      if (r && r.error) { toast('⚠ ' + r.error); btn.disabled = false; return; }
+      toast('Campaign build requested 📢 — it will land PAUSED for your approval');
+      var wrap = document.getElementById('adsEngine' + id);
+      try { var rep = JSON.parse(STATE.settings['ads_' + id] || '{}'); rep.build_requested = r.requested; STATE.settings['ads_' + id] = JSON.stringify(rep); } catch (e) {}
+      if (wrap) wrap.innerHTML = panelHtml(id);
+    } catch (e) { toast('⚠ Request failed, try again'); btn.disabled = false; }
+  };
+})();
 </script>
 </body>
 </html>
