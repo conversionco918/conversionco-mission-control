@@ -1494,6 +1494,11 @@ app.post('/agreement-sign/:id/:token', async (c) => {
   const name = String(f.name || '').slice(0, 120).trim();
   if (!name) return c.json({ error: 'name required' }, 400);
   const pkg = client.tier === 'premium' ? 'Premium $999' : 'Standard $649';
+  // 🔒 DOUBLE-CLICK GUARD (caught live in the 8/17 pipeline test: two rapid sign
+  // submissions raced past the billing guard and sent TWO deposit invoices). First
+  // signature wins; any repeat returns ok and does nothing.
+  const alreadySigned = await db.prepare('SELECT id FROM agreements WHERE client_id = ? LIMIT 1').bind(id).first();
+  if (alreadySigned) return c.json({ ok: true, already: true });
   await db.prepare('INSERT INTO agreements (client_id, version, package, signed_name, user_agent) VALUES (?, ?, ?, ?, ?)')
     .bind(id, AGREEMENT_VERSION, pkg, name, (c.req.header('User-Agent') || '').slice(0, 200)).run();
   await logEvent(db, id, 'agreement_signed', `✍️ Agreement signed by ${name} (${pkg})`);
@@ -1502,7 +1507,8 @@ app.post('/agreement-sign/:id/:token', async (c) => {
   // invoice fires — no manual step. Guards: Stripe configured, nothing already
   // sent/paid. Uses the card's current tier (set on the pricing call).
   try {
-    const bS = getBilling(client);
+    const freshS = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+    const bS = getBilling(freshS || client);
     if (c.env.STRIPE_SECRET_KEY && !bS.dep_id && bS.dep_status !== 'paid' && bS.invoice_status !== 'paid' && !bS.fin_id) {
       const tierKeyS = (client.tier === 'premium') ? 'premium' : 'standard';
       const custS = await ensureCustomer(c.env.STRIPE_SECRET_KEY, client.email, client.name || client.business_name || '');
