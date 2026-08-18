@@ -5200,7 +5200,11 @@ async function adsVerify(env, id, url) {
   report.checks.policy = { ok: /privacy/i.test(html) && /terms/i.test(html) };
   report.checks.tracker = { ok: html.indexOf('/t/' + id + '/t.js') !== -1 };
   const rxHits = html.match(/\b(zofran|ondansetron|toradol|ketorolac)\b/gi) || [];
-  const claimHits = html.match(/\b(cures?|guaranteed?|treats? (?:illness|disease|migraines|infections))\b/gi) || [];
+  // Claim scan runs on a copy with disclaimer/negation sentences removed — the required
+  // "not intended to diagnose, treat, cure, or prevent" line and "no cure claims" phrasing
+  // are compliance language, not violations.
+  const scanHtml = html.replace(/[^.<>]*diagnose[^.<>]*/gi, '').replace(/[^.<>]*no cure claims[^.<>]*/gi, '').replace(/[^.<>]*(?:cannot|can't|won't|not) (?:cure|guarantee)[^.<>]*/gi, '');
+  const claimHits = scanHtml.match(/\b(cures?|guaranteed?|treats? (?:illness|disease|migraines|infections))\b/gi) || [];
   const flagged = [...new Set([...rxHits, ...claimHits].map((w) => w.toLowerCase()))];
   report.checks.rx = { ok: flagged.length === 0, found: flagged.slice(0, 10) };
   report.ok = !!(report.checks.ga4.ok && report.checks.clarity.ok && report.checks.phone.ok);
