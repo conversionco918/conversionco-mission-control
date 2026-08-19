@@ -3298,6 +3298,14 @@ app.delete('/api/clients/:id', async (c) => {
   if (clD && clD.stage === 'generating' && c.req.query('force') !== 'yes')
     return c.json({ error: 'A build is RUNNING for this client. Deleting now would orphan the site and the signed agreement. Wait for the build to finish (or re-request with ?force=yes).' }, 409);
   await c.env.DB.prepare('DELETE FROM clients WHERE id = ?').bind(id).run();
+  // 8/19: sweep this client's per-client settings so nothing keeps running for a
+  // card that no longer exists (the ads watchdog used to keep polling dead pages).
+  try {
+    await c.env.DB.prepare(
+      `DELETE FROM settings WHERE key IN (${['ads', 'gsc', 'gsc_data', 'gsc_first', 'buildprog', 'uptime', 'meet', 'qw_build', 'rev1_sent', 'revask', 'lp'].map(() => '?').join(',')})`
+    ).bind(...['ads', 'gsc', 'gsc_data', 'gsc_first', 'buildprog', 'uptime', 'meet', 'qw_build', 'rev1_sent', 'revask', 'lp'].map((p) => `${p}_${id}`)).run();
+    await c.env.DB.prepare('DELETE FROM rank_history WHERE client_id = ?').bind(id).run();
+  } catch { /* cleanup is best-effort — never block the delete */ }
   await logEvent(c.env.DB, id, 'client_deleted');
   return c.json({ ok: true });
 });
@@ -5318,6 +5326,9 @@ async function adsWatchdog(env) {
     let prev = {}; try { prev = JSON.parse(settings[k] || '{}'); } catch {}
     if (!prev.url) continue;
     const id = Number(k.slice(4));
+    // orphan guard: the card was deleted — clear the key instead of polling forever
+    const stillHere = await db.prepare('SELECT id FROM clients WHERE id = ?').bind(id).first();
+    if (!stillHere) { await setSetting(db, k, ''); continue; }
     const rep = await adsVerify(env, id, prev.url);
     await setSetting(db, k, JSON.stringify({ ...prev, ...rep }));
     const regress = [];
@@ -5359,6 +5370,8 @@ async function gscRankSnapshot(env) {
     const id = Number(k.slice(4));
     let st = null; try { st = JSON.parse(settings[k] || 'null'); } catch {}
     if (!st || !st.property || !st.verified) continue;
+    const liveClient = await db.prepare('SELECT id FROM clients WHERE id = ?').bind(id).first();
+    if (!liveClient) { await setSetting(db, k, ''); continue; }
     try {
       const stats = await gscQueryStats(env, st.property, 28);
       const rows = (stats && stats.rows) || [];
