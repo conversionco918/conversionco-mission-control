@@ -5554,6 +5554,31 @@ app.post('/api/clients/:id/ads-live', async (c) => {
   return c.json({ ok: true });
 });
 
+
+// 📣 Store the client's Google Ads account (10-digit customer ID or a pasted
+// account URL) so the Ads tab can deep-link straight into their campaigns.
+app.post('/api/clients/:id/ads-account', async (c) => {
+  const id = Number(c.req.param('id')) || 0;
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'no such client' }, 404);
+  let body = {}; try { body = await c.req.json(); } catch {}
+  const raw = String(body.account || '').trim().slice(0, 300);
+  const settings = await getSettings(db);
+  let rep = {}; try { rep = JSON.parse(settings['ads_' + id] || '{}'); } catch {}
+  if (!raw) { delete rep.ads_cid; delete rep.ads_url; }
+  else if (/^https?:\/\//i.test(raw)) { rep.ads_url = raw; delete rep.ads_cid; }
+  else {
+    const digits = raw.replace(/\D/g, '');
+    if (digits.length !== 10) return c.json({ error: 'Google Ads customer IDs are 10 digits (like 123-456-7890). Or paste the full account URL instead.' }, 400);
+    rep.ads_cid = digits;
+    delete rep.ads_url;
+  }
+  await setSetting(db, 'ads_' + id, JSON.stringify(rep));
+  await logEvent(db, id, 'ads_account', raw ? `📣 Google Ads account linked for ${client.business_name || client.name || client.email}` : 'Google Ads account link cleared');
+  return c.json({ ok: true, ads_cid: rep.ads_cid || '', ads_url: rep.ads_url || '' });
+});
+
 export default {
   fetch: app.fetch,
   async scheduled(event, env, ctx) {

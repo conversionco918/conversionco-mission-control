@@ -284,7 +284,10 @@
   <div class="viewbar">
     <button id="vTable" class="on" onclick="setView('table')">☰ List</button>
     <button id="vBoard" onclick="setView('board')">▦ Pipeline board</button>
+    <button id="vAds" onclick="setView('ads')">&#128226; Ads</button>
   </div>
+
+  <div id="adsWrap" style="display:none"></div>
 
   <div class="cols" id="tableWrap">
     <div>
@@ -393,8 +396,13 @@ function setView(v) {
   VIEW = v; localStorage.setItem('cc_view', v);
   document.getElementById('tableWrap').style.display = v === 'table' ? '' : 'none';
   document.getElementById('boardWrap').style.display = v === 'board' ? 'block' : 'none';
+  const aw = document.getElementById('adsWrap');
+  if (aw) aw.style.display = v === 'ads' ? 'block' : 'none';
   document.getElementById('vTable').classList.toggle('on', v === 'table');
   document.getElementById('vBoard').classList.toggle('on', v === 'board');
+  const va = document.getElementById('vAds');
+  if (va) va.classList.toggle('on', v === 'ads');
+  if (v === 'ads') { try { renderAdsView(); } catch (e) {} }
 }
 
 function dot(c) {
@@ -1265,51 +1273,25 @@ async function lpInject(id){
   function panelHtml(id) {
     var rep = null;
     try { rep = JSON.parse((STATE.settings || {})['ads_' + id] || 'null'); } catch (e) {}
-    var url = rep && rep.url ? rep.url : '';
-    var when = rep && rep.at ? new Date(rep.at).toLocaleString('en-US', { timeZone: 'America/Chicago', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '';
-    var h = '<div style="border-top:1px solid var(--line);margin-top:18px;padding-top:16px">';
-    h += '<div style="font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);font-weight:700;margin-bottom:10px">&#128640; Ads Engine <span style="font-weight:400;letter-spacing:0;text-transform:none">&middot; your eyes only</span></div>';
     var track = rep && rep.track ? rep.track : '';
+    var h = '<div style="border-top:1px solid var(--line);margin-top:18px;padding-top:14px">';
+    h += '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">';
+    h += '<span style="font-family:var(--font-mono);font-size:9.5px;letter-spacing:.2em;text-transform:uppercase;color:var(--faint)">&#128226; Google Ads</span>';
     if (!track) {
-      h += '<div style="background:#F7F9FC;border:1px solid var(--line);border-radius:10px;padding:12px;margin-bottom:12px">';
-      h += '<div style="font-size:12.5px;color:var(--muted);margin-bottom:9px">Not on ads management. $249/mo, plus whatever they spend with Google (their card pays Google directly).</div>';
-      h += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
-      h += '<button class="btn btn-green" style="font-size:12.5px" onclick="adsEnroll(' + id + ', \'addon\', this)">&#43; Add ads to their website</button>';
-      h += '<button class="btn btn-ghost" style="font-size:12.5px" onclick="adsEnroll(' + id + ', \'ads_only\', this)" title="They are an ads-only client — no website build, no website invoices.">Ads only (no website)</button>';
-      h += '</div></div>';
-    } else {
-      var since = rep.enrolled_at ? new Date(rep.enrolled_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '';
-      var lbl = track === 'ads_only' ? 'ADS ONLY &middot; no website' : 'ADS ADD-ON &middot; alongside their website';
-      h += '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:#0B1D33;color:#fff;border-radius:10px;padding:10px 13px;margin-bottom:12px">';
-      h += '<span style="font-family:var(--font-mono);font-size:10px;letter-spacing:.16em;color:#C7A86B">' + lbl + '</span>';
-      h += '<span style="font-size:12px;color:#B8C4D4">$' + (rep.monthly || 249) + '/mo' + (since ? ' &middot; since ' + since : '') + '</span>';
-      if (rep.live_at) h += '<span style="font-size:11px;color:#35D07F;font-weight:600">&#9679; CAMPAIGN RUNNING</span>';
+      h += '<span style="font-size:12.5px;color:var(--muted)">not on management</span>';
       h += '<span style="flex:1"></span>';
-      if (!rep.live_at) h += '<button class="btn btn-green" style="font-size:11.5px;padding:6px 11px" onclick="adsGoLive(' + id + ', this)" title="Click this after YOU enable the paused campaign inside Google Ads.">I enabled the campaign</button>';
-      h += '<button class="btn" style="font-size:11px;padding:6px 10px;background:rgba(255,255,255,.1);color:#B8C4D4;border:1px solid rgba(255,255,255,.2)" onclick="adsEnroll(' + id + ', \'cancel\', this)">Stop management</button>';
-      h += '</div>';
+      h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:6px 11px" onclick="adsEnroll(' + id + ', \'addon\', this)">&#43; Add ads &middot; $249/mo</button>';
+      h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:6px 11px" onclick="adsEnroll(' + id + ', \'ads_only\', this)" title="Ads management only — no website build.">Ads only</button>';
+    } else {
+      h += '<span class="chip" style="background:' + (track === 'ads_only' ? '#FFF4E5;color:#B54708' : '#EFF4FF;color:#175CD3') + '">' + (track === 'ads_only' ? 'ads only' : 'add-on') + '</span>';
+      h += '<span style="font-size:12.5px;color:var(--muted)">$' + (rep.monthly || 249) + '/mo' + (rep.live_at ? ' &middot; <b style="color:var(--green)">campaign running</b>' : (rep.ok ? ' &middot; tracking ready' : ' &middot; setup in progress')) + '</span>';
+      h += '<span style="flex:1"></span>';
+      h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:6px 11px" onclick="closeDrawer();setView(\'ads\')">Manage in Ads tab &#8594;</button>';
     }
-    h += '<div style="display:flex;gap:8px;margin-bottom:10px"><input id="adsUrl' + id + '" type="text" placeholder="Paste the landing page URL" value="' + (url ? url.replace(/"/g, '&quot;') : '') + '" style="flex:1;font-size:13px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:#fff">';
-    h += '<button class="btn btn-primary" style="white-space:nowrap" onclick="adsConnect(' + id + ', this)">Connect</button></div>';
-    h += '<div id="adsLights' + id + '" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">' + LKEYS.map(function (p) { return light(rep, p[0], p[1]); }).join('') + '</div>';
-    if (when) h += '<div style="font-size:11.5px;color:var(--muted);margin-bottom:10px">Last checked ' + when + (rep && rep.ok ? ' &middot; tracking is green' : rep ? ' &middot; not green yet' : '') + '</div>';
-    h += '<div style="display:flex;flex-wrap:wrap;gap:8px">';
-    h += '<button class="btn btn-ghost" style="font-size:12.5px" onclick="adsCopySnippet(' + id + ')">&#128203; Copy tracking code</button>';
-    h += '<button class="btn btn-ghost" style="font-size:12.5px"' + (rep && rep.ok ? '' : ' disabled title="Connect must be green first"') + ' onclick="adsBuildRequest(' + id + ', this)">&#128226; Request campaign build</button>';
-    if (rep && rep.url && rep.checks && rep.checks.ga4 && !rep.checks.ga4.ok && !rep.ga4_measurement) {
-      h += '<button class="btn btn-ghost" style="font-size:12.5px" onclick="ga4Create(' + id + ', this)">&#128202; Create GA4 property</button>';
-    }
-    h += '</div>';
-    if (rep && rep.build_requested) h += '<div style="font-size:11.5px;color:#047857;margin-top:8px">Campaign build requested ' + new Date(rep.build_requested).toLocaleString('en-US', { timeZone: 'America/Chicago', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) + ' &middot; it will land PAUSED for your approval</div>';
-    var gsc = '';
-    try { var gscSt = JSON.parse((STATE.settings || {})['gsc_' + id] || 'null'); gsc = (gscSt && gscSt.property) || ''; } catch (e) { gsc = ''; }
-    h += '<div style="display:flex;gap:8px;margin-top:12px;align-items:center"><input id="gscProp' + id + '" type="text" placeholder="Search Console domain (their-site.com — must be verified)" value="' + gsc.replace(/"/g, '&quot;') + '" style="flex:1;font-size:12.5px;padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:#fff">';
-    h += '<button class="btn btn-ghost" style="font-size:12.5px;white-space:nowrap" onclick="gscSave(' + id + ', this)">Save</button></div>';
-    h += '<div id="gscInfo' + id + '" style="font-size:11.5px;color:var(--muted);margin-top:6px">' + (gsc ? '&#11088; Rankings snapshots run daily from this property.' : 'Set the verified Search Console property to turn on the daily keyword rankings (standard for every client).') + '</div>';
-    h += '<div style="font-size:11px;color:var(--muted);margin-top:8px">Flow: tracking green &#8594; research &#8594; build sheet &#8594; campaign lands PAUSED &#8594; you enable. No guarantees in client-facing copy, ever.</div>';
-    h += '</div>';
+    h += '</div></div>';
     return h;
   }
+
   function addPanel(id) {
     if (document.getElementById('adsEngine' + id)) return;
     var body = document.querySelector('#drawer .dbody');
@@ -1479,6 +1461,121 @@ async function lpInject(id){
   }
   render();
   setInterval(render, 1000);
+})();
+</script>
+<script>
+// 📣 ADS TAB (8/19/2026) — every ads client in one place, so the client card
+// stays about the website. Shows track, tracking health, campaign state, and a
+// direct link into that client's Google Ads account.
+(function () {
+  var MCC = function () { return (STATE.settings || {}).ads_mcc_id || ''; };
+  function repFor(id) { try { return JSON.parse((STATE.settings || {})['ads_' + id] || 'null'); } catch (e) { return null; } }
+  function adsClients() {
+    return (STATE.clients || []).filter(function (c) { var r = repFor(c.id); return r && (r.track || r.url); });
+  }
+  function lightRow(rep) {
+    var keys = [['ga4', 'GA4'], ['clarity', 'Clarity'], ['phone', 'Call'], ['form', 'Form'], ['policy', 'Legal'], ['rx', 'Policy']];
+    return keys.map(function (k) {
+      var c = rep && rep.checks && rep.checks[k[0]];
+      var ok = c && c.ok;
+      return '<span title="' + k[1] + '" style="display:inline-block;width:9px;height:9px;border-radius:99px;margin-right:4px;background:' + (ok ? '#12B76A' : (rep && rep.checks ? '#F04438' : '#CBD5E1')) + '"></span>';
+    }).join('') + '<span style="font-size:11px;color:var(--faint);margin-left:4px">' + (rep && rep.ok ? 'ready' : (rep && rep.checks ? 'needs work' : 'not checked')) + '</span>';
+  }
+  function adsLink(rep) {
+    if (!rep) return '';
+    if (rep.ads_url) return rep.ads_url;
+    if (rep.ads_cid) return 'https://ads.google.com/aw/campaigns?__c=' + rep.ads_cid;
+    return '';
+  }
+  window.renderAdsView = function () {
+    var el = document.getElementById('adsWrap');
+    if (!el) return;
+    var list = adsClients();
+    var mcc = MCC();
+    var h = '';
+    h += '<div class="panel" style="margin-bottom:16px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">';
+    h += '<div><div style="font-family:var(--font-mono);font-size:9.5px;letter-spacing:.2em;text-transform:uppercase;color:var(--faint)">Manager account</div>';
+    h += '<div style="font-family:var(--font-mono);font-size:15px;color:var(--navy);font-weight:600">' + (mcc || 'not set') + '</div></div>';
+    h += '<div style="border-left:1px solid var(--line);align-self:stretch"></div>';
+    h += '<div><div style="font-family:var(--font-mono);font-size:9.5px;letter-spacing:.2em;text-transform:uppercase;color:var(--faint)">On management</div>';
+    h += '<div style="font-family:var(--font-mono);font-size:15px;color:var(--navy);font-weight:600">' + list.length + ' <span style="font-size:11px;color:var(--faint);font-family:var(--font-ui)">&times; $249/mo</span></div></div>';
+    h += '<div style="border-left:1px solid var(--line);align-self:stretch"></div>';
+    h += '<div><div style="font-family:var(--font-mono);font-size:9.5px;letter-spacing:.2em;text-transform:uppercase;color:var(--faint)">Running</div>';
+    h += '<div style="font-family:var(--font-mono);font-size:15px;color:var(--green);font-weight:600">' + list.filter(function (c) { var r = repFor(c.id); return r && r.live_at; }).length + '</div></div>';
+    h += '<span style="flex:1"></span>';
+    if (mcc) h += '<a class="btn btn-ghost" style="font-size:12.5px;text-decoration:none" href="https://ads.google.com/aw/accounts" target="_blank" rel="noopener">Open Google Ads &#8599;</a>';
+    h += '</div>';
+
+    if (!list.length) {
+      h += '<div class="panel"><div class="empty">No one is on ads management yet.<br><span style="font-size:12.5px">Start an ads-only client from the bar at the top, or open any client and use &ldquo;Add ads to their website&rdquo;.</span></div></div>';
+      el.innerHTML = h; return;
+    }
+
+    h += '<table><thead><tr><th>Client</th><th>Track</th><th>Landing page</th><th>Tracking</th><th>Campaign</th><th>Ads account</th></tr></thead><tbody>';
+    list.forEach(function (c) {
+      var rep = repFor(c.id) || {};
+      var link = adsLink(rep);
+      h += '<tr>';
+      h += '<td><b style="font-size:13.5px">' + esc(c.business_name || c.name || c.email) + '</b><div style="font-size:11px;color:var(--faint);font-family:var(--font-mono)">' + esc(c.email) + '</div></td>';
+      h += '<td>' + (rep.track === 'ads_only'
+        ? '<span class="chip" style="background:#FFF4E5;color:#B54708">ads only</span>'
+        : rep.track === 'addon' ? '<span class="chip" style="background:#EFF4FF;color:#175CD3">add-on</span>'
+        : '<span class="chip" style="background:#F2F4F7;color:#5D6B7E">not enrolled</span>') + '</td>';
+      h += '<td>' + (rep.url ? '<a href="' + esc(rep.url) + '" target="_blank" rel="noopener" style="font-size:12px;word-break:break-all">' + esc(String(rep.url).replace(/^https?:\/\//, '').slice(0, 34)) + '</a>' : '<span style="font-size:12px;color:var(--faint)">none yet</span>') + '</td>';
+      h += '<td>' + lightRow(rep) + '</td>';
+      h += '<td>' + (rep.live_at
+        ? '<span class="chip" style="background:#ECFDF3;color:#067647">&#9679; running</span>'
+        : rep.build_requested ? '<span class="chip" style="background:#FFFAEB;color:#B54708">build requested</span>'
+        : '<span class="chip" style="background:#F2F4F7;color:#5D6B7E">setup</span>') + '</td>';
+      h += '<td>' + (link
+        ? '<a class="btn btn-ghost" style="font-size:11.5px;padding:6px 10px;text-decoration:none" href="' + esc(link) + '" target="_blank" rel="noopener">Open in Ads &#8599;</a>'
+        : '<button class="btn btn-ghost" style="font-size:11.5px;padding:6px 10px" onclick="adsAccountPrompt(' + c.id + ')">Link account</button>') + '</td>';
+      h += '</tr>';
+      h += '<tr><td colspan="6" style="padding-top:0;border-bottom:1px solid var(--line)">';
+      h += '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding-bottom:12px">';
+      h += '<input id="adsTabUrl' + c.id + '" type="text" placeholder="landing page URL" value="' + (rep.url ? esc(rep.url) : '') + '" style="flex:1;min-width:220px;font-size:12.5px;padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:#FBFCFE">';
+      h += '<button class="btn btn-primary" style="font-size:11.5px;padding:7px 12px" onclick="adsTabConnect(' + c.id + ', this)">Connect</button>';
+      h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsCopySnippet(' + c.id + ')">&#128203; Tracking code</button>';
+      h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px"' + (rep.ok ? '' : ' disabled title="Tracking must be green first"') + ' onclick="adsBuildRequest(' + c.id + ', this)">&#128226; Request build</button>';
+      if (rep.track && !rep.live_at) h += '<button class="btn btn-green" style="font-size:11.5px;padding:7px 12px" onclick="adsGoLive(' + c.id + ', this)">I enabled it</button>';
+      if (link) h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsAccountPrompt(' + c.id + ')">Edit account link</button>';
+      h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="openDrawer(' + c.id + ')">Open card</button>';
+      h += '</div></td></tr>';
+    });
+    h += '</tbody></table>';
+    h += '<p style="font-size:11.5px;color:var(--faint);margin-top:12px">Campaigns are researched to your doctrine and always land <b>PAUSED</b> in Google Ads. Nothing spends until you enable it there and hit &ldquo;I enabled it&rdquo; here.</p>';
+    el.innerHTML = h;
+  };
+  window.adsAccountPrompt = async function (id) {
+    var cur = (repFor(id) || {});
+    var v = prompt('Google Ads account for this client.\n\nPaste either their 10-digit customer ID (123-456-7890) or the full URL of their account page in Google Ads.\n\nLeave blank to clear.', cur.ads_url || cur.ads_cid || '');
+    if (v === null) return;
+    try {
+      var r = await api('/api/clients/' + id + '/ads-account', { method: 'POST', body: JSON.stringify({ account: v.trim() }) });
+      if (r && r.error) { toast('⚠ ' + r.error); return; }
+      var rep = repFor(id) || {};
+      rep.ads_cid = r.ads_cid; rep.ads_url = r.ads_url;
+      STATE.settings['ads_' + id] = JSON.stringify(rep);
+      toast(v.trim() ? 'Ads account linked 📣' : 'Link cleared');
+      renderAdsView();
+    } catch (e) { toast('⚠ Could not save, try again'); }
+  };
+  window.adsTabConnect = async function (id, btn) {
+    var inp = document.getElementById('adsTabUrl' + id);
+    var url = inp ? inp.value.trim() : '';
+    if (!url) { toast('Paste the landing page URL first'); return; }
+    btn.disabled = true; btn.textContent = 'Checking…';
+    try {
+      var r = await api('/api/clients/' + id + '/ads-connect', { method: 'POST', body: JSON.stringify({ url: url }) });
+      if (r && r.error) toast('⚠ ' + r.error);
+      else { STATE.settings['ads_' + id] = JSON.stringify(r); toast(r.ok ? 'Tracking is green ✅' : 'Checked — some lights are red'); renderAdsView(); }
+    } catch (e) { toast('⚠ Connect failed, try again'); }
+    btn.disabled = false; btn.textContent = 'Connect';
+  };
+  var _rf = window.refresh;
+  if (typeof _rf === 'function') {
+    window.refresh = async function () { var r = await _rf.apply(this, arguments); if (VIEW === 'ads') { try { renderAdsView(); } catch (e) {} } return r; };
+  }
 })();
 </script>
 </body>
