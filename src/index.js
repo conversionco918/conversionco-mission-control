@@ -1695,6 +1695,33 @@ app.get('/portal/:id/:token', async (c) => {
   // to THEM. Our own beacon counts (hits slug ext-<id>, path ev-<name>) render
   // instantly; the live Google Analytics totals are fetched by the page after
   // load from /portal-ads so a slow Google call never blocks the portal.
+  // ⭐ RANKINGS (8/19/2026) — Google's own positions, shown to the client. Held
+  // back until there are TWO snapshot days, because a one-day card is a flat
+  // line with zero movement and reads as "nothing is happening".
+  let rankCard = null;
+  try {
+    const rrows = (await db.prepare(
+      `SELECT q, day, pos FROM rank_history WHERE client_id = ? AND day >= date('now','-35 days') ORDER BY day ASC`
+    ).bind(id).all()).results || [];
+    const rdays = [...new Set(rrows.map((r) => r.day))];
+    if (rdays.length >= 2) {
+      const latest = rdays[rdays.length - 1];
+      const byQ = {};
+      for (const r of rrows) (byQ[r.q] = byQ[r.q] || []).push(r);
+      const list = Object.entries(byQ).map(([q, h]) => {
+        const cur = h[h.length - 1];
+        const prior = h.length > 7 ? h[h.length - 8] : h[0];
+        return { q, pos: cur.pos, day: cur.day, delta: Math.round((prior.pos - cur.pos) * 10) / 10, spark: h.slice(-14).map((x) => x.pos) };
+      }).filter((x) => x.day === latest).sort((a, b) => a.pos - b.pos).slice(0, 8);
+      if (list.length) rankCard = list;
+    }
+  } catch {}
+  const sparkSvg = (arr) => {
+    if (!arr || arr.length < 2) return '';
+    const mn = Math.min(...arr), mx = Math.max(...arr), rng = (mx - mn) || 1;
+    const pts = arr.map((v, i) => `${(i / (arr.length - 1) * 56).toFixed(1)},${(2 + ((v - mn) / rng) * 14).toFixed(1)}`).join(' ');
+    return `<svg width="58" height="18" viewBox="0 0 58 18" aria-hidden="true"><polyline points="${pts}" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity=".6"/></svg>`;
+  };
   let adsRep = null, adsEv = null;
   try {
     const ar = JSON.parse(settings['ads_' + id] || '{}');
@@ -1883,6 +1910,19 @@ app.get('/portal/:id/:token', async (c) => {
         <button class="cbtn bk ${L.status === 'no' ? 'on' : ''}" onclick="markLead(${L.lid}, 'no', this)" style="padding:4px 12px;font-size:12px">No</button>
       </div>
     </div>`).join('')}
+  </div>` : ''}
+
+  ${rankCard ? `<div class="card" style="--sec:#7C3AED"><span class="eyebrow">Google Rankings</span><h2>Where you show up on Google</h2>
+    <p class="note" style="margin:0 0 12px">Straight from Google Search Console — these are Google's own positions, not an estimate. An arrow means you moved since last week.</p>
+    <div style="display:flex;flex-direction:column;gap:2px">
+    ${rankCard.map((k) => `<div style="display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid var(--line)">
+      <div style="flex:1;min-width:0;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escq(k.q)}</div>
+      <div style="color:var(--faint);flex:none">${sparkSvg(k.spark)}</div>
+      <div style="flex:none;width:52px;text-align:right;font-size:12px;color:${k.delta > 0 ? 'var(--good)' : k.delta < 0 ? '#B42318' : 'var(--faint)'}">${k.delta > 0 ? '&#9650; ' + k.delta : k.delta < 0 ? '&#9660; ' + Math.abs(k.delta) : '&mdash;'}</div>
+      <div style="flex:none;width:44px;text-align:right;font-family:'Cormorant Garamond',serif;font-size:26px;line-height:1">${k.pos}</div>
+    </div>`).join('')}
+    </div>
+    <p class="note" style="margin-top:12px">Position 1 is the top of page one. Moving from 70 to 40 is real progress even though nobody has clicked yet — it means Google is starting to trust the site.</p>
   </div>` : ''}
 
   ${adsRep ? `<div class="card" style="--sec:#1A73E8"><span class="eyebrow">Your Marketing</span><h2>What your landing page is doing</h2>
@@ -2734,6 +2774,41 @@ app.get('/qz/:slug/:state', async (c) => {
 
 // Keyed: lead-form mapping proof for headless builders (GET — they can't POST).
 // Same truth as the __qa-test marker: does this slug accept leads for a client?
+// 🔎 GOOGLE POWERS (8/19/2026, keyed + read-only): which Google scopes are
+// actually live on GOOGLE_REFRESH_TOKEN right now. Every call is a GET — this
+// route can never create a property, an event, or a calendar entry. Answers
+// "did the re-consent take?" without guessing and without side effects.
+app.get('/api/google-scopes/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const env = c.env;
+  const out = { at: new Date().toISOString(), configured: !!(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET && env.GOOGLE_REFRESH_TOKEN) };
+  if (!out.configured) return c.json(out);
+  let token = '';
+  try {
+    const tr = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET, refresh_token: env.GOOGLE_REFRESH_TOKEN, grant_type: 'refresh_token' }),
+    });
+    const td = await tr.json();
+    token = td.access_token || '';
+    out.token = !!token;
+    if (!token) out.token_error = String(td.error_description || td.error || '').slice(0, 90);
+  } catch (e) { out.token = false; out.token_error = String(e && e.message || e).slice(0, 90); }
+  if (!token) return c.json(out);
+  const H = { Authorization: 'Bearer ' + token };
+  const probe = async (name, url) => {
+    try { const r = await fetch(url, { headers: H }); out[name] = r.ok ? 'ok' : 'http-' + r.status; }
+    catch (e) { out[name] = 'error'; }
+  };
+  await probe('search_console', 'https://www.googleapis.com/webmasters/v3/sites');
+  await probe('calendar', 'https://www.googleapis.com/calendar/v3/users/me/calendarList?maxResults=1');
+  await probe('analytics_admin', 'https://analyticsadmin.googleapis.com/v1beta/accounts');
+  await probe('analytics_summaries', 'https://analyticsadmin.googleapis.com/v1beta/accountSummaries');
+  out.reads = { search_console: 'Search Console rankings', calendar: 'Meet/Calendar after-call autopilot',
+    analytics_admin: 'GA4 property auto-create', analytics_summaries: 'GA4 numbers in the portal' };
+  return c.json(out);
+});
+
 app.get('/api/lead-qa/:key', async (c) => {
   if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
   const slug = String(c.req.query('slug') || '');
