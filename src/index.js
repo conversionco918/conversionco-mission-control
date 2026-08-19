@@ -5672,7 +5672,10 @@ async function ga4Ensure(env, id) {
     if (accs.error) return { pending: accs.error.status === 'PERMISSION_DENIED' ? 'scope' : 'accounts-' + (accs.error.code || '?'), note: String(accs.error.message || '').slice(0, 140) };
     const acct = (accs.accounts || [])[0];
     if (!acct) return { pending: 'no-ga-account', note: 'Sign into analytics.google.com once with conversionco918 to create the account shell.' };
-    const bizName = String(client.name || client.email || ('Client ' + id)).slice(0, 90);
+    // NAME THE PROPERTY AFTER THE BUSINESS, not the contact. A GA4 property
+    // called "Tiffany" is useless in a list of twenty; "Anywhere Infusions" is not.
+    let i1n = {}; try { i1n = JSON.parse(client.intake1_data || '{}'); } catch {}
+    const bizName = String(client.business_name || i1n['Business Name'] || client.name || client.email || ('Client ' + id)).slice(0, 90);
     const prop = await fetch('https://analyticsadmin.googleapis.com/v1beta/properties', {
       method: 'POST', headers: H,
       body: JSON.stringify({ parent: acct.name, displayName: bizName, timeZone: 'America/Chicago', currencyCode: 'USD', industryCategory: 'HEALTHCARE' }),
