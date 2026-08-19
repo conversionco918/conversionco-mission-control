@@ -6231,6 +6231,8 @@ function scanOfferings(html) {
   return out;
 }
 
+const scanSlug = (x) => String(x).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+
 function scanLinks(html) {
   const out = []; const rx = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi; let m;
   while ((m = rx.exec(html))) out.push({ href: m[1], text: sText(m[2]).slice(0, 60) });
@@ -6244,8 +6246,11 @@ function scanCities(html) {
   for (const l of scanLinks(html)) {
     const mm = String(l.href).match(/([a-z0-9-]+)\.html?(?:[?#]|$)/i);
     if (!mm) continue;
-    const cm = mm[1].match(/^(?:iv-therapy|iv|service|serving|areas?|locations?|mobile-iv|drip|therapy)-(.+)$/i);
-    if (cm && l.text && l.text.length < 26 && /^[A-Z]/.test(l.text) && !SCAN_BAD_NAME.test(l.text)) {
+    const cm = mm[1].match(/^(?:iv-therapy|iv-hydration|mobile-iv|service-area|serving|areas?|locations?)-(.+)$/i);
+    // the link TEXT has to match the slug tail, or it is a menu link, not a town
+    if (cm && l.text && l.text.length < 26 && /^[A-Z]/.test(l.text) && !SCAN_BAD_NAME.test(l.text)
+      && !/\d|see all|choose|view|all |menu|→|&rarr;/i.test(l.text)
+      && scanSlug(l.text) === cm[1].toLowerCase()) {
       found.push({ name: l.text.trim(), page: l.href });
     }
   }
@@ -6346,6 +6351,10 @@ async function adsScan(env, id, url) {
     if (/menu|price|pricing/i.test(p.url)) facts.pageMap.menu = p.url;
     if (isMember) facts.pageMap.membership = p.url;
   }
+  // once three or more priced items exist, an unpriced heading is page furniture
+  if (facts.offerings.filter((o) => o.price > 0).length >= 3) {
+    facts.offerings = facts.offerings.filter((o) => o.price > 0);
+  }
   const priced = facts.offerings.filter((o) => o.price > 0).map((o) => o.price);
   if (priced.length) { facts.priceMin = Math.min(...priced); facts.priceMax = Math.max(...priced); }
   const add = (bundle.map((p) => sText(sStrip(p.html))).join(' ')).match(/add[\s\-]?(?:on|anything|ons)[^.$]{0,30}\$\s?(\d{2,3})/i);
@@ -6389,7 +6398,8 @@ function adsPlan(client, rep, settings) {
   const ph = (t) => '"' + String(t).toLowerCase().replace(/[^a-z0-9+ ']/g, ' ').replace(/\s+/g, ' ').trim() + '"';
   const withCity = (t, c) => t + ' ' + String(c || cl).toLowerCase();
 
-  const offerings = (F.offerings || []).filter((o) => o.name);
+  const bizLc = biz.toLowerCase();
+  const offerings = (F.offerings || []).filter((o) => o.name && o.name.toLowerCase() !== bizLc);
   const memberships = (F.memberships || []).filter((o) => o.name);
   const problems = offerings.filter((o) => PROBLEM_RX.test(o.name));
   const outcomes = offerings.filter((o) => !PROBLEM_RX.test(o.name));
