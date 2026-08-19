@@ -6170,215 +6170,485 @@ function adsLint(heads, descs) {
 }
 
 // ── the plan ───────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// 🔬 PAGE SCAN (8/19/2026) — read what the client ACTUALLY sells, then plan
+// against that. Templates were the v2 weakness: every IV client got the same
+// "iv therapy / iv hydration" keywords whether they sold a Migraine Cocktail
+// in Broken Arrow or a NAD+ membership. This crawls the landing page and the
+// handful of pages it links to (menu, pricing, membership, city pages) and
+// pulls out the real offerings with real prices, the real service-area towns,
+// the real differentiators and the real proof. The plan is then built from
+// THOSE, with the vertical library used only as backfill.
+//
+// Ben Heath's doctrine is unchanged and is in fact better served by this:
+// "include the exact words someone is searching for", one landing page per ad
+// group (the site already has a page per drip and per town — each ad group is
+// pointed at its own), and hyper-local ad groups per neighbourhood.
+
+const SCAN_FOLLOW = /(menu|service|pricing|price|infusion|drip|therapy|treatment|membership|member|iv-|package|special|offer)/i;
+const SCAN_SKIP = /(privacy|terms|legal|blog|faq|review|policy|login|cart|checkout|sitemap|accessibility)/i;
+const SCAN_MAX_PAGES = 7;
+
+async function adsFetchPage(env, url, absolute) {
+  try {
+    const u = new URL(url, absolute || undefined);
+    const ownHost = new URL(BASE_URL).host;
+    if (u.host === ownHost) {
+      const m = u.pathname.match(/^\/preview\/([^/]+)\/?(.*)$/);
+      if (!m) return null;
+      const slug = m[1]; let p = m[2] || 'index.html';
+      if (p === '' || p.endsWith('/')) p += 'index.html';
+      const row = await env.DB.prepare('SELECT content, is_base64 FROM site_files WHERE slug = ? AND path = ?').bind(slug, p).first();
+      if (!row || row.is_base64) return null;
+      return { url: u.toString(), html: String(row.content || '') };
+    }
+    const r = await fetch(u.toString(), { redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ConversionCo-Connect/1.0)' } });
+    if (!r.ok) return null;
+    const ct = r.headers.get('content-type') || '';
+    if (ct && !/html/i.test(ct)) return null;
+    return { url: u.toString(), html: await r.text() };
+  } catch { return null; }
+}
+
+const sStrip = (h) => String(h || '').replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ');
+const sText = (s) => String(s || '').replace(/<[^>]+>/g, ' ')
+  .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&rsquo;|&#39;|&apos;/g, "'")
+  .replace(/&mdash;/g, '—').replace(/&[a-z]+;/g, ' ').replace(/\s+/g, ' ').trim();
+
+const SCAN_BAD_NAME = /^(the menu|menu|visit|service area|home|faq|about us?|about|locations?|reviews?|contact|pricing|prices|book|booking|blog|news|gallery|our team|hours|follow us|navigation|footer|search)$/i;
+
+// A heading that sits within ~700 characters of a price is a thing they sell.
+function scanOfferings(html) {
+  const h = sStrip(html); const out = [];
+  const rx = /<h([234])[^>]*>([\s\S]*?)<\/h\1>/gi; let m;
+  while ((m = rx.exec(h))) {
+    const name = sText(m[2]);
+    if (!name || name.length > 44 || name.split(' ').length > 6) continue;
+    if (name.indexOf('$') !== -1 || /[.!?]$/.test(name) || SCAN_BAD_NAME.test(name) || !/^[A-Z0-9]/.test(name)) continue;
+    const pm = h.slice(m.index, m.index + 700).match(/\$\s?(\d{2,4})/);
+    out.push({ name, price: pm ? Number(pm[1]) : 0 });
+  }
+  return out;
+}
+
+function scanLinks(html) {
+  const out = []; const rx = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi; let m;
+  while ((m = rx.exec(html))) out.push({ href: m[1], text: sText(m[2]).slice(0, 60) });
+  return out;
+}
+
+// Towns come from two places: dedicated city pages (the strongest signal —
+// they mean a real landing page exists for that town) and "serving X, Y and Z".
+function scanCities(html) {
+  const found = [];
+  for (const l of scanLinks(html)) {
+    const mm = String(l.href).match(/([a-z0-9-]+)\.html?(?:[?#]|$)/i);
+    if (!mm) continue;
+    const cm = mm[1].match(/^(?:iv-therapy|iv|service|serving|areas?|locations?|mobile-iv|drip|therapy)-(.+)$/i);
+    if (cm && l.text && l.text.length < 26 && /^[A-Z]/.test(l.text) && !SCAN_BAD_NAME.test(l.text)) {
+      found.push({ name: l.text.trim(), page: l.href });
+    }
+  }
+  const body = sText(sStrip(html));
+  const sm = body.match(/serv(?:ing|e|es)\s+([A-Z][A-Za-z]+(?:\s[A-Z][A-Za-z]+)?(?:,\s*(?:and\s+)?[A-Z][A-Za-z]+(?:\s[A-Z][A-Za-z]+)?){0,8})/);
+  if (sm) sm[1].split(/,\s*(?:and\s+)?/).forEach((c) => {
+    const n = c.trim();
+    if (n && n.length < 26 && !found.some((f) => f.name.toLowerCase() === n.toLowerCase())) found.push({ name: n, page: '' });
+  });
+  return found;
+}
+
+const SCAN_DIFFS = [
+  [/we come to you|comes? to you|at your (?:home|door|office)|in[- ]home|house call|mobile (?:iv|service|unit|nurse)/i, 'we come to you'],
+  [/registered nurse|\bRNs?\b|licensed nurse|nurse[- ]led|nurse practitioner/i, 'registered nurse'],
+  [/same[- ]day|within an hour|about an hour|book today|today's? (?:times?|openings?)/i, 'same-day'],
+  [/no (?:clinic|waiting room|wait)/i, 'no clinic'],
+  [/text (?:us|me)\b|one text|by text/i, 'text to book'],
+  [/board[- ]certified|medical director|physician[- ]?(?:led|supervised)/i, 'medical oversight'],
+  [/membership|members? (?:save|get|pay)/i, 'membership'],
+  [/flat (?:rate|pricing)|transparent pricing|no hidden|upfront pricing|no surprise/i, 'clear pricing'],
+  [/concierge|private|discreet/i, 'concierge'],
+  [/24\/7|after hours|evenings and weekends|weekends/i, 'after-hours'],
+];
+
+function scanDiffs(html) {
+  const b = sText(sStrip(html));
+  return SCAN_DIFFS.filter(([r]) => r.test(b)).map(([, l]) => l);
+}
+
+function scanTrust(html) {
+  const b = sText(sStrip(html)); const out = [];
+  const r = b.match(/(\d\.\d)\s*(?:stars?\s*)?(?:on\s+)?Google/i); if (r) out.push({ k: 'rating', v: r[1] });
+  const rev = b.match(/(\d{2,4})\+?\s*(?:5[- ]star\s*)?reviews/i); if (rev) out.push({ k: 'reviews', v: rev[1] });
+  const yr = b.match(/(\d{1,2})\+?\s*years?\s+(?:of\s+)?(?:experience|in\s+practice|serving)/i); if (yr) out.push({ k: 'years', v: yr[1] });
+  return out;
+}
+
+// THE SCAN. Entry page plus up to six of the pages it links to that look like
+// menu / pricing / membership / city pages. Bounded, same-origin, HTML only.
+async function adsScan(env, id, url) {
+  const facts = {
+    at: new Date().toISOString(), entry: url, pages: [], offerings: [], memberships: [],
+    cities: [], diffs: [], trust: [], booking: '', priceMin: 0, priceMax: 0, addon: 0,
+    title: '', h1: '', pageMap: {},
+  };
+  const first = await adsFetchPage(env, url);
+  if (!first) { facts.error = 'could not read the page'; return facts; }
+  const seen = new Set([first.url]);
+  const bundle = [first];
+
+  const t = first.html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  facts.title = t ? sText(t[1]).slice(0, 140) : '';
+  const h1 = first.html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+  facts.h1 = h1 ? sText(h1[1]).slice(0, 140) : '';
+
+  // pick which linked pages are worth reading
+  const candidates = [];
+  for (const l of scanLinks(first.html)) {
+    const href = String(l.href || '');
+    if (!href || href.startsWith('#') || /^(tel:|sms:|mailto:|javascript:)/i.test(href)) continue;
+    let abs = ''; try { abs = new URL(href, first.url).toString(); } catch { continue; }
+    try { if (new URL(abs).host !== new URL(first.url).host) continue; } catch { continue; }
+    if (seen.has(abs)) continue;
+    const hay = href + ' ' + l.text;
+    if (SCAN_SKIP.test(hay)) continue;
+    if (!SCAN_FOLLOW.test(hay)) continue;
+    seen.add(abs); candidates.push(abs);
+    if (candidates.length >= SCAN_MAX_PAGES) break;
+  }
+  for (const c of candidates) {
+    const p = await adsFetchPage(env, c);
+    if (p) bundle.push(p);
+  }
+
+  const offSeen = new Set(); const citySeen = new Set();
+  const diffSet = new Set(); const trustSeen = {};
+  for (const p of bundle) {
+    facts.pages.push(p.url);
+    const isMember = /member/i.test(p.url);
+    for (const o of scanOfferings(p.html)) {
+      const k = o.name.toLowerCase();
+      if (offSeen.has(k)) continue; offSeen.add(k);
+      (isMember ? facts.memberships : facts.offerings).push({ ...o, page: p.url });
+    }
+    for (const c of scanCities(p.html)) {
+      const k = c.name.toLowerCase();
+      if (citySeen.has(k)) continue; citySeen.add(k);
+      let page = c.page; try { if (page) page = new URL(page, p.url).toString(); } catch { page = ''; }
+      facts.cities.push({ name: c.name, page });
+    }
+    scanDiffs(p.html).forEach((d) => diffSet.add(d));
+    for (const t2 of scanTrust(p.html)) if (!trustSeen[t2.k]) { trustSeen[t2.k] = t2.v; facts.trust.push(t2); }
+    if (!facts.booking) {
+      const bm = p.html.match(/(janeapp\.com|calendly\.com|acuityscheduling|squareup\.com\/appointments|vagaro|mindbody|msgsndr\.com|leadconnectorhq\.com)/i);
+      if (bm) facts.booking = bm[1].toLowerCase();
+    }
+    if (/menu|price|pricing/i.test(p.url)) facts.pageMap.menu = p.url;
+    if (isMember) facts.pageMap.membership = p.url;
+  }
+  const priced = facts.offerings.filter((o) => o.price > 0).map((o) => o.price);
+  if (priced.length) { facts.priceMin = Math.min(...priced); facts.priceMax = Math.max(...priced); }
+  const add = (bundle.map((p) => sText(sStrip(p.html))).join(' ')).match(/add[\s\-]?(?:on|anything|ons)[^.$]{0,30}\$\s?(\d{2,3})/i);
+  if (add) facts.addon = Number(add[1]);
+  facts.diffs = [...diffSet];
+  return facts;
+}
+
+// ── the plan, built from what the page actually sells ──────────────────────
+const PROBLEM_RX = /hangover|migraine|immun|allerg|flu\b|cold\b|nausea|sick|recovery|surgery|prenatal|pregnan|energy|fatigue|tired|dehydrat|detox|stomach|food poison/i;
+const DIFF_HEADLINES = {
+  'we come to you': ['We come to you', 'A nurse comes to you', 'Treated where you are'],
+  'registered nurse': ['Licensed RN, every visit', 'Nurse-delivered drips'],
+  'same-day': ['Same-day appointments', 'Same-day times often open'],
+  'no clinic': ['No clinic, no waiting', 'No clinic, no waiting room'],
+  'text to book': ['Book by text', 'One text and we come'],
+  'medical oversight': ['Physician-supervised', 'Medical oversight on file'],
+  membership: ['Members pay less', 'Ask about membership'],
+  'clear pricing': ['Flat pricing, no surprises', 'Prices before you book'],
+  concierge: ['Private, unhurried visits'],
+  'after-hours': ['Evenings and weekends'],
+};
+
 function adsPlan(client, rep, settings) {
   let i1 = {}; try { i1 = JSON.parse(client.intake1_data || '{}'); } catch {}
+  const F = (rep && rep.facts) || {};
   const biz = String(client.business_name || i1['Business Name'] || client.name || 'This business').trim();
   const cityFull = String(i1['Primary City & State'] || i1['Location'] || '').trim();
-  const city = (cityFull.split(',')[0] || '').trim();
+  // the page's own towns beat stale intake data
+  const pageCities = (F.cities || []).map((c) => c.name).filter(Boolean);
+  const city = (pageCities[0] || cityFull.split(',')[0] || '').trim();
   const V = String(client.vertical || 'iv').toLowerCase();
   const P = VERTICAL_ADS[V] || VERTICAL_ADS.iv;
   const phone = String(client.phone || '').trim();
   const pd = phone.replace(/\D/g, '').replace(/^1(?=\d{10}$)/, '');
   const phoneNice = pd.length === 10 ? '(' + pd.slice(0, 3) + ') ' + pd.slice(3, 6) + '-' + pd.slice(6) : phone;
   const cl = city.toLowerCase();
+  const entry = (rep && rep.url) || F.entry || '';
 
-  // ── keywords: exact carries the budget, phrase scouts. Broad stays OFF at
-  // campaign level until negatives, tracking and profitability are proven.
-  const ex = (t) => '[' + t + ']';
-  const ph = (t) => '"' + t + '"';
-  const withCity = (t) => (cl ? t + ' ' + cl : t + ' near me');
+  const ex = (t) => '[' + String(t).toLowerCase().replace(/[^a-z0-9+ ']/g, ' ').replace(/\s+/g, ' ').trim() + ']';
+  const ph = (t) => '"' + String(t).toLowerCase().replace(/[^a-z0-9+ ']/g, ' ').replace(/\s+/g, ' ').trim() + '"';
+  const withCity = (t, c) => t + ' ' + String(c || cl).toLowerCase();
 
-  const agCore = { name: 'Core — ' + P.label, theme: P.label,
-    keywords: P.core.flatMap((t) => [ex(t), ex(withCity(t))]).concat(P.core.slice(0, 4).map((t) => ph(t))) };
-  const agIntent = { name: 'At-home / mobile intent', theme: 'delivery model',
-    keywords: P.intent.flatMap((t) => [ex(t), ph(t)]) };
-  const agProblem = { name: 'Problem and urgency', theme: 'why they search today',
-    keywords: P.problem.flatMap((t) => [ex(t), ph(t)]) };
-  const agCity = cl ? { name: 'City — ' + city, theme: 'geo-qualified',
-    keywords: P.core.slice(0, 5).flatMap((t) => [ex(withCity(t)), ph(withCity(t))]) } : null;
-  const nonBrandGroups = [agCore, agIntent, agProblem].concat(agCity ? [agCity] : []);
+  const offerings = (F.offerings || []).filter((o) => o.name);
+  const memberships = (F.memberships || []).filter((o) => o.name);
+  const problems = offerings.filter((o) => PROBLEM_RX.test(o.name));
+  const outcomes = offerings.filter((o) => !PROBLEM_RX.test(o.name));
+  const derived = offerings.length > 0;
 
-  const brandTerms = [ex(biz.toLowerCase()), ph(biz.toLowerCase())]
-    .concat(cl ? [ex(biz.toLowerCase() + ' ' + cl)] : []);
+  // ── ad groups: real offerings first, template only as backfill
+  const groups = [];
+  groups.push({ name: 'Core — ' + P.label, theme: P.label, url: entry,
+    keywords: P.core.flatMap((t) => [ex(t), ex(withCity(t))]).concat(P.core.slice(0, 4).map((t) => ph(t))) });
+  groups.push({ name: 'At-home / mobile intent', theme: 'delivery model', url: entry,
+    keywords: P.intent.flatMap((t) => [ex(t), ph(t)]) });
 
-  // ── RSA assets
-  const pinPool = fillTpl(P.cityHeads, { c: city, b: biz }).filter((h) => h.length <= 30 && adsPolicyOk(h));
+  const dripTerms = (list) => list.flatMap((o) => {
+    const n = o.name.toLowerCase();
+    const k = [ex(n), ph(n)];
+    if (cl) k.push(ex(withCity(n)));
+    if (!/iv|drip|infusion|shot/.test(n)) k.push(ph(n + ' iv'), ph(n + ' drip'));
+    return k;
+  });
+  if (problems.length) {
+    groups.push({ name: 'Problem drips — ' + problems.slice(0, 4).map((o) => o.name).join(', '),
+      theme: 'why they search today', url: F.pageMap && F.pageMap.menu || entry,
+      keywords: dripTerms(problems).concat(P.problem.flatMap((t) => [ex(t), ph(t)])) });
+  } else {
+    groups.push({ name: 'Problem and urgency', theme: 'why they search today', url: entry,
+      keywords: P.problem.flatMap((t) => [ex(t), ph(t)]) });
+  }
+  if (outcomes.length) {
+    groups.push({ name: 'Named drips — ' + outcomes.slice(0, 4).map((o) => o.name).join(', '),
+      theme: 'they already know what they want', url: F.pageMap && F.pageMap.menu || entry,
+      keywords: dripTerms(outcomes) });
+  }
+  if (memberships.length) {
+    const mt = memberships.flatMap((m) => [ex(m.name), ph(m.name + ' membership')]);
+    groups.push({ name: 'Membership — ' + memberships.map((m) => m.name).join(', '),
+      theme: 'recurring revenue, the cheapest lead you will buy',
+      url: (F.pageMap && F.pageMap.membership) || entry,
+      keywords: mt.concat([ex(P.label + ' membership'), ph(P.label + ' membership'), cl ? ex(P.label + ' membership ' + cl) : ''].filter(Boolean)) });
+  }
+  // hyper-local ad groups, one per town that has its own landing page
+  const cityGroups = (F.cities || []).filter((c) => c.page).slice(0, 5);
+  for (const c of cityGroups) {
+    const lc = c.name.toLowerCase();
+    groups.push({ name: 'City — ' + c.name, theme: 'hyper-local, its own landing page', url: c.page,
+      keywords: P.core.slice(0, 4).flatMap((t) => [ex(withCity(t, lc)), ph(withCity(t, lc))])
+        .concat(problems.slice(0, 3).map((o) => ex(withCity(o.name.toLowerCase(), lc)))) });
+  }
+  if (!cityGroups.length && cl) {
+    groups.push({ name: 'City — ' + city, theme: 'geo-qualified', url: entry,
+      keywords: P.core.slice(0, 5).flatMap((t) => [ex(withCity(t)), ph(withCity(t))]) });
+  }
+
+  const brandTerms = [ex(biz), ph(biz)].concat(cl ? [ex(biz + ' ' + cl)] : []);
+
+  // ── headlines: the page's own words first
+  const pagePool = [];
+  const fit = (s) => (s && s.length <= 30 ? s : '');
+  for (const o of offerings.slice(0, 8)) {
+    if (cl) pagePool.push(fit(o.name + ' in ' + city));
+    pagePool.push(fit(o.name));
+    if (o.price) pagePool.push(fit(o.name + ', $' + o.price));
+  }
+  if (F.priceMin) pagePool.push(fit(P.label.replace(/\b\w/, (m) => m.toUpperCase()) + ' from $' + F.priceMin), fit('Drips from $' + F.priceMin));
+  if (F.addon) pagePool.push(fit('Add anything, $' + F.addon));
+  if (memberships.length) {
+    const mp = memberships.map((m) => m.price).filter(Boolean);
+    if (mp.length) pagePool.push(fit('Membership from $' + Math.min(...mp)));
+    pagePool.push(fit('Members pay less'));
+  }
+  for (const d of (F.diffs || [])) (DIFF_HEADLINES[d] || []).forEach((h) => pagePool.push(fit(h)));
+  for (const t of (F.trust || [])) {
+    if (t.k === 'rating') pagePool.push(fit(t.v + ' stars on Google'));
+    if (t.k === 'reviews') pagePool.push(fit(t.v + ' local reviews'));
+    if (t.k === 'years') pagePool.push(fit(t.v + ' years in ' + (city || 'practice')));
+  }
+  if (pageCities.length > 1) pagePool.push(fit(pageCities[0] + ' to ' + pageCities[pageCities.length - 1]));
+
+  const cityHeads = fillTpl(P.cityHeads, { c: city, b: biz }).filter((h) => h.length <= 30 && adsPolicyOk(h));
   const brandPool = fillTpl(P.brandHeads, { c: city, b: biz }).filter((h) => h.length <= 30 && adsPolicyOk(h));
   const disq = fillTpl(P.disqualifiers, { c: city, b: biz }).filter((h) => h.length <= 30 && adsPolicyOk(h));
-  const pool = pinPool.concat(brandPool, P.headlines, disq);
+  const pool = cityHeads
+    .concat(pagePool.filter(Boolean).filter(adsPolicyOk))
+    .concat(brandPool, disq, P.headlines);
   const headlines = pickHeadlines(pool, 15);
-  // make sure the pinned trio actually survived selection
-  for (const p of pinPool.slice(0, 3)) if (!headlines.includes(p) && headlines.length) headlines[headlines.length - 1] = p;
-  const pinH1 = headlines.filter((h) => pinPool.includes(h)).slice(0, 3);
+  for (const p of cityHeads.slice(0, 2)) if (!headlines.includes(p) && headlines.length) headlines[headlines.length - 1] = p;
+  const pinH1 = headlines.filter((h) => cityHeads.includes(h)).slice(0, 3);
 
-  const descriptions = (P.descriptions || []).filter((d) => d.length <= 90 && adsPolicyOk(d)).slice(0, 4);
+  // ── descriptions: weave in real prices, towns and proof where they fit
+  const dPool = [];
+  if (F.priceMin && city) dPool.push('Drips from $' + F.priceMin + ' in ' + city + '. A licensed nurse comes to you, no clinic visit.');
+  if (offerings.length >= 3) dPool.push('Choose from ' + offerings.length + ' drips, or tell us how you feel and we match the bag.');
+  if (pageCities.length > 2) dPool.push('We travel across ' + pageCities.slice(0, 3).join(', ') + ' and the towns around them.');
+  if (F.addon) dPool.push('Add anything to any drip for $' + F.addon + ', on the same visit, decided with your nurse.');
+  const descriptions = dPool.concat(P.descriptions).filter((d) => d.length <= 90 && adsPolicyOk(d)).slice(0, 4);
   const lint = adsLint(headlines, descriptions);
-
   const econ = adsEconomics(rep && rep.econ);
 
   const plan = {
-    v: 2, built: new Date().toISOString(), biz, city: cityFull || city, vertical: P.label,
-    url: (rep && rep.url) || '',
+    v: 3, built: new Date().toISOString(), biz, city: city || cityFull, vertical: P.label,
+    url: entry, derived, scannedPages: (F.pages || []).length,
+    facts: {
+      offerings: offerings.map((o) => o.name + (o.price ? ' ($' + o.price + ')' : '')),
+      memberships: memberships.map((m) => m.name + (m.price ? ' ($' + m.price + ')' : '')),
+      cities: pageCities, diffs: F.diffs || [],
+      trust: (F.trust || []).map((t) => t.k + ' ' + t.v),
+      priceRange: F.priceMin ? '$' + F.priceMin + '–$' + F.priceMax : '',
+      addon: F.addon || 0, booking: F.booking || '',
+    },
     campaigns: [
       {
-        role: 'non-brand',
-        name: biz + ' — Search — ' + (city || 'Local'),
+        role: 'non-brand', name: biz + ' — Search — ' + (city || 'Local'),
         settings: {
           'Campaign type': 'Search only',
           'Goal': 'Leads. Do NOT pick "without a goal\'s guidance" — you lose the settings guardrails.',
           'Networks': 'Google Search only. Display Network OFF. Search Partners OFF for lead gen.',
-          'Locations': city ? 'Radius 12–20 miles around ' + city + ', or the named city plus surrounding towns' : 'Radius around the service area',
-          'Location options': 'Presence — "people in or regularly in your targeted locations". Never leave the presence-or-interest default; it buys tourists and trip planners.',
-          'Bidding': 'Maximize Conversions from launch. Do not add a target CPA for the first month; then set it AT current performance, not aspiration, and move it no more than once a fortnight.',
-          'Daily budget': econ.daily_budget ? '$' + econ.daily_budget + '/day (back-solved below). Absolute floor to learn anything: $' + (econ.floor_daily || 25) + '/day.'
-            : 'Back-solve it: expected CPC × 5 is the floor to get ~5–10 clicks a day. Under that you cannot optimise.',
-          'Conversion counting': 'One (lead gen). "Every" is for ecommerce purchases.',
+          'Locations': pageCities.length > 1
+            ? 'Target these towns by name: ' + pageCities.join(', ') + '. They came off the site, so a landing page already exists for most of them.'
+            : (city ? 'Radius 12–20 miles around ' + city : 'Radius around the service area'),
+          'Location options': 'Presence — "people in or regularly in your targeted locations". Never leave the presence-or-interest default.',
+          'Bidding': 'Maximize Conversions from launch. No target CPA for the first month; then set it AT current performance and move it at most once a fortnight.',
+          'Daily budget': econ.daily_budget ? '$' + econ.daily_budget + '/day (back-solved below). Floor to learn anything: $' + (econ.floor_daily || 25) + '/day.'
+            : 'Back-solve it: expected CPC × 5 is the floor for ~5–10 clicks a day.',
+          'Conversion counting': 'One (lead gen).',
           'Broad match toggle': 'OFF at campaign level. Exact and phrase only until negatives, tracking and profit are proven.',
-          'Optimized targeting / audience expansion': 'OFF at launch. Revisit past ~100 conversions.',
-          'AI Max': 'OFF. It generates its own ad text, which is disqualifying in a healthcare account where every claim is regulated.',
-          'Auto-apply recommendations': 'OFF — especially "Remove conflicting negative keywords", which deletes negatives you added on purpose.',
-          'Ad schedule': 'Match the hours a human actually answers. A lead that rings out at 9pm is a lead you paid for and lost.',
-          'Devices': 'All on. Read the device report after two weeks before touching a modifier.',
+          'Optimized targeting': 'OFF at launch. Revisit past ~100 conversions.',
+          'AI Max': 'OFF. It writes its own ad text, which is disqualifying in a regulated healthcare account.',
+          'Auto-apply recommendations': 'OFF — especially "Remove conflicting negative keywords".',
+          'Ad schedule': 'Match the hours a human actually answers.',
+          'Devices': 'All on. Read the device report after two weeks.',
           'Ad rotation': 'Optimize: prefer best performing ads.',
         },
-        adGroups: nonBrandGroups,
+        adGroups: groups,
       },
       {
-        role: 'brand',
-        name: biz + ' — Brand',
-        settings: {
-          'Why': 'Cheap, high-intent, and it stops a competitor buying your name. Keep it separate so brand conversions do not flatter the non-brand numbers.',
-          'Daily budget': '$3–$5/day is usually plenty.',
-          'Bidding': 'Maximize Conversions.',
-        },
-        adGroups: [{ name: 'Brand — ' + biz, theme: 'people already looking for you', keywords: brandTerms }],
+        role: 'brand', name: biz + ' — Brand',
+        settings: { 'Why': 'Cheap, high-intent, and it stops a competitor buying your name.', 'Daily budget': '$3–$5/day.', 'Bidding': 'Maximize Conversions.' },
+        adGroups: [{ name: 'Brand — ' + biz, theme: 'people already looking for you', url: entry, keywords: brandTerms }],
       },
     ],
     negatives: negList(P.negatives),
     rsa: { headlines, pinH1, descriptions, lint,
-      pinning: 'Pin the 2–3 keyword/city headlines to position 1 and leave everything else unpinned. Full pinning collapses the combinations and costs impressions; no pinning at all lets Google drop your keyword out of the visible headline.' },
+      pinning: 'Pin the 2–3 keyword/city headlines to position 1 and leave the rest unpinned. Full pinning collapses the combinations; none at all lets Google drop your keyword out of the visible headline.' },
     assets: {
       callouts: (P.callouts || []).filter((s) => s.length <= 25),
       sitelinks: (P.sitelinks || []).filter((s) => s[0].length <= 25 && s[1].length <= 35),
-      snippets: { header: 'Services', values: (P.snippets || []).filter((s) => s.length <= 25) },
+      snippets: { header: 'Services', values: (offerings.length ? offerings.map((o) => o.name) : (P.snippets || [])).filter((s) => s.length <= 25).slice(0, 10) },
       call: phoneNice
-        ? 'Call asset: ' + phoneNice + '. Turn ON call reporting so it uses a Google forwarding number — without that, calls are invisible. Count each caller once, minimum 60 seconds.'
+        ? 'Call asset: ' + phoneNice + '. Turn ON call reporting so it uses a Google forwarding number. Count each caller once, minimum 60 seconds.'
         : 'Call asset: add the business phone, then turn on call reporting.',
-      location: 'Location asset: link the Google Business Profile once it is verified. For a local service advertiser this is close to mandatory.',
-      note: 'A phone number must never appear in headline or description text — Google prohibits it. That is what the call asset is for.',
+      location: 'Location asset: link the Google Business Profile once it is verified.',
+      note: 'A phone number must never appear in headline or description text — that is what the call asset is for.',
     },
     conversions: [
       'Tools → Data manager → link the GA4 property Mission Control created.',
       'Goals → Conversions → Import → Google Analytics 4 → import call_click, sms_click, form_submit, book_click.',
-      'Primary: form_submit and book_click. call_click and sms_click go Primary only if calls get answered reliably; otherwise Secondary.',
-      'Set conversion counting to One.',
-      'Do not spend a dollar before a real conversion has been recorded end to end. Bidding on broken tracking is the most expensive mistake in this account.',
+      'Primary: form_submit and book_click. Calls Primary only if they get answered reliably.',
+      'Conversion counting: One.',
+      'Do not spend a dollar before a real conversion has been recorded end to end.',
     ],
     economics: econ,
     cadence: {
-      Daily: 'Nothing. Looking every day and tweaking is itself a failure mode — the bidding needs room to learn.',
-      Weekly: 'Search terms report → add negatives, and promote any winning search term to an exact keyword. Reallocate budget. Small copy tweaks.',
-      Monthly: 'Bidding review and target adjustment. Full creative refresh. Check the device, hour and location reports.',
-      'First 6 weeks': 'Change one thing at a time. Every budget, bid, targeting or copy change restarts learning.',
+      Daily: 'Nothing. Tweaking daily is itself a failure mode — the bidding needs room to learn.',
+      Weekly: 'Search terms report → add negatives, promote winning terms to exact. Reallocate budget. Small copy tweaks.',
+      Monthly: 'Bidding review and target adjustment. Full creative refresh. Device, hour and location reports.',
+      'First 6 weeks': 'Change one thing at a time. Every change restarts learning.',
     },
     policy: [
-      'No outcome or cure claims anywhere in the ad or on the page — health absolutes are the fastest disapproval in this vertical.',
+      'No outcome or cure claims anywhere in the ad or on the page.',
       'No prescription drug names in ad text.',
       'No phone number in ad text. No exclamation marks. No "#1", "best", "guaranteed".',
       'The page must show a real business name, a working phone number, and privacy plus terms links.',
       'The ad promise and the landing page headline must match, close to word for word.',
     ],
     divergences: [
-      'Bidding: Ben Heath says start on conversion-based Smart Bidding from day one; Aaron Young and much of the local-PPC world says start on Maximize Clicks until roughly 30 conversions exist. This sheet follows Heath. If six weeks pass under 15 conversions, the fix is the offer and the landing page, not the bid strategy.',
+      'Bidding: Ben Heath says start on conversion-based Smart Bidding from day one; much of the local-PPC world says Maximize Clicks until ~30 conversions exist. This sheet follows Heath. If six weeks pass under 15 conversions, the fix is the offer and the page, not the bid strategy.',
       'Search Partners: Heath leaves them on; current lead-gen opinion leans to opting out. This sheet opts out.',
-      'Ad Strength: treat it as a completeness checklist. The largest published study found "Average" ads beat "Excellent" ones on CPA. Never delete a converting asset to chase a rating.',
+      'Ad Strength is a completeness checklist, not a target. Never delete a converting asset to chase the rating.',
     ],
   };
 
-  // ── the copyable sheet
-  const L = [];
-  const line = (s) => L.push(s);
-  line('CAMPAIGN BUILD SHEET v2 — ' + biz + (city ? ' (' + city + ')' : ''));
-  line('Landing page: ' + (plan.url || '(not connected)'));
-  line('Built ' + plan.built.slice(0, 10) + ' by Mission Control. Tracking is already live on the page.');
+  const L = []; const line = (s) => L.push(s);
+  line('CAMPAIGN BUILD SHEET v3 — ' + biz + (city ? ' (' + city + ')' : ''));
+  line('Landing page: ' + (entry || '(not connected)'));
+  line('Built ' + plan.built.slice(0, 10) + (derived ? ' by reading ' + plan.scannedPages + ' page(s) of their own site.' : ' from the vertical library — no offerings were readable on the page.'));
   line('');
-  line('0. BEFORE YOU BUILD');
+  if (derived) {
+    line('0. WHAT WE READ OFF THEIR SITE — everything below is built from this');
+    if (offerings.length) { line('   Offerings (' + offerings.length + '):'); for (const o of offerings) line('      • ' + o.name + (o.price ? '  $' + o.price : '')); }
+    if (memberships.length) { line('   Memberships:'); for (const m of memberships) line('      • ' + m.name + (m.price ? '  $' + m.price : '')); }
+    if (pageCities.length) line('   Towns they serve: ' + pageCities.join(', '));
+    if (F.diffs && F.diffs.length) line('   How they are different: ' + F.diffs.join(' · '));
+    if (plan.facts.trust.length) line('   Proof on the page: ' + plan.facts.trust.join(' · '));
+    if (plan.facts.priceRange) line('   Price range: ' + plan.facts.priceRange + (F.addon ? '  ·  add-ons $' + F.addon : ''));
+    if (F.booking) line('   Booking runs through: ' + F.booking);
+    line('');
+  }
+  line('1. BEFORE YOU BUILD');
   for (const s of plan.conversions) line('   • ' + s);
   line('');
   if (econ.monthly_budget || econ.max_cpl) {
-    line('1. THE NUMBERS (from this client\'s own economics)');
+    line('2. THE NUMBERS (from this client\'s own economics)');
     if (econ.ticket) line('   • Average new-client value: $' + econ.ticket + ' at ' + Math.round(econ.margin * 100) + '% margin = $' + econ.gross_per_client + ' gross');
-    if (econ.close) line('   • Lead → client close rate: ' + Math.round(econ.close * 100) + '%');
-    if (econ.target) line('   • Target new clients per month: ' + econ.target + '  →  ' + econ.leads_needed + ' leads needed');
-    if (econ.max_cpl) line('   • Most you can pay per lead and still profit: $' + econ.max_cpl);
-    if (econ.projected_cpl) line('   • Projected cost per lead at $' + econ.cpc + ' CPC and ' + Math.round(econ.lp_cvr * 100) + '% page conversion: $' + econ.projected_cpl);
-    if (econ.monthly_budget) line('   • Budget that math implies: $' + econ.monthly_budget + '/month (~$' + econ.daily_budget + '/day)');
+    if (econ.target) line('   • Target ' + econ.target + ' new clients/mo → ' + econ.leads_needed + ' leads needed');
+    if (econ.max_cpl) line('   • Most you can pay per lead: $' + econ.max_cpl);
+    if (econ.projected_cpl) line('   • Projected cost per lead: $' + econ.projected_cpl);
+    if (econ.monthly_budget) line('   • Budget that implies: $' + econ.monthly_budget + '/month (~$' + econ.daily_budget + '/day)');
     if (econ.headroom != null) line('   • Headroom per lead: ' + (econ.headroom >= 0 ? '$' + econ.headroom + ' — the math works' : '-$' + Math.abs(econ.headroom) + ' — the math does NOT work at these numbers'));
     if (econ.required && econ.headroom < 0) {
-      line('   • WHAT WOULD HAVE TO BE TRUE — any ONE of these closes the gap:');
-      line('       - a new client is worth $' + econ.required.ticket + ' instead of $' + econ.ticket + ' (memberships, packages, repeat visits counted properly)');
-      line('       - the landing page converts at ' + econ.required.lp_cvr + '% instead of ' + Math.round(econ.lp_cvr * 100) + '%');
-      line('       - the cost per click comes in at $' + econ.required.cpc + ' instead of $' + econ.cpc + ' (tighter, higher-intent keywords)');
+      line('   • ANY ONE OF THESE CLOSES THE GAP:');
+      line('       - a new client is worth $' + econ.required.ticket + ' instead of $' + econ.ticket);
+      line('       - the page converts at ' + econ.required.lp_cvr + '% instead of ' + Math.round(econ.lp_cvr * 100) + '%');
+      line('       - cost per click comes in at $' + econ.required.cpc + ' instead of $' + econ.cpc);
     }
-    if (econ.smart_bidding_ok === false) line('   • WARNING: under 15 leads/month, Smart Bidding cannot learn. Either raise budget or optimise to a softer conversion first.');
-    line('   • These are planning numbers, not promises. Nobody can guarantee ad results.');
-    line('');
-  } else {
-    line('1. THE NUMBERS');
-    line('   • Not set yet. Open the client card → Ads economics and enter average ticket, close rate,');
-    line('     target clients per month and expected CPC. The sheet then back-solves the budget.');
+    line('   • Planning numbers, not promises. Nobody can guarantee ad results.');
     line('');
   }
-  let n = 2;
+  let n = 3;
   for (const camp of plan.campaigns) {
     line(n + '. CAMPAIGN — ' + camp.name + '  [' + camp.role + ']');
     for (const [k, v] of Object.entries(camp.settings)) line('   • ' + k + ': ' + v);
     for (const g of camp.adGroups) {
       line('   AD GROUP: ' + g.name);
+      if (g.url) line('      final URL → ' + g.url);
       line('      ' + g.keywords.join('  '));
     }
-    line('');
-    n++;
+    line(''); n++;
   }
-  line(n + '. NEGATIVE KEYWORDS — build this as a shared list BEFORE you spend');
-  line('   (' + plan.negatives.length + ' terms. At launch the negative list should be longer than the keyword list.)');
+  line(n + '. NEGATIVE KEYWORDS — build as a shared list BEFORE you spend (' + plan.negatives.length + ' terms)');
   line('   ' + plan.negatives.join(', '));
-  line('');
-  n++;
+  line(''); n++;
   line(n + '. AD COPY — one RSA per ad group');
-  line('   PIN TO HEADLINE POSITION 1 (all of these, so they rotate): ' + (plan.rsa.pinH1.join(' | ') || '(none — add a city)'));
+  line('   PIN TO HEADLINE 1: ' + (plan.rsa.pinH1.join(' | ') || '(none — add a city)'));
   line('   ' + plan.rsa.pinning);
-  line('   HEADLINES (' + headlines.length + ', all within 30 characters, sentence case on purpose):');
+  line('   HEADLINES (' + headlines.length + ', ≤30 characters, sentence case on purpose):');
   for (const h of headlines) line('      • ' + h + '   [' + h.length + ']');
-  line('   DESCRIPTIONS (' + descriptions.length + ', 61–80 characters beats maxing out 90):');
+  line('   DESCRIPTIONS (' + descriptions.length + ', 61–80 beats maxing 90):');
   for (const d of descriptions) line('      • ' + d + '   [' + d.length + ']');
   if (lint.issues.length) { line('   LINT:'); for (const s of lint.issues) line('      ! ' + s); }
-  line('');
-  n++;
+  line(''); n++;
   line(n + '. ASSETS');
   line('   • ' + plan.assets.call);
   line('   • ' + plan.assets.location);
   line('   • Callouts: ' + plan.assets.callouts.join(' · '));
-  line('   • Structured snippet — ' + plan.assets.snippets.header + ': ' + plan.assets.snippets.values.join(', '));
+  line('   • Structured snippet — Services: ' + plan.assets.snippets.values.join(', '));
   for (const s of plan.assets.sitelinks) line('   • Sitelink: ' + s[0] + ' — ' + s[1]);
   line('   • ' + plan.assets.note);
-  line('');
-  n++;
+  line(''); n++;
   line(n + '. AFTER LAUNCH');
   for (const [k, v] of Object.entries(plan.cadence)) line('   • ' + k + ': ' + v);
-  line('');
-  n++;
+  line(''); n++;
   line(n + '. POLICY GUARDRAILS');
   for (const s of plan.policy) line('   • ' + s);
-  line('');
-  n++;
-  line(n + '. WHERE THE EXPERTS DISAGREE (so you can decide, not guess)');
+  line(''); n++;
+  line(n + '. WHERE THE EXPERTS DISAGREE');
   for (const s of plan.divergences) line('   • ' + s);
   plan.text = L.join('\n');
   return plan;
 }
 
-// v1 name kept so every existing caller and every stored brief keeps working.
 function adsBrief(client, rep) { return adsPlan(client, rep, null); }
 
 // Deep links that drop her exactly where she needs to be in Google's UI.
@@ -6460,8 +6730,16 @@ app.post('/api/clients/:id/ads-provision', async (c) => {
   // 3 — portal analytics card ON for this client
   rep.portal_analytics = rep.portal_analytics === false ? false : true;
 
+  // 3b — READ THE PAGE. Crawl the landing page and the menu/pricing/membership
+  // /city pages it links to, and pull out what they actually sell. The plan is
+  // then built from their real offerings, prices and towns, not a template.
+  try {
+    const facts = await adsScan(c.env, id, url);
+    if (facts && !facts.error) rep.facts = facts;
+  } catch {}
+
   // 4 — the build sheet she works from
-  rep.brief = adsBrief(client, rep);
+  rep.brief = adsPlan(client, rep, settings);
   rep.provisioned_at = new Date().toISOString();
   await setSetting(db, 'ads_' + id, JSON.stringify(rep));
 
@@ -6469,7 +6747,7 @@ app.post('/api/clients/:id/ads-provision', async (c) => {
   const lights = ['ga4', 'clarity', 'phone', 'form', 'policy', 'tracker']
     .map((k) => (report.checks[k] && report.checks[k].ok ? '✓' : '✗') + k).join(' ');
   await logEvent(db, id, 'ads_provisioned',
-    `\u{1F4E3} Ads provision on ${url} — ${lights}${ga4.measurement ? ' · GA4 ' + ga4.measurement : ''}${ga4.pending ? ' · GA4 pending (' + ga4.pending + ')' : ''}${adopted.length ? ' · adopted ' + adopted.join(', ') : ''}${gscAttached ? ' · Search Console ' + gscAttached : ''}. Build sheet ready; campaign is Tiffany's to build in Google Ads.`);
+    `\u{1F4E3} Ads provision on ${url} — ${lights}${ga4.measurement ? ' · GA4 ' + ga4.measurement : ''}${ga4.pending ? ' · GA4 pending (' + ga4.pending + ')' : ''}${adopted.length ? ' · adopted ' + adopted.join(', ') : ''}${gscAttached ? ' · Search Console ' + gscAttached : ''}${rep.facts ? ' · read ' + rep.facts.offerings.length + ' offering(s) and ' + (rep.facts.cities || []).length + ' town(s) off ' + (rep.facts.pages || []).length + ' page(s)' : ''}. Build sheet ready; campaign is Tiffany's to build in Google Ads.`);
 
   const steps = [
     { k: 'snippet', done: !!(report.checks.tracker && report.checks.tracker.ok),
@@ -6483,6 +6761,34 @@ app.post('/api/clients/:id/ads-provision', async (c) => {
     { k: 'campaign', done: !!rep.live_at, label: 'Campaign built + enabled (yours)', detail: 'Mission Control never enables spend' },
   ];
   return c.json({ ok: true, report: rep, ga4, links, steps, brief: rep.brief, adopted, gsc: gscAttached });
+});
+
+// 🔬 RESCAN — she changed the page (new drip, new member benefit, new town).
+// Re-reads the site and rebuilds the whole plan around what is there now.
+app.post('/api/clients/:id/ads-rescan', async (c) => {
+  const id = Number(c.req.param('id')) || 0;
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'no such client' }, 404);
+  const settings = await getSettings(db);
+  let rep = {}; try { rep = JSON.parse(settings['ads_' + id] || '{}'); } catch {}
+  let body = {}; try { body = await c.req.json(); } catch {}
+  let url = String(body.url || rep.url || '').trim();
+  if (url && !/^https?:\/\//i.test(url)) url = 'https://' + url;
+  if (!url) return c.json({ error: 'Connect the landing page first.' }, 400);
+  const before = ((rep.facts && rep.facts.offerings) || []).map((o) => o.name).join('|');
+  const facts = await adsScan(c.env, id, url);
+  if (!facts || facts.error) return c.json({ error: (facts && facts.error) || 'could not read the page' }, 502);
+  rep.url = url; rep.facts = facts;
+  rep.brief = adsPlan(client, rep, settings);
+  await setSetting(db, 'ads_' + id, JSON.stringify(rep));
+  const after = facts.offerings.map((o) => o.name).join('|');
+  const changed = before !== after;
+  await logEvent(db, id, 'ads_rescan',
+    `\u{1F52C} Re-read ${(facts.pages || []).length} page(s) for ${client.business_name || client.name || client.email} — ` +
+    `${facts.offerings.length} offering(s), ${(facts.memberships || []).length} membership tier(s), ${(facts.cities || []).length} town(s). ` +
+    (changed ? 'The menu CHANGED — keywords and headlines rebuilt around it.' : 'Nothing new on the page; the plan was refreshed anyway.'));
+  return c.json({ ok: true, facts, brief: rep.brief, changed });
 });
 
 // Re-read (or regenerate) the build sheet without re-verifying the page.
