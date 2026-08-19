@@ -1539,6 +1539,7 @@ async function lpInject(id){
       h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px"' + (rep.ok ? '' : ' disabled title="Tracking must be green first"') + ' onclick="adsBuildRequest(' + c.id + ', this)">&#128226; Request build</button>';
       if (rep.track && !rep.live_at) h += '<button class="btn btn-green" style="font-size:11.5px;padding:7px 12px" onclick="adsGoLive(' + c.id + ', this)">I enabled it</button>';
       if (link) h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsAccountPrompt(' + c.id + ')">Edit account link</button>';
+      h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsIdsPrompt(' + c.id + ')">&#127991; Tracking IDs</button>';
       h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="openDrawer(' + c.id + ')">Open card</button>';
       h += '</div></td></tr>';
     });
@@ -1557,6 +1558,26 @@ async function lpInject(id){
       rep.ads_cid = r.ads_cid; rep.ads_url = r.ads_url;
       STATE.settings['ads_' + id] = JSON.stringify(rep);
       toast(v.trim() ? 'Ads account linked 📣' : 'Link cleared');
+      renderAdsView();
+    } catch (e) { toast('⚠ Could not save, try again'); }
+  };
+  window.adsIdsPrompt = async function (id) {
+    var rep = repFor(id) || {};
+    var ga4 = prompt('Google Analytics 4 measurement ID for this client (G-XXXXXXX).\n\nLeave blank to clear. Cancel to stop.', rep.ga4_measurement || '');
+    if (ga4 === null) return;
+    var gtm = prompt('Google Tag Manager container ID (GTM-XXXXXXX).\n\nOptional — leave blank unless this client uses GTM.', rep.gtm_id || '');
+    if (gtm === null) return;
+    var clarity = prompt('Microsoft Clarity project ID.\n\nLeave blank to skip.', rep.clarity_id || '');
+    if (clarity === null) return;
+    var aw = prompt('Google Ads conversion ID (AW-XXXXXXXXX).\n\nOptional — only if you tag Ads conversions directly instead of importing them from GA4.', rep.aw_id || '');
+    if (aw === null) return;
+    try {
+      var r = await api('/api/clients/' + id + '/ads-ids', { method: 'POST', body: JSON.stringify({ ga4: ga4, gtm: gtm, clarity: clarity, aw: aw }) });
+      if (r && r.error) { toast('⚠ ' + r.error); return; }
+      var rp = repFor(id) || {};
+      rp.ga4_measurement = r.ga4; rp.gtm_id = r.gtm; rp.clarity_id = r.clarity; rp.aw_id = r.aw;
+      STATE.settings['ads_' + id] = JSON.stringify(rp);
+      toast('Tracking IDs saved 🏷 — live on their page within 5 minutes, no re-paste needed');
       renderAdsView();
     } catch (e) { toast('⚠ Could not save, try again'); }
   };

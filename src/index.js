@@ -2549,35 +2549,115 @@ ${msgF ? `<blockquote style="border-left:3px solid #C9A254;padding-left:12px;col
 // page view into the same hits table (slug ext-<id>), bot-filtered like /preview.
 app.get('/t/:id/t.js', async (c) => {
   const id = Number(c.req.param('id')) || 0;
-  // ONE-PASTE TRACKING (8/18/2026): visitor beacon always; when the client's GA4
-  // measurement id / Clarity id are saved (settings ads_<id>), the same snippet
-  // also loads gtag + Clarity and auto-binds the 4 key events to tel:/sms:/form/
-  // booking elements. ?qa=1 visits are tagged internal (never counted as leads).
-  let ga4 = '', clar = '';
+  // ═══ ONE-PASTE TRACKING v2 (8/19/2026) ═══════════════════════════════════
+  // One script tag on the client's page does everything:
+  //   • visitor beacon (our own counts, bot-filtered)
+  //   • Google Analytics 4 (their own property)
+  //   • Google Tag Manager container (optional — only if she sets a GTM id)
+  //   • Google Ads tag (optional — only if she sets an AW- conversion id)
+  //   • Microsoft Clarity session replay
+  //   • the four key events, auto-bound: call_click · sms_click · form_submit ·
+  //     book_click — pushed to BOTH gtag and dataLayer so GTM can consume them
+  //   • GOHIGHLEVEL SUPPORT: GHL renders forms and calendars inside iframes, so
+  //     a normal submit listener never sees them. We listen for the postMessage
+  //     those iframes send to the parent page and fire the event from there.
+  //   • ?qa=1 marks the visit internal so her own testing never counts as a lead
+  let ga4 = '', clar = '', gtm = '', aw = '';
   try {
     const s = await getSettings(c.env.DB);
     const rep = JSON.parse(s['ads_' + id] || '{}');
-    ga4 = String(rep.ga4_measurement || (rep.checks && rep.checks.ga4 && rep.checks.ga4.id) || '').replace(/[^A-Z0-9-]/g, '');
+    ga4 = String(rep.ga4_measurement || (rep.checks && rep.checks.ga4 && rep.checks.ga4.id) || '').replace(/[^A-Z0-9-]/gi, '');
     clar = String(rep.clarity_id || (rep.checks && rep.checks.clarity && rep.checks.clarity.id) || '').replace(/[^A-Za-z0-9]/g, '');
+    gtm = String(rep.gtm_id || '').replace(/[^A-Z0-9-]/gi, '');
+    aw = String(rep.aw_id || '').replace(/[^A-Z0-9-]/gi, '');
   } catch {}
-  let js = "(function(){try{var qa=/[?&]qa=1/.test(location.search);";
+
+  let js = "(function(){try{";
+  js += "if(window.__ccTrack)return;window.__ccTrack=1;";
+  js += "var qa=/[?&]qa=1/.test(location.search);";
+  js += "window.dataLayer=window.dataLayer||[];";
+  // our own beacon — always on, even with no Google ids yet
   js += "var p=encodeURIComponent(location.pathname||'/');(new Image()).src='" + BASE_URL + "/t/" + id + "/p.gif?p='+p+'&r='+Date.now();";
-  if (ga4) {
-    js += "var s=document.createElement('script');s.async=1;s.src='https://www.googletagmanager.com/gtag/js?id=" + ga4 + "';document.head.appendChild(s);";
-    js += "window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}window.gtag=window.gtag||gtag;";
-    js += "gtag('js',new Date());gtag('config','" + ga4 + "',qa?{traffic_type:'internal'}:{});";
-    js += "var fire=function(n){try{window.gtag('event',n,qa?{traffic_type:'internal'}:{});}catch(e){}};";
-    js += "document.addEventListener('click',function(e){var a=e.target&&e.target.closest&&e.target.closest('a');if(!a)return;var href=a.getAttribute('href')||'';";
-    js += "if(href.indexOf('tel:')===0)fire('call_click');else if(href.indexOf('sms:')===0)fire('sms_click');";
-    js += "else if(/janeapp\\.com|calendar\\.google\\.com\\/calendar\\/appointments|calendly\\.com|booking/i.test(href))fire('book_click');},true);";
-    js += "document.addEventListener('submit',function(e){fire('form_submit');},true);";
+
+  if (gtm) {
+    js += "(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':new Date().getTime(),event:'gtm.js'});";
+    js += "var f=d.getElementsByTagName(s)[0],j=d.createElement(s);j.async=true;";
+    js += "j.src='https://www.googletagmanager.com/gtm.js?id='+i;f.parentNode.insertBefore(j,f);})(window,document,'script','dataLayer','" + gtm + "');";
+  }
+  if (ga4 || aw) {
+    const first = ga4 || aw;
+    js += "var s=document.createElement('script');s.async=1;s.src='https://www.googletagmanager.com/gtag/js?id=" + first + "';document.head.appendChild(s);";
+    js += "function gtag(){dataLayer.push(arguments);}window.gtag=window.gtag||gtag;";
+    js += "gtag('js',new Date());";
+    if (ga4) js += "gtag('config','" + ga4 + "',qa?{traffic_type:'internal'}:{});";
+    if (aw) js += "gtag('config','" + aw + "');";
   }
   if (clar) {
     js += "(function(w,d,t,u){w.clarity=w.clarity||function(){(w.clarity.q=w.clarity.q||[]).push(arguments)};var e=d.createElement(t);e.async=1;e.src=u;d.head.appendChild(e);})(window,document,'script','https://www.clarity.ms/tag/" + clar + "');";
   }
+
+  // ── the shared fire() — every path below goes through this one function ──
+  js += "var seen={};";
+  js += "var fire=function(n,extra){try{";
+  js += "var k=n+'|'+Math.floor(Date.now()/1500);if(seen[k])return;seen[k]=1;";           // 1.5s dedupe
+  js += "var d=extra||{};if(qa)d.traffic_type='internal';";
+  js += "if(window.gtag)window.gtag('event',n,d);";                                        // GA4 (+Ads via config)
+  js += "window.dataLayer.push(Object.assign({event:n},d));";                              // GTM-consumable
+  js += "if(window.clarity)window.clarity('set','cc_event',n);";                           // Clarity segment
+  js += "(new Image()).src='" + BASE_URL + "/t/" + id + "/p.gif?p=ev-'+encodeURIComponent(n)+'&r='+Date.now();"; // our own count
+  js += "}catch(e){}};";
+  js += "window.ccTrackEvent=fire;";                                                       // manual hook if ever needed
+
+  // ── plain-DOM bindings (works on any normal page, incl. non-iframe GHL parts) ──
+  js += "document.addEventListener('click',function(e){var t=e.target;if(!t||!t.closest)return;";
+  js += "var a=t.closest('a[href]');";
+  js += "if(a){var href=a.getAttribute('href')||'';";
+  js += "if(href.indexOf('tel:')===0){fire('call_click');return;}";
+  js += "if(href.indexOf('sms:')===0){fire('sms_click');return;}";
+  js += "if(/janeapp\\.com|calendly\\.com|calendar\\.google\\.com\\/calendar\\/appointments|\\/widget\\/booking|book|schedul/i.test(href)){fire('book_click');return;}}";
+  js += "var b=t.closest('[data-cc-event]');if(b){fire(b.getAttribute('data-cc-event'));return;}";  // manual tagging escape hatch
+  js += "var btn=t.closest('button,.cta,[role=button]');";
+  js += "if(btn){var txt=(btn.textContent||'').toLowerCase();";
+  js += "if(/call|phone/.test(txt)&&!/recall/.test(txt))fire('cta_click',{cta:'call'});";
+  js += "else if(/text|message/.test(txt))fire('cta_click',{cta:'text'});";
+  js += "else if(/book|schedul|appointment|reserve/.test(txt))fire('cta_click',{cta:'book'});}";
+  js += "},true);";
+  js += "document.addEventListener('submit',function(e){fire('form_submit');},true);";
+
+  // ── GOHIGHLEVEL iframe bridge: forms + calendars post to the parent window ──
+  js += "window.addEventListener('message',function(ev){try{";
+  js += "if(!/(msgsndr|leadconnectorhq|gohighlevel|funnels\\.msgsndr)\\.com$/.test((new URL(ev.origin)).hostname.replace(/^.*?([^.]+\\.[^.]+)$/,'$1')))return;";
+  js += "var d=ev.data;var str=typeof d==='string'?d:JSON.stringify(d||{});str=str.toLowerCase();";
+  js += "if(/appointment|booking|slot_?booked|calendar.*(book|confirm)/.test(str)){fire('book_click',{source:'ghl'});return;}";
+  js += "if(/form.*(submit|complete|success)|submit.*success|survey.*complete/.test(str)){fire('form_submit',{source:'ghl'});return;}";
+  js += "}catch(e){}},false);";
+
   js += "}catch(e){}})();";
   return c.body(js, 200, { 'Content-Type': 'application/javascript', 'Cache-Control': 'public, max-age=300', 'Access-Control-Allow-Origin': '*' });
 });
+
+// Save the tracking IDs for a client (GA4 / GTM / Clarity / Google Ads) — the
+// snippet reads these live, so changing one here updates every page in ~5 min
+// with no re-paste on the client's site.
+app.post('/api/clients/:id/ads-ids', async (c) => {
+  const id = Number(c.req.param('id')) || 0;
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'no such client' }, 404);
+  let body = {}; try { body = await c.req.json(); } catch {}
+  const settings = await getSettings(db);
+  let rep = {}; try { rep = JSON.parse(settings['ads_' + id] || '{}'); } catch {}
+  const clean = (v, rx) => String(v || '').trim().replace(rx, '');
+  if ('ga4' in body) rep.ga4_measurement = clean(body.ga4, /[^A-Z0-9-]/gi).toUpperCase();
+  if ('gtm' in body) rep.gtm_id = clean(body.gtm, /[^A-Z0-9-]/gi).toUpperCase();
+  if ('clarity' in body) rep.clarity_id = clean(body.clarity, /[^A-Za-z0-9]/g);
+  if ('aw' in body) rep.aw_id = clean(body.aw, /[^A-Z0-9-]/gi).toUpperCase();
+  for (const k of ['ga4_measurement', 'gtm_id', 'clarity_id', 'aw_id']) if (!rep[k]) delete rep[k];
+  await setSetting(db, 'ads_' + id, JSON.stringify(rep));
+  await logEvent(db, id, 'ads_ids', `🏷 Tracking IDs updated — ${['ga4_measurement', 'gtm_id', 'clarity_id', 'aw_id'].filter((k) => rep[k]).map((k) => k.replace('_measurement', '').replace('_id', '')).join(', ') || 'all cleared'}`);
+  return c.json({ ok: true, ga4: rep.ga4_measurement || '', gtm: rep.gtm_id || '', clarity: rep.clarity_id || '', aw: rep.aw_id || '' });
+});
+
 app.get('/t/:id/p.gif', async (c) => {
   const id = Number(c.req.param('id')) || 0;
   const GIF = Uint8Array.from(atob('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'), (ch) => ch.charCodeAt(0));
