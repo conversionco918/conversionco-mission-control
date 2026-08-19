@@ -5454,6 +5454,8 @@ async function adsVerify(env, id, url) {
   report.checks.phone = { ok: /href=["'](?:tel:|sms:)/i.test(html) };
   report.checks.form = { ok: /<form[\s>]/i.test(html) || /janeapp\.com|calendar\.google\.com\/calendar\/appointments/i.test(html) };
   report.checks.policy = { ok: /privacy/i.test(html) && /terms/i.test(html) };
+  const gtmM = html.match(/GTM-[A-Z0-9]{4,}/i);
+  report.checks.gtm = { ok: !!gtmM, id: gtmM ? gtmM[0].toUpperCase() : '' };
   report.checks.tracker = { ok: html.indexOf('/t/' + id + '/t.js') !== -1 };
   const rxHits = html.match(/\b(zofran|ondansetron|toradol|ketorolac)\b/gi) || [];
   // Claim scan runs on a copy with disclaimer/negation sentences removed — the required
@@ -5816,95 +5818,345 @@ app.post('/api/clients/:id/ads-account', async (c) => {
 // SHE builds the campaign herself — this lane never touches spend, never
 // creates an ad, and never promises a result. It only removes the plumbing.
 
+// ════════════════════════════════════════════════════════════════════════════
+// 📣 ADS ENGINE v2 (8/19/2026) — rebuilt on researched doctrine, not memory.
+//
+// Sources this encodes (verified, with the divergences flagged in the sheet):
+//  • Ben Heath (YouTube, 2025–26): Leads objective — never "no guidance";
+//    Display OFF; location option = Presence, not presence-or-interest;
+//    conversion-based Smart Bidding from day one; conversion counting = One;
+//    auto-apply recommendations OFF (esp. "remove conflicting negatives");
+//    optimized targeting OFF until ~100 conversions; AI Max OFF (and he says
+//    skip it entirely in compliance-heavy verticals, which healthcare is);
+//    campaign-level broad-match toggle OFF; consolidate — 1 non-brand search
+//    campaign + 1 brand campaign, themed ad groups, SKAGs are dead; negative
+//    list LONGER than the keyword list at launch; ad schedules matter; fill
+//    all 15 headlines; pin the keyword/city headline to position 1; write copy
+//    that DISQUALIFIES the wrong clicker; daily optimisation = do nothing.
+//  • Google Ads policy: a phone number in ad TEXT is prohibited (call assets
+//    only); no gimmick punctuation; no unsubstantiated superlatives; health
+//    absolutes ("cure", "eliminate") are disapproval bait.
+//  • Optmyzr ~20k-account study (Apr 2026): sentence case beats Title Case by
+//    a wide margin on CPA/CTR/CVR; headlines under 20 chars outperform 21–30;
+//    descriptions peak at 61–70 chars, NOT maxed to 90; partial pinning beats
+//    full pinning; Ad Strength is a completeness lint, not a target.
+//  • Google Ads Help: RSA limits 30/90, sitelink 25 + 35/35, callout 25,
+//    structured snippet value 25; ≥6 sitelinks feeds Ad Strength.
+//
+// This lane never creates an ad, never enables spend, and never writes a
+// results promise. It removes plumbing and hands Tiffany a build sheet.
+
+// ── negative keyword library, by category ──────────────────────────────────
+// Heath: at launch the negative list should be LONGER than the keyword list,
+// and it is cheaper to be too restrictive first and open up later.
+const NEG_LIB = {
+  employment: ['job', 'jobs', 'career', 'careers', 'hiring', 'hire', 'salary', 'salaries', 'pay rate',
+    'employment', 'resume', 'apply', 'recruiter', 'staffing', 'per diem', 'travel nurse', 'shift'],
+  training: ['school', 'schools', 'class', 'classes', 'course', 'courses', 'training', 'certification',
+    'certified course', 'certificate', 'ceu', 'continuing education', 'how to become', 'become a',
+    'curriculum', 'exam', 'license requirements', 'scope of practice', 'textbook', 'study guide'],
+  diy: ['diy', 'at home kit', 'home kit', 'kit', 'kits', 'do it yourself', 'self administer',
+    'buy supplies', 'supplies', 'wholesale', 'bulk', 'distributor', 'manufacturer', 'amazon', 'ebay',
+    'walmart', 'costco', 'for sale', 'buy online', 'order online'],
+  research: ['what is', 'what are', 'meaning', 'definition', 'wiki', 'wikipedia', 'reddit', 'quora',
+    'study', 'studies', 'research paper', 'pubmed', 'journal', 'statistics', 'pdf', 'article',
+    'reviews of', 'vs', 'versus', 'comparison', 'pros and cons', 'is it safe', 'dangers',
+    'side effects', 'risks', 'complications', 'lawsuit', 'recall', 'gone wrong'],
+  price_shopping: ['free', 'cheap', 'cheapest', 'discount code', 'coupon', 'coupons', 'promo code',
+    'groupon', 'voucher', 'deal site', 'low cost clinic', 'sliding scale', 'no cost'],
+  wrong_payer: ['insurance', 'insurances', 'covered by insurance', 'medicaid', 'medicare', 'tricare',
+    'hsa eligible', 'fsa eligible', 'copay', 'billing code', 'cpt code', 'icd 10', 'superbill'],
+  wrong_setting: ['hospital', 'emergency room', 'er near me', 'urgent care', 'walk in clinic',
+    'primary care', 'pharmacy', 'veterinary', 'vet', 'for dogs', 'for cats', 'pediatric', 'nicu'],
+  low_intent: ['pictures', 'images', 'photos', 'video', 'youtube', 'template', 'logo', 'name ideas',
+    'business plan', 'how to start', 'start a business', 'franchise', 'open a', 'marketing',
+    'software', 'app', 'crm', 'consultant'],
+};
+
+function negList(extra) {
+  const base = Object.keys(NEG_LIB).reduce((a, k) => a.concat(NEG_LIB[k]), []);
+  const all = base.concat(extra || []);
+  return Array.from(new Set(all.map((s) => String(s).toLowerCase().trim()))).filter(Boolean).sort();
+}
+
+// ── per-vertical content pools ─────────────────────────────────────────────
+// Headlines are written in SENTENCE CASE on purpose (Optmyzr Apr 2026: sentence
+// case CPA $7.46 vs title case $27.47). {c} = city, {b} = business name; a
+// template whose filled length busts 30 chars is dropped, never truncated.
 const VERTICAL_ADS = {
   iv: {
     label: 'IV therapy',
-    core: ['iv therapy', 'iv hydration', 'mobile iv', 'iv drip', 'vitamin iv therapy', 'iv fluids'],
-    intent: ['hangover iv', 'iv therapy near me', 'at home iv therapy', 'iv hydration near me', 'mobile iv nurse'],
-    negatives: ['free', 'jobs', 'job', 'hiring', 'salary', 'school', 'training', 'certification', 'course', 'classes',
-      'how to become', 'nurse job', 'diy', 'at home kit', 'kit', 'supplies', 'wholesale', 'amazon', 'reddit',
-      'side effects', 'symptoms', 'dangers', 'insurance', 'medicaid', 'medicare', 'hospital', 'urgent care', 'er'],
-    headlines: ['Mobile IV — We Come to You', 'Feel Better in 45 Minutes', 'Delivered by a Licensed RN',
-      'Same-Day Appointments', 'No Clinic. No Waiting Room.', 'Hydration Without the Drive',
-      'Book Today, Treated Today', 'Fluids, Vitamins, Fast', 'A Nurse at Your Door',
-      'Rehydrate. Recover. Repeat.', 'Text Us for Today’s Times'],
-    descriptions: ['A licensed nurse comes to you with the drip you need. Booking takes under a minute.',
-      'No clinic, no waiting room. Treated at home, at work, or wherever you happen to be.',
-      'Same-day times are often open. Call or text and we will confirm your appointment today.',
-      'Tell us how you feel and we will match you to the right drip before we arrive.'],
-    callouts: ['Licensed Nurses', 'Same-Day Times', 'We Come to You', 'Transparent Pricing'],
-    sitelinks: [['Our Drip Menu', 'See every drip and what is in it.'], ['Pricing', 'Simple pricing, no surprises.'],
-      ['Book Now', 'Pick a time that works for you.'], ['About Us', 'Meet the nurse behind the bag.']],
+    // exact-match spine, phrase scouts, and the problem/urgency layer
+    core: ['iv therapy', 'iv hydration', 'mobile iv', 'iv drip', 'iv fluids', 'vitamin iv',
+      'iv infusion', 'hydration therapy'],
+    intent: ['mobile iv therapy', 'at home iv therapy', 'iv therapy near me', 'iv hydration near me',
+      'mobile iv nurse', 'in home iv drip', 'concierge iv therapy'],
+    problem: ['hangover iv', 'hangover drip', 'dehydration iv', 'migraine iv', 'food poisoning iv',
+      'iv for the flu', 'immune iv drip', 'recovery iv drip', 'nad iv'],
+    negatives: ['blood draw', 'plasma donation', 'donate plasma', 'chemotherapy', 'dialysis',
+      'picc line', 'port placement', 'infusion center', 'infusion clinic hospital', 'iv pole',
+      'iv bag for sale', 'saline for sale', 'lactated ringers buy', 'iv catheter', 'phlebotomy'],
+    headlines: [
+      'A nurse comes to you', 'Same-day IV drips', 'Feel better today', 'Book in 60 seconds',
+      'No clinic, no waiting', 'Hydration, delivered', 'Licensed RN at home',
+      'Nurse-delivered IV drips', 'No clinic, no waiting room', 'Fluids and vitamins, fast',
+      'Hangover relief at home', 'Rehydrate without the drive', 'Registered nurse at your door',
+      'IV therapy without the clinic', 'Same-day times often open', 'Treated where you already are',
+      'Text us for today’s times', 'We bring the drip to you', 'Recover at home, not in a clinic',
+    ],
+    cityHeads: ['IV therapy in {c}', 'Mobile IV in {c}', 'IV hydration in {c}', 'Serving {c} and nearby',
+      '{c} mobile IV nurses'],
+    brandHeads: ['{b}'],
+    disqualifiers: ['Adults 18+, {c} area only', 'In-home visits, {c} only'],
+    descriptions: [
+      'A licensed nurse comes to you with the drip you need. Booking takes a minute.',
+      'No clinic and no waiting room. Treated at home, at work, or in your hotel.',
+      'Same-day times are often open. Call or text and we confirm your slot today.',
+      'Tell us how you feel and we match the drip before the nurse arrives.',
+      'Every visit is run by a licensed registered nurse, start to finish.',
+      'Clear flat pricing before we book. No membership required to get started.',
+    ],
+    callouts: ['Licensed nurses', 'Same-day times', 'We come to you', 'Flat pricing', 'No membership needed'],
+    sitelinks: [['Drip menu', 'See every drip and what is in it.'], ['Pricing', 'Flat pricing, no surprises.'],
+      ['Book now', 'Pick a time that works for you.'], ['How it works', 'What happens on a visit.'],
+      ['About your nurse', 'Meet the RN who treats you.'], ['Service area', 'Towns we travel to.']],
+    snippets: ['Hydration', 'Recovery', 'Immune', 'Energy', 'Beauty', 'NAD+'],
   },
   'med-spa': {
     label: 'med spa',
-    core: ['med spa', 'medspa', 'medical spa', 'facial treatment', 'skin treatment'],
-    intent: ['med spa near me', 'best med spa', 'medspa consultation'],
-    negatives: ['free', 'jobs', 'hiring', 'salary', 'school', 'training', 'certification', 'course', 'diy',
-      'at home', 'reddit', 'wholesale', 'supplies', 'groupon', 'side effects', 'dangers'],
-    headlines: ['Med Spa Consultations', 'Results You Can See', 'Book Your Consultation', 'Treated by Licensed Pros',
-      'Same-Week Appointments', 'Quiet, Private, Unhurried', 'A Plan Built for Your Skin'],
-    descriptions: ['A licensed provider maps a plan for your skin before anything is booked.',
-      'Private, unhurried appointments. Ask every question you have — we have the time.',
-      'Consultations are quick to book and easy to reschedule if life gets in the way.'],
-    callouts: ['Licensed Providers', 'Private Suites', 'Same-Week Times', 'Clear Pricing'],
-    sitelinks: [['Our Services', 'Every treatment we offer.'], ['Pricing', 'Clear pricing up front.'],
-      ['Book a Consult', 'Find a time this week.'], ['About Us', 'Meet your provider.']],
+    core: ['med spa', 'medspa', 'medical spa', 'skin treatment', 'facial treatment', 'laser treatment'],
+    intent: ['med spa near me', 'medical spa near me', 'med spa consultation', 'best med spa'],
+    problem: ['acne treatment', 'sun damage treatment', 'skin tightening', 'hyperpigmentation treatment',
+      'anti aging treatment'],
+    negatives: ['day spa', 'massage only', 'nail salon', 'hair salon', 'esthetician school',
+      'spa gift card cheap', 'groupon spa', 'spa resort', 'hotel spa'],
+    headlines: [
+      'Book a consultation', 'Real results, real plan', 'Licensed providers only',
+      'Same-week appointments', 'Private, unhurried visits', 'A plan built for your skin',
+      'No pressure consultations', 'Med spa with a nurse on staff', 'Your skin, assessed properly',
+      'Ask every question you have', 'Clear pricing before you book', 'Quiet, private treatment rooms',
+    ],
+    cityHeads: ['Med spa in {c}', 'Skin treatments in {c}', 'Serving {c} and nearby'],
+    brandHeads: ['{b}'],
+    disqualifiers: ['Adults 18+, {c} area only'],
+    descriptions: [
+      'A licensed provider maps a plan for your skin before anything is booked.',
+      'Private, unhurried appointments. Bring every question you have with you.',
+      'Consultations are quick to book and easy to move if life gets in the way.',
+      'Clear pricing is given before treatment, so nothing lands as a surprise.',
+    ],
+    callouts: ['Licensed providers', 'Private suites', 'Same-week times', 'Clear pricing'],
+    sitelinks: [['Our services', 'Every treatment we offer.'], ['Pricing', 'Clear pricing up front.'],
+      ['Book a consult', 'Find a time this week.'], ['Before and after', 'Real client results.'],
+      ['Meet the team', 'Who will be treating you.'], ['New client offer', 'What first visits include.']],
+    snippets: ['Facials', 'Laser', 'Injectables', 'Peels', 'Body', 'Skincare'],
   },
   injector: {
     label: 'injectables',
-    core: ['botox', 'lip filler', 'dermal filler', 'injectables'],
-    intent: ['botox near me', 'lip filler near me', 'filler consultation'],
-    negatives: ['free', 'jobs', 'hiring', 'school', 'training', 'certification', 'course', 'diy', 'at home',
-      'reddit', 'wholesale', 'supplies', 'buy online', 'side effects', 'gone wrong', 'dissolve'],
-    headlines: ['Consultations, Not Pressure', 'Subtle, Natural Results', 'Book Your Consultation',
-      'Licensed Injector', 'Same-Week Appointments', 'Your Face, Still Yours'],
-    descriptions: ['A licensed injector talks through your goals before anything is decided.',
-      'Natural, conservative work — we would rather do less and have you come back.',
-      'Consultations are easy to book and there is never pressure to treat that day.'],
-    callouts: ['Licensed Injector', 'Natural Results', 'Consultations', 'Clear Pricing'],
-    sitelinks: [['Our Services', 'What we treat and how.'], ['Pricing', 'Clear pricing up front.'],
-      ['Book a Consult', 'Find a time this week.'], ['About Us', 'Meet your injector.']],
+    core: ['botox', 'lip filler', 'dermal filler', 'injectables', 'wrinkle relaxer'],
+    intent: ['botox near me', 'lip filler near me', 'filler consultation', 'botox consultation'],
+    problem: ['forehead lines', 'crows feet treatment', 'thin lips', 'smile lines treatment'],
+    negatives: ['botox for sale', 'buy botox', 'botox training', 'injector course', 'dissolve filler',
+      'filler gone wrong', 'botox lawsuit', 'counterfeit', 'at home filler'],
+    headlines: [
+      'Consultations, not pressure', 'Subtle, natural results', 'Book a consultation',
+      'Treated by a licensed injector', 'Same-week appointments', 'Your face, still yours',
+      'We would rather do less', 'Conservative by default', 'Ask before you commit',
+      'A plan, then a price', 'Nothing is decided that day',
+    ],
+    cityHeads: ['Injectables in {c}', 'Botox and filler in {c}', 'Serving {c} and nearby'],
+    brandHeads: ['{b}'],
+    disqualifiers: ['Adults 18+, {c} area only'],
+    descriptions: [
+      'A licensed injector talks through your goals before anything is decided.',
+      'Natural, conservative work. We would rather do less and see you again.',
+      'Consultations are easy to book and there is no pressure to treat that day.',
+      'Pricing is given in the consult, before you agree to anything at all.',
+    ],
+    callouts: ['Licensed injector', 'Natural results', 'Free consultations', 'Clear pricing'],
+    sitelinks: [['Our services', 'What we treat and how.'], ['Pricing', 'Clear pricing up front.'],
+      ['Book a consult', 'Find a time this week.'], ['Before and after', 'Real client results.'],
+      ['Meet your injector', 'Training and experience.'], ['First visit', 'What to expect.']],
+    snippets: ['Botox', 'Lip filler', 'Cheek filler', 'Jawline', 'Under eye', 'Skin boosters'],
   },
   'weight-loss': {
     label: 'medical weight loss',
-    core: ['medical weight loss', 'weight loss clinic', 'weight loss program', 'weight loss doctor'],
+    core: ['medical weight loss', 'weight loss clinic', 'weight loss program', 'weight loss doctor',
+      'physician weight loss'],
     intent: ['weight loss clinic near me', 'medical weight loss near me', 'weight loss consultation'],
-    negatives: ['free', 'jobs', 'hiring', 'school', 'training', 'certification', 'diy', 'at home', 'reddit',
-      'wholesale', 'buy online', 'coupon', 'insurance', 'medicaid', 'medicare', 'side effects', 'dangers'],
-    headlines: ['Medical Weight Loss', 'A Plan Built Around You', 'Book Your Consultation',
-      'Provider-Led, Not a Fad', 'Same-Week Appointments', 'Real Support, Every Week'],
-    descriptions: ['A licensed provider builds the plan and stays with you through every check-in.',
-      'Consultations are unhurried. Bring your history and your questions — all of them.',
-      'Weekly support, honest expectations, and a plan that fits the life you actually have.'],
-    callouts: ['Licensed Providers', 'Weekly Check-Ins', 'Clear Pricing', 'Same-Week Times'],
-    sitelinks: [['Our Program', 'How the program works.'], ['Pricing', 'Clear pricing up front.'],
-      ['Book a Consult', 'Find a time this week.'], ['About Us', 'Meet your provider.']],
+    problem: ['lose weight fast safely', 'weight loss plateau help', 'metabolism testing'],
+    negatives: ['pills', 'supplement', 'supplements', 'tea', 'detox', 'cleanse', 'surgery',
+      'bariatric', 'gastric sleeve', 'compounded online', 'buy online', 'without prescription',
+      'peptide for sale', 'grey market'],
+    headlines: [
+      'Provider-led, not a fad', 'Book a consultation', 'A plan built around you',
+      'Weekly check-ins included', 'Same-week appointments', 'Honest expectations, no hype',
+      'A real provider, every visit', 'Support that does not stop', 'Built for the life you have',
+      'Start with a conversation',
+    ],
+    cityHeads: ['Weight loss clinic in {c}', 'Medical weight loss, {c}', 'Serving {c} and nearby'],
+    brandHeads: ['{b}'],
+    disqualifiers: ['Adults 18+, {c} area only'],
+    descriptions: [
+      'A licensed provider builds the plan and stays with you through check-ins.',
+      'Consultations are unhurried. Bring your history and all of your questions.',
+      'Weekly support, honest expectations, and a plan that fits your real life.',
+      'Pricing is explained in the first visit before you commit to a program.',
+    ],
+    callouts: ['Licensed providers', 'Weekly check-ins', 'Clear pricing', 'Same-week times'],
+    sitelinks: [['Our program', 'How the program works.'], ['Pricing', 'Clear pricing up front.'],
+      ['Book a consult', 'Find a time this week.'], ['Is it for me', 'Who the program suits.'],
+      ['Meet your provider', 'Who you will be working with.'], ['FAQ', 'The questions we get most.']],
+    snippets: ['Consultation', 'Lab work', 'Nutrition', 'Check-ins', 'Body composition'],
   },
   'lash-brow': {
-    label: 'lashes & brows',
-    core: ['lash extensions', 'eyelash extensions', 'brow lamination', 'lash lift'],
-    intent: ['lash extensions near me', 'brow artist near me', 'lash fill'],
-    negatives: ['free', 'jobs', 'hiring', 'school', 'training', 'certification', 'course', 'diy', 'at home',
-      'kit', 'supplies', 'wholesale', 'amazon', 'reddit', 'how to'],
-    headlines: ['Lashes That Last', 'Book Your Lash Appointment', 'Brows, Shaped for You',
-      'Certified Lash Artist', 'Same-Week Appointments', 'Wake Up Ready'],
-    descriptions: ['A certified artist maps every set to your eye shape — no two sets are the same.',
-      'Easy online booking, gentle application, and aftercare you will actually follow.',
-      'New sets and fills both bookable online. Reschedule any time if life happens.'],
-    callouts: ['Certified Artists', 'Online Booking', 'Fills Welcome', 'Clear Pricing'],
-    sitelinks: [['Our Services', 'Sets, fills, and brows.'], ['Pricing', 'Clear pricing up front.'],
-      ['Book Now', 'Pick your time.'], ['About Us', 'Meet your artist.']],
+    label: 'lashes and brows',
+    core: ['lash extensions', 'eyelash extensions', 'lash lift', 'brow lamination', 'microblading'],
+    intent: ['lash extensions near me', 'lash artist near me', 'brow artist near me', 'lash fill'],
+    problem: ['sparse brows', 'straight lashes', 'lash fill overdue'],
+    negatives: ['kit', 'glue', 'training', 'course', 'certification', 'strip lashes', 'diy',
+      'amazon', 'wholesale', 'supplies', 'mascara'],
+    headlines: [
+      'Lashes that actually last', 'Book your lash appointment', 'Brows shaped for your face',
+      'Certified lash artists', 'Same-week appointments', 'Wake up ready',
+      'Fills welcome, new sets too', 'Mapped to your eye shape', 'Gentle application, every time',
+      'Easy online booking',
+    ],
+    cityHeads: ['Lash extensions in {c}', 'Lashes and brows in {c}', 'Serving {c} and nearby'],
+    brandHeads: ['{b}'],
+    disqualifiers: ['{c} area appointments only'],
+    descriptions: [
+      'A certified artist maps every set to your eye shape. No two sets are alike.',
+      'Easy online booking, gentle application, and aftercare you will follow.',
+      'New sets and fills are both bookable online, and easy to move if needed.',
+      'Pricing is listed before you book, so there is nothing to work out later.',
+    ],
+    callouts: ['Certified artists', 'Online booking', 'Fills welcome', 'Clear pricing'],
+    sitelinks: [['Our services', 'Sets, fills, and brows.'], ['Pricing', 'Clear pricing up front.'],
+      ['Book now', 'Pick your time.'], ['Aftercare', 'How to keep them longer.'],
+      ['Meet your artist', 'Training and style.'], ['Gallery', 'Recent work.']],
+    snippets: ['Classic', 'Hybrid', 'Volume', 'Lash lift', 'Brow lamination', 'Tinting'],
   },
 };
 
-// Google Ads asset character limits — anything that does not fit is dropped,
-// never truncated mid-word (a cut-off headline is worse than one fewer).
-function adsFit(list, n) { return (list || []).map((s) => String(s || '').trim()).filter((s) => s && s.length <= n); }
+// ── policy + quality gates ─────────────────────────────────────────────────
+// Google prohibits a phone number in ad TEXT (call assets exist for that), and
+// disapproves gimmick punctuation and unsubstantiated superlatives. Health
+// absolutes are the fastest route to a disapproval in this vertical.
+const AD_BANNED = /(\b\d{3}[-. ]?\d{3}[-. ]?\d{4}\b)|!|#1|\bbest\b|\bguarantee\w*\b|\bcure\w*\b|\beliminate\b|\bproven\b|\binstant\b|\bmiracle\b|\bsafest\b|\bcheapest\b/i;
 
-function adsBrief(client, rep) {
+function adsPolicyOk(s) {
+  const t = String(s || '');
+  if (!t.trim()) return false;
+  if (AD_BANNED.test(t)) return false;
+  // more than one all-caps word (acronyms allowed) reads as shouting to review
+  const caps = (t.match(/\b[A-Z]{2,}\b/g) || []).filter((w) => !['IV', 'RN', 'NAD', 'USA', 'FAQ', 'GLP'].includes(w));
+  if (caps.length > 0) return false;
+  return true;
+}
+
+function tokens(s) {
+  const STOP = new Set(['a', 'an', 'the', 'in', 'to', 'for', 'of', 'and', 'or', 'your', 'you', 'we', 'us', 'at', 'on', 'is', 'it', 'no']);
+  return String(s).toLowerCase().replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter((w) => w && !STOP.has(w));
+}
+
+// Reject a candidate that shares ≥60% of its meaningful tokens with one already
+// chosen — a near-duplicate headline is a wasted slot and drags Ad Strength.
+function tooSimilar(cand, chosen) {
+  const a = tokens(cand);
+  if (!a.length) return true;
+  for (const c of chosen) {
+    const b = new Set(tokens(c));
+    const shared = a.filter((w) => b.has(w)).length;
+    if (shared / a.length >= 0.6) return true;
+  }
+  return false;
+}
+
+// Fill a target length distribution rather than maxing every asset out:
+// Optmyzr found headlines under 20 chars beat 21–30 on CPA and CTR.
+function pickHeadlines(pool, want) {
+  const bands = [[1, 20, 5], [21, 26, 6], [27, 30, 4]];
+  const chosen = [];
+  const used = new Set();
+  for (const [lo, hi, n] of bands) {
+    let taken = 0;
+    for (const h of pool) {
+      if (taken >= n || chosen.length >= want) break;
+      if (used.has(h)) continue;
+      const L = h.length;
+      if (L < lo || L > hi) continue;
+      if (!adsPolicyOk(h)) continue;
+      if (tooSimilar(h, chosen)) continue;
+      chosen.push(h); used.add(h); taken++;
+    }
+  }
+  // top up from anything legal that still fits, keeping the uniqueness gate
+  for (const h of pool) {
+    if (chosen.length >= want) break;
+    if (used.has(h) || h.length > 30) continue;
+    if (!adsPolicyOk(h) || tooSimilar(h, chosen)) continue;
+    chosen.push(h); used.add(h);
+  }
+  return chosen.slice(0, want);
+}
+
+function fillTpl(list, map) {
+  return (list || []).map((t) => String(t).replace(/\{c\}/g, map.c || '').replace(/\{b\}/g, map.b || ''))
+    .map((s) => s.replace(/\s+/g, ' ').trim())
+    .filter((s) => s && !/\{|\}/.test(s));
+}
+
+// ── unit economics: the honest version of a client target ──────────────────
+// Back-solves from what the client actually earns. This is an INTERNAL planning
+// number and a monitoring baseline. It is never shown to a client and it is
+// never phrased as a promise — ad performance is not guaranteeable and this
+// system does not pretend otherwise.
+function adsEconomics(econ) {
+  const e = econ || {};
+  const ticket = Number(e.ticket) || 0;           // average revenue per new client
+  const margin = Number(e.margin) || 0.6;          // gross margin
+  const close = Number(e.close_rate) || 0.25;      // lead → paying client
+  const target = Number(e.target_clients) || 0;    // new clients wanted per month
+  const cpc = Number(e.cpc) || 0;                  // expected CPC (Keyword Planner high range)
+  const lpCvr = Number(e.lp_cvr) || 0.08;          // landing page click → lead
+  const out = { ticket, margin, close, target, cpc, lp_cvr: lpCvr };
+  if (ticket > 0) out.gross_per_client = Math.round(ticket * margin);
+  if (target > 0 && close > 0) out.leads_needed = Math.ceil(target / close);
+  if (out.gross_per_client && close > 0) out.max_cpl = Math.round(out.gross_per_client * close);
+  if (out.leads_needed && cpc > 0 && lpCvr > 0) {
+    out.clicks_needed = Math.ceil(out.leads_needed / lpCvr);
+    out.monthly_budget = Math.round(out.clicks_needed * cpc);
+    out.daily_budget = Math.round(out.monthly_budget / 30);
+    out.projected_cpl = Math.round(cpc / lpCvr);
+  }
+  if (cpc > 0) out.floor_daily = Math.round(cpc * 5); // Heath: high-range CPC × 5 is the learn-anything floor
+  if (out.projected_cpl && out.max_cpl) out.headroom = out.max_cpl - out.projected_cpl;
+  // Smart Bidding needs 15 conversions / 30 days to function at all
+  if (out.leads_needed) out.smart_bidding_ok = out.leads_needed >= 15;
+  return out;
+}
+
+function adsLint(heads, descs) {
+  const lint = { headlines: heads.length, descriptions: descs.length, issues: [] };
+  lint.len_short = heads.filter((h) => h.length <= 20).length;
+  lint.len_mid = heads.filter((h) => h.length > 20 && h.length <= 26).length;
+  lint.len_long = heads.filter((h) => h.length > 26).length;
+  if (heads.length < 15) lint.issues.push('Only ' + heads.length + ' headlines — Google accepts 15 and mixes them; add more angles.');
+  if (descs.length < 4) lint.issues.push('Only ' + descs.length + ' descriptions — 4 is the maximum and the target.');
+  if (heads.some((h) => h.length > 30)) lint.issues.push('A headline is over 30 characters and will be rejected.');
+  if (descs.some((d) => d.length > 90)) lint.issues.push('A description is over 90 characters and will be rejected.');
+  const over = descs.filter((d) => d.length > 80).length;
+  if (over) lint.issues.push(over + ' description(s) run past 80 characters — the 61–80 band performs better than maxing 90.');
+  if (!lint.len_short) lint.issues.push('No headline under 20 characters — short headlines carry the best CPA in the data.');
+  lint.ad_strength_estimate = (heads.length >= 15 && descs.length >= 4) ? 'Good to Excellent (completeness only)' : 'Average — add assets';
+  return lint;
+}
+
+// ── the plan ───────────────────────────────────────────────────────────────
+function adsPlan(client, rep, settings) {
   let i1 = {}; try { i1 = JSON.parse(client.intake1_data || '{}'); } catch {}
-  const biz = String(client.business_name || i1['Business Name'] || client.name || 'Your business').trim();
+  const biz = String(client.business_name || i1['Business Name'] || client.name || 'This business').trim();
   const cityFull = String(i1['Primary City & State'] || i1['Location'] || '').trim();
   const city = (cityFull.split(',')[0] || '').trim();
   const V = String(client.vertical || 'iv').toLowerCase();
@@ -5912,109 +6164,200 @@ function adsBrief(client, rep) {
   const phone = String(client.phone || '').trim();
   const pd = phone.replace(/\D/g, '').replace(/^1(?=\d{10}$)/, '');
   const phoneNice = pd.length === 10 ? '(' + pd.slice(0, 3) + ') ' + pd.slice(3, 6) + '-' + pd.slice(6) : phone;
+  const cl = city.toLowerCase();
 
-  // ── keywords: exact first (Ben Heath: exact carries the budget, phrase scouts)
-  const kwCore = [];
-  for (const t of P.core) {
-    kwCore.push('[' + t + ']');
-    if (city) kwCore.push('[' + t + ' ' + city.toLowerCase() + ']');
-  }
-  const kwLocal = city ? P.core.slice(0, 4).flatMap((t) => ['"' + t + ' ' + city.toLowerCase() + '"', '"' + t + ' near me"']) : P.core.slice(0, 4).map((t) => '"' + t + ' near me"');
-  const kwIntent = P.intent.flatMap((t) => ['[' + t + ']', '"' + t + '"']);
+  // ── keywords: exact carries the budget, phrase scouts. Broad stays OFF at
+  // campaign level until negatives, tracking and profitability are proven.
+  const ex = (t) => '[' + t + ']';
+  const ph = (t) => '"' + t + '"';
+  const withCity = (t) => (cl ? t + ' ' + cl : t + ' near me');
 
-  const headlines = adsFit([
-    ...(city ? [P.label.replace(/\b\w/g, (m) => m.toUpperCase()) + ' in ' + city] : []),
-    ...(biz ? [biz] : []),
-    ...P.headlines,
-    ...(city ? ['Serving ' + city + ' & Nearby'] : []),
-    ...(phoneNice ? ['Call ' + phoneNice] : []),
-  ], 30);
+  const agCore = { name: 'Core — ' + P.label, theme: P.label,
+    keywords: P.core.flatMap((t) => [ex(t), ex(withCity(t))]).concat(P.core.slice(0, 4).map((t) => ph(t))) };
+  const agIntent = { name: 'At-home / mobile intent', theme: 'delivery model',
+    keywords: P.intent.flatMap((t) => [ex(t), ph(t)]) };
+  const agProblem = { name: 'Problem and urgency', theme: 'why they search today',
+    keywords: P.problem.flatMap((t) => [ex(t), ph(t)]) };
+  const agCity = cl ? { name: 'City — ' + city, theme: 'geo-qualified',
+    keywords: P.core.slice(0, 5).flatMap((t) => [ex(withCity(t)), ph(withCity(t))]) } : null;
+  const nonBrandGroups = [agCore, agIntent, agProblem].concat(agCity ? [agCity] : []);
 
-  const descriptions = adsFit(P.descriptions.map((d) => (city && d.length + city.length + 5 <= 90 ? d : d)), 90);
+  const brandTerms = [ex(biz.toLowerCase()), ph(biz.toLowerCase())]
+    .concat(cl ? [ex(biz.toLowerCase() + ' ' + cl)] : []);
 
-  const brief = {
-    v: 1,
-    built: new Date().toISOString(),
-    biz, city: cityFull || city, vertical: P.label,
-    url: rep.url || '',
-    campaign: {
-      name: biz + ' — Search — ' + (city || 'Local'),
-      type: 'Search (no Display Network, no Search Partners — uncheck both)',
-      goal: 'Leads · without a goal guidance (pick "Create a campaign without a goal\'s guidance")',
-      budget: '$25–$40/day to start. Do not start higher — you cannot learn from noise.',
-      bidding: 'Start on Maximize Clicks with a max CPC cap of ~$4. Switch to Maximize Conversions only after 15–30 recorded conversions.',
-      locations: (city ? 'Radius targeting: 12–20 miles around ' + city : 'Radius targeting around the service area'),
-      locationSetting: 'Location options → Presence: "People in or regularly in your targeted locations". NEVER leave it on the default (interest) — that is the #1 wasted-spend mistake.',
-      schedule: 'If calls are the main conversion, run the ad schedule against real answer hours. If the form/booking is the main conversion, run all hours.',
-      devices: 'Leave all devices on for two weeks, then read the device report before adjusting.',
-      network: 'Search only. Display expansion OFF.',
+  // ── RSA assets
+  const pinPool = fillTpl(P.cityHeads, { c: city, b: biz }).filter((h) => h.length <= 30 && adsPolicyOk(h));
+  const brandPool = fillTpl(P.brandHeads, { c: city, b: biz }).filter((h) => h.length <= 30 && adsPolicyOk(h));
+  const disq = fillTpl(P.disqualifiers, { c: city, b: biz }).filter((h) => h.length <= 30 && adsPolicyOk(h));
+  const pool = pinPool.concat(brandPool, P.headlines, disq);
+  const headlines = pickHeadlines(pool, 15);
+  // make sure the pinned trio actually survived selection
+  for (const p of pinPool.slice(0, 3)) if (!headlines.includes(p) && headlines.length) headlines[headlines.length - 1] = p;
+  const pinH1 = headlines.filter((h) => pinPool.includes(h)).slice(0, 3);
+
+  const descriptions = (P.descriptions || []).filter((d) => d.length <= 90 && adsPolicyOk(d)).slice(0, 4);
+  const lint = adsLint(headlines, descriptions);
+
+  const econ = adsEconomics(rep && rep.econ);
+
+  const plan = {
+    v: 2, built: new Date().toISOString(), biz, city: cityFull || city, vertical: P.label,
+    url: (rep && rep.url) || '',
+    campaigns: [
+      {
+        role: 'non-brand',
+        name: biz + ' — Search — ' + (city || 'Local'),
+        settings: {
+          'Campaign type': 'Search only',
+          'Goal': 'Leads. Do NOT pick "without a goal\'s guidance" — you lose the settings guardrails.',
+          'Networks': 'Google Search only. Display Network OFF. Search Partners OFF for lead gen.',
+          'Locations': city ? 'Radius 12–20 miles around ' + city + ', or the named city plus surrounding towns' : 'Radius around the service area',
+          'Location options': 'Presence — "people in or regularly in your targeted locations". Never leave the presence-or-interest default; it buys tourists and trip planners.',
+          'Bidding': 'Maximize Conversions from launch. Do not add a target CPA for the first month; then set it AT current performance, not aspiration, and move it no more than once a fortnight.',
+          'Daily budget': econ.daily_budget ? '$' + econ.daily_budget + '/day (back-solved below). Absolute floor to learn anything: $' + (econ.floor_daily || 25) + '/day.'
+            : 'Back-solve it: expected CPC × 5 is the floor to get ~5–10 clicks a day. Under that you cannot optimise.',
+          'Conversion counting': 'One (lead gen). "Every" is for ecommerce purchases.',
+          'Broad match toggle': 'OFF at campaign level. Exact and phrase only until negatives, tracking and profit are proven.',
+          'Optimized targeting / audience expansion': 'OFF at launch. Revisit past ~100 conversions.',
+          'AI Max': 'OFF. It generates its own ad text, which is disqualifying in a healthcare account where every claim is regulated.',
+          'Auto-apply recommendations': 'OFF — especially "Remove conflicting negative keywords", which deletes negatives you added on purpose.',
+          'Ad schedule': 'Match the hours a human actually answers. A lead that rings out at 9pm is a lead you paid for and lost.',
+          'Devices': 'All on. Read the device report after two weeks before touching a modifier.',
+          'Ad rotation': 'Optimize: prefer best performing ads.',
+        },
+        adGroups: nonBrandGroups,
+      },
+      {
+        role: 'brand',
+        name: biz + ' — Brand',
+        settings: {
+          'Why': 'Cheap, high-intent, and it stops a competitor buying your name. Keep it separate so brand conversions do not flatter the non-brand numbers.',
+          'Daily budget': '$3–$5/day is usually plenty.',
+          'Bidding': 'Maximize Conversions.',
+        },
+        adGroups: [{ name: 'Brand — ' + biz, theme: 'people already looking for you', keywords: brandTerms }],
+      },
+    ],
+    negatives: negList(P.negatives),
+    rsa: { headlines, pinH1, descriptions, lint,
+      pinning: 'Pin the 2–3 keyword/city headlines to position 1 and leave everything else unpinned. Full pinning collapses the combinations and costs impressions; no pinning at all lets Google drop your keyword out of the visible headline.' },
+    assets: {
+      callouts: (P.callouts || []).filter((s) => s.length <= 25),
+      sitelinks: (P.sitelinks || []).filter((s) => s[0].length <= 25 && s[1].length <= 35),
+      snippets: { header: 'Services', values: (P.snippets || []).filter((s) => s.length <= 25) },
+      call: phoneNice
+        ? 'Call asset: ' + phoneNice + '. Turn ON call reporting so it uses a Google forwarding number — without that, calls are invisible. Count each caller once, minimum 60 seconds.'
+        : 'Call asset: add the business phone, then turn on call reporting.',
+      location: 'Location asset: link the Google Business Profile once it is verified. For a local service advertiser this is close to mandatory.',
+      note: 'A phone number must never appear in headline or description text — Google prohibits it. That is what the call asset is for.',
     },
-    adGroups: [
-      { name: 'Core — ' + P.label, keywords: kwCore },
-      { name: 'Local — ' + (city || 'near me'), keywords: kwLocal },
-      { name: 'Intent — problem/urgency', keywords: kwIntent },
-    ],
-    negatives: P.negatives,
-    headlines, descriptions,
-    callouts: adsFit(P.callouts, 25),
-    sitelinks: (P.sitelinks || []).filter((s) => s[0].length <= 25 && s[1].length <= 35),
-    assets: [
-      phoneNice ? 'Call asset: ' + phoneNice + ' (turn on call reporting so calls count as conversions)' : 'Call asset: add the business phone number',
-      'Location asset: link the Google Business Profile once it is verified',
-      'Structured snippet: Services → ' + P.core.slice(0, 4).join(', '),
-    ],
     conversions: [
-      'Tools → Data manager → link the GA4 property (already created by Mission Control)',
-      'Goals → Conversions → Import → Google Analytics 4 → import: call_click, sms_click, form_submit, book_click',
-      'Set form_submit and book_click as Primary. Set call_click and sms_click as Primary only if you answer reliably; otherwise Secondary.',
-      'Leave "Include in Conversions" ON for primaries — that is what Smart Bidding learns from.',
+      'Tools → Data manager → link the GA4 property Mission Control created.',
+      'Goals → Conversions → Import → Google Analytics 4 → import call_click, sms_click, form_submit, book_click.',
+      'Primary: form_submit and book_click. call_click and sms_click go Primary only if calls get answered reliably; otherwise Secondary.',
+      'Set conversion counting to One.',
+      'Do not spend a dollar before a real conversion has been recorded end to end. Bidding on broken tracking is the most expensive mistake in this account.',
     ],
+    economics: econ,
+    cadence: {
+      Daily: 'Nothing. Looking every day and tweaking is itself a failure mode — the bidding needs room to learn.',
+      Weekly: 'Search terms report → add negatives, and promote any winning search term to an exact keyword. Reallocate budget. Small copy tweaks.',
+      Monthly: 'Bidding review and target adjustment. Full creative refresh. Check the device, hour and location reports.',
+      'First 6 weeks': 'Change one thing at a time. Every budget, bid, targeting or copy change restarts learning.',
+    },
     policy: [
-      'No outcome or cure claims anywhere in the ad or on the landing page — healthcare copy gets disapproved for this first.',
+      'No outcome or cure claims anywhere in the ad or on the page — health absolutes are the fastest disapproval in this vertical.',
       'No prescription drug names in ad text.',
-      'Landing page must show a real business name, a working phone number, and privacy + terms links, or Google flags "destination not working".',
-      'The ad promise and the landing page headline must match, word for word where possible.',
+      'No phone number in ad text. No exclamation marks. No "#1", "best", "guaranteed".',
+      'The page must show a real business name, a working phone number, and privacy plus terms links.',
+      'The ad promise and the landing page headline must match, close to word for word.',
+    ],
+    divergences: [
+      'Bidding: Ben Heath says start on conversion-based Smart Bidding from day one; Aaron Young and much of the local-PPC world says start on Maximize Clicks until roughly 30 conversions exist. This sheet follows Heath. If six weeks pass under 15 conversions, the fix is the offer and the landing page, not the bid strategy.',
+      'Search Partners: Heath leaves them on; current lead-gen opinion leans to opting out. This sheet opts out.',
+      'Ad Strength: treat it as a completeness checklist. The largest published study found "Average" ads beat "Excellent" ones on CPA. Never delete a converting asset to chase a rating.',
     ],
   };
 
+  // ── the copyable sheet
   const L = [];
-  L.push('CAMPAIGN BUILD SHEET — ' + biz + (city ? ' (' + city + ')' : ''));
-  L.push('Landing page: ' + (rep.url || '(not connected)'));
-  L.push('');
-  L.push('1. CAMPAIGN SETTINGS');
-  const CLBL = { name: 'Campaign name', type: 'Campaign type', goal: 'Goal', budget: 'Daily budget',
-    bidding: 'Bidding', locations: 'Locations', locationSetting: 'Location setting (critical)',
-    schedule: 'Ad schedule', devices: 'Devices', network: 'Networks' };
-  for (const [k, v] of Object.entries(brief.campaign)) L.push('   • ' + (CLBL[k] || k) + ': ' + v);
-  L.push('');
-  L.push('2. AD GROUPS + KEYWORDS');
-  for (const g of brief.adGroups) { L.push('   ' + g.name); L.push('      ' + g.keywords.join('  ')); }
-  L.push('');
-  L.push('3. NEGATIVE KEYWORDS (paste as a negative list, broad match)');
-  L.push('   ' + brief.negatives.join(', '));
-  L.push('');
-  L.push('4. HEADLINES (' + headlines.length + ', all within 30 characters)');
-  for (const h of headlines) L.push('   • ' + h);
-  L.push('');
-  L.push('5. DESCRIPTIONS (all within 90 characters)');
-  for (const d of descriptions) L.push('   • ' + d);
-  L.push('');
-  L.push('6. ASSETS');
-  for (const a of brief.assets) L.push('   • ' + a);
-  L.push('   • Callouts: ' + brief.callouts.join(' · '));
-  for (const s of brief.sitelinks) L.push('   • Sitelink: ' + s[0] + ' — ' + s[1]);
-  L.push('');
-  L.push('7. CONVERSION TRACKING (do this BEFORE you enable the campaign)');
-  for (const s of brief.conversions) L.push('   • ' + s);
-  L.push('');
-  L.push('8. POLICY GUARDRAILS');
-  for (const s of brief.policy) L.push('   • ' + s);
-  L.push('');
-  L.push('Built by Mission Control. Tracking is already live on the page — every');
-  L.push('conversion you import above is already firing.');
-  brief.text = L.join('\n');
-  return brief;
+  const line = (s) => L.push(s);
+  line('CAMPAIGN BUILD SHEET v2 — ' + biz + (city ? ' (' + city + ')' : ''));
+  line('Landing page: ' + (plan.url || '(not connected)'));
+  line('Built ' + plan.built.slice(0, 10) + ' by Mission Control. Tracking is already live on the page.');
+  line('');
+  line('0. BEFORE YOU BUILD');
+  for (const s of plan.conversions) line('   • ' + s);
+  line('');
+  if (econ.monthly_budget || econ.max_cpl) {
+    line('1. THE NUMBERS (from this client\'s own economics)');
+    if (econ.ticket) line('   • Average new-client value: $' + econ.ticket + ' at ' + Math.round(econ.margin * 100) + '% margin = $' + econ.gross_per_client + ' gross');
+    if (econ.close) line('   • Lead → client close rate: ' + Math.round(econ.close * 100) + '%');
+    if (econ.target) line('   • Target new clients per month: ' + econ.target + '  →  ' + econ.leads_needed + ' leads needed');
+    if (econ.max_cpl) line('   • Most you can pay per lead and still profit: $' + econ.max_cpl);
+    if (econ.projected_cpl) line('   • Projected cost per lead at $' + econ.cpc + ' CPC and ' + Math.round(econ.lp_cvr * 100) + '% page conversion: $' + econ.projected_cpl);
+    if (econ.monthly_budget) line('   • Budget that math implies: $' + econ.monthly_budget + '/month (~$' + econ.daily_budget + '/day)');
+    if (econ.headroom != null) line('   • Headroom per lead: ' + (econ.headroom >= 0 ? '$' + econ.headroom + ' — the math works' : '-$' + Math.abs(econ.headroom) + ' — the math does NOT work at this CPC; raise the ticket, raise page conversion, or narrow the keywords'));
+    if (econ.smart_bidding_ok === false) line('   • WARNING: under 15 leads/month, Smart Bidding cannot learn. Either raise budget or optimise to a softer conversion first.');
+    line('   • These are planning numbers, not promises. Nobody can guarantee ad results.');
+    line('');
+  } else {
+    line('1. THE NUMBERS');
+    line('   • Not set yet. Open the client card → Ads economics and enter average ticket, close rate,');
+    line('     target clients per month and expected CPC. The sheet then back-solves the budget.');
+    line('');
+  }
+  let n = 2;
+  for (const camp of plan.campaigns) {
+    line(n + '. CAMPAIGN — ' + camp.name + '  [' + camp.role + ']');
+    for (const [k, v] of Object.entries(camp.settings)) line('   • ' + k + ': ' + v);
+    for (const g of camp.adGroups) {
+      line('   AD GROUP: ' + g.name);
+      line('      ' + g.keywords.join('  '));
+    }
+    line('');
+    n++;
+  }
+  line(n + '. NEGATIVE KEYWORDS — build this as a shared list BEFORE you spend');
+  line('   (' + plan.negatives.length + ' terms. At launch the negative list should be longer than the keyword list.)');
+  line('   ' + plan.negatives.join(', '));
+  line('');
+  n++;
+  line(n + '. AD COPY — one RSA per ad group');
+  line('   PIN TO HEADLINE POSITION 1 (all of these, so they rotate): ' + (plan.rsa.pinH1.join(' | ') || '(none — add a city)'));
+  line('   ' + plan.rsa.pinning);
+  line('   HEADLINES (' + headlines.length + ', all within 30 characters, sentence case on purpose):');
+  for (const h of headlines) line('      • ' + h + '   [' + h.length + ']');
+  line('   DESCRIPTIONS (' + descriptions.length + ', 61–80 characters beats maxing out 90):');
+  for (const d of descriptions) line('      • ' + d + '   [' + d.length + ']');
+  if (lint.issues.length) { line('   LINT:'); for (const s of lint.issues) line('      ! ' + s); }
+  line('');
+  n++;
+  line(n + '. ASSETS');
+  line('   • ' + plan.assets.call);
+  line('   • ' + plan.assets.location);
+  line('   • Callouts: ' + plan.assets.callouts.join(' · '));
+  line('   • Structured snippet — ' + plan.assets.snippets.header + ': ' + plan.assets.snippets.values.join(', '));
+  for (const s of plan.assets.sitelinks) line('   • Sitelink: ' + s[0] + ' — ' + s[1]);
+  line('   • ' + plan.assets.note);
+  line('');
+  n++;
+  line(n + '. AFTER LAUNCH');
+  for (const [k, v] of Object.entries(plan.cadence)) line('   • ' + k + ': ' + v);
+  line('');
+  n++;
+  line(n + '. POLICY GUARDRAILS');
+  for (const s of plan.policy) line('   • ' + s);
+  line('');
+  n++;
+  line(n + '. WHERE THE EXPERTS DISAGREE (so you can decide, not guess)');
+  for (const s of plan.divergences) line('   • ' + s);
+  plan.text = L.join('\n');
+  return plan;
 }
+
+// v1 name kept so every existing caller and every stored brief keeps working.
+function adsBrief(client, rep) { return adsPlan(client, rep, null); }
 
 // Deep links that drop her exactly where she needs to be in Google's UI.
 function adsDeepLinks(rep, settings) {
@@ -6052,12 +6395,45 @@ app.post('/api/clients/:id/ads-provision', async (c) => {
   const report = await adsVerify(c.env, id, url);
   rep = { ...rep, ...report, url };
   if (!rep.track) { rep.track = String(body.track || 'addon'); rep.monthly = 249; rep.enrolled_at = rep.enrolled_at || new Date().toISOString(); }
+
+  // 1b — ZERO TOUCH: if the GoHighLevel page already carries tags, adopt those
+  // IDs instead of asking her for them or creating a second property. Anything
+  // already saved wins, so this can never overwrite a deliberate choice.
+  const adopted = [];
+  const detGa4 = (report.checks && report.checks.ga4 && report.checks.ga4.id) || '';
+  const detClar = (report.checks && report.checks.clarity && report.checks.clarity.id) || '';
+  const detGtm = (report.checks && report.checks.gtm && report.checks.gtm.id) || '';
+  if (detGa4 && !rep.ga4_measurement) { rep.ga4_measurement = String(detGa4).toUpperCase(); adopted.push('Google Analytics ' + rep.ga4_measurement); }
+  if (detClar && !rep.clarity_id) { rep.clarity_id = String(detClar); adopted.push('Clarity ' + rep.clarity_id); }
+  if (detGtm && !rep.gtm_id) { rep.gtm_id = String(detGtm).toUpperCase(); adopted.push('Tag Manager ' + rep.gtm_id); }
   await setSetting(db, 'ads_' + id, JSON.stringify(rep));
 
   // 2 — GA4 property + key events (idempotent; safe to call every paste)
   const ga4 = await ga4Ensure(c.env, id);
   settings = await getSettings(db);
   try { rep = JSON.parse(settings['ads_' + id] || '{}'); } catch {}
+
+  // 2b — Search Console: if this domain is already verified on her Google
+  // account, wire it now so the rankings snapshots start on their own.
+  let gscAttached = '';
+  try {
+    let host = ''; try { host = new URL(url).hostname.replace(/^www\./, ''); } catch {}
+    let stG = {}; try { stG = JSON.parse(settings['gsc_' + id] || '{}'); } catch {}
+    if (host && !/workers\.dev$/.test(host) && (!stG || !stG.property) && gscConfigured(c.env)) {
+      const props = await gscListProperties(c.env).catch(() => null);
+      const list = (props && (props.siteEntry || props.sites || props)) || [];
+      const hit = (Array.isArray(list) ? list : []).find((p) => {
+        const site = String((p && (p.siteUrl || p.site)) || '');
+        return site.replace(/^sc-domain:|^https?:\/\//, '').replace(/^www\./, '').replace(/\/$/, '') === host
+          && /Owner|FullUser|Restricted/i.test(String((p && (p.permissionLevel || p.permission)) || ''));
+      });
+      if (hit) {
+        await setSetting(db, 'gsc_' + id, JSON.stringify({ ...(stG || {}), property: host, verified: 'auto' }));
+        gscAttached = host;
+        c.executionCtx.waitUntil(gscRankSnapshot(c.env).catch(() => {}));
+      }
+    }
+  } catch {}
 
   // 3 — portal analytics card ON for this client
   rep.portal_analytics = rep.portal_analytics === false ? false : true;
@@ -6071,7 +6447,7 @@ app.post('/api/clients/:id/ads-provision', async (c) => {
   const lights = ['ga4', 'clarity', 'phone', 'form', 'policy', 'tracker']
     .map((k) => (report.checks[k] && report.checks[k].ok ? '✓' : '✗') + k).join(' ');
   await logEvent(db, id, 'ads_provisioned',
-    `\u{1F4E3} Ads provision on ${url} — ${lights}${ga4.measurement ? ' · GA4 ' + ga4.measurement : ''}${ga4.pending ? ' · GA4 pending (' + ga4.pending + ')' : ''}. Build sheet ready; campaign is Tiffany's to build in Google Ads.`);
+    `\u{1F4E3} Ads provision on ${url} — ${lights}${ga4.measurement ? ' · GA4 ' + ga4.measurement : ''}${ga4.pending ? ' · GA4 pending (' + ga4.pending + ')' : ''}${adopted.length ? ' · adopted ' + adopted.join(', ') : ''}${gscAttached ? ' · Search Console ' + gscAttached : ''}. Build sheet ready; campaign is Tiffany's to build in Google Ads.`);
 
   const steps = [
     { k: 'snippet', done: !!(report.checks.tracker && report.checks.tracker.ok),
@@ -6080,10 +6456,11 @@ app.post('/api/clients/:id/ads-provision', async (c) => {
     { k: 'events', done: !!(rep.ga4_measurement), label: 'Key events registered', detail: 'call_click · sms_click · form_submit · book_click' },
     { k: 'portal', done: true, label: 'Client portal analytics card', detail: 'live on their portal now' },
     { k: 'account', done: !!links.cid, label: 'Google Ads account linked', detail: links.cid ? links.cid : 'paste the 10-digit customer ID in the Ads tab' },
-    { k: 'brief', done: true, label: 'Campaign build sheet', detail: rep.brief.headlines.length + ' headlines · ' + rep.brief.adGroups.length + ' ad groups' },
+    { k: 'brief', done: true, label: 'Campaign build sheet', detail: ((rep.brief && rep.brief.rsa && rep.brief.rsa.headlines.length) || 0) + ' headlines · ' +
+      ((rep.brief && rep.brief.campaigns) || []).reduce((a, x) => a + x.adGroups.length, 0) + ' ad groups · ' + ((rep.brief && rep.brief.negatives) || []).length + ' negatives' },
     { k: 'campaign', done: !!rep.live_at, label: 'Campaign built + enabled (yours)', detail: 'Mission Control never enables spend' },
   ];
-  return c.json({ ok: true, report: rep, ga4, links, steps, brief: rep.brief });
+  return c.json({ ok: true, report: rep, ga4, links, steps, brief: rep.brief, adopted, gsc: gscAttached });
 });
 
 // Re-read (or regenerate) the build sheet without re-verifying the page.
@@ -6098,6 +6475,100 @@ app.get('/api/clients/:id/ads-brief', async (c) => {
   if (fresh || !rep.brief) { rep.brief = adsBrief(client, rep); await setSetting(db, 'ads_' + id, JSON.stringify(rep)); }
   return c.json({ ok: true, brief: rep.brief, links: adsDeepLinks(rep, settings) });
 });
+
+// 💵 ADS ECONOMICS (8/19/2026) — the honest version of a client target.
+// Back-solves from what the client actually earns: average ticket, margin,
+// lead→client close rate, target new clients per month, expected CPC and
+// landing-page conversion rate. Produces the leads needed, the most she can
+// pay per lead and still profit, and the budget that implies.
+// INTERNAL ONLY. It is a planning and monitoring baseline, never a promise —
+// nobody can guarantee ad results and nothing here is written into client copy.
+app.post('/api/clients/:id/ads-economics', async (c) => {
+  const id = Number(c.req.param('id')) || 0;
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'no such client' }, 404);
+  let body = {}; try { body = await c.req.json(); } catch {}
+  const settings = await getSettings(db);
+  let rep = {}; try { rep = JSON.parse(settings['ads_' + id] || '{}'); } catch {}
+  const num = (v, d) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : d; };
+  const pct = (v, d) => { let n = Number(v); if (!Number.isFinite(n) || n <= 0) return d; if (n > 1) n = n / 100; return n > 0 && n <= 1 ? n : d; };
+  rep.econ = {
+    ticket: num(body.ticket, (rep.econ && rep.econ.ticket) || 0),
+    margin: pct(body.margin, (rep.econ && rep.econ.margin) || 0.6),
+    close_rate: pct(body.close_rate, (rep.econ && rep.econ.close_rate) || 0.25),
+    target_clients: num(body.target_clients, (rep.econ && rep.econ.target_clients) || 0),
+    cpc: num(body.cpc, (rep.econ && rep.econ.cpc) || 0),
+    lp_cvr: pct(body.lp_cvr, (rep.econ && rep.econ.lp_cvr) || 0.08),
+  };
+  const model = adsEconomics(rep.econ);
+  rep.brief = adsPlan(client, rep, settings);   // the sheet rebuilds around the new numbers
+  await setSetting(db, 'ads_' + id, JSON.stringify(rep));
+  await logEvent(db, id, 'ads_economics',
+    `\u{1F4B5} Ads economics set for ${client.business_name || client.name || client.email} — target ${rep.econ.target_clients || '?'} new clients/mo, ` +
+    `${model.leads_needed || '?'} leads needed, max $${model.max_cpl || '?'}/lead, implied budget $${model.monthly_budget || '?'}/mo. Planning model only.`);
+  return c.json({ ok: true, econ: rep.econ, model, brief: rep.brief });
+});
+
+// 🚨 SILENT-FAILURE ALARM (8/19/2026, daily noon cron) — the most expensive
+// failure in ad management is a campaign that spends while the funnel is
+// broken, because nothing looks wrong until the invoice arrives. For every
+// client whose campaign is live, this asks Google Analytics whether ANY key
+// event fired in the last 7 days. Zero is the alarm.
+async function adsSilentFailure(env) {
+  const db = env.DB;
+  const settings = await getSettings(db);
+  const keys = Object.keys(settings).filter((k) => /^ads_\d+$/.test(k));
+  const alarms = [];
+  if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET || !env.GOOGLE_REFRESH_TOKEN) return 0;
+  let token = '';
+  try {
+    const tr = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET, refresh_token: env.GOOGLE_REFRESH_TOKEN, grant_type: 'refresh_token' }),
+    });
+    token = (await tr.json()).access_token || '';
+  } catch {}
+  if (!token) return 0;
+  for (const k of keys) {
+    let rep = {}; try { rep = JSON.parse(settings[k] || '{}'); } catch {}
+    if (!rep.live_at || !rep.ga4_property) continue;          // only campaigns she has switched on
+    const id = Number(k.slice(4));
+    const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+    if (!client) continue;
+    // a campaign enabled less than 8 days ago has not had time to prove anything
+    if (Date.now() - Date.parse(rep.live_at) < 8 * 86400000) continue;
+    try {
+      const rr = await fetch(`https://analyticsdata.googleapis.com/v1beta/properties/${encodeURIComponent(rep.ga4_property)}:runReport`, {
+        method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dateRanges: [{ startDate: '7daysAgo', endDate: 'today' }], metrics: [{ name: 'sessions' }, { name: 'keyEvents' }] }),
+      });
+      if (!rr.ok) continue;
+      const d = await rr.json();
+      const m = (d.rows && d.rows[0] && d.rows[0].metricValues) || [];
+      const sessions = Number((m[0] || {}).value || 0);
+      const events = Number((m[1] || {}).value || 0);
+      const biz = client.business_name || client.name || client.email;
+      if (sessions >= 25 && events === 0) {
+        alarms.push({ id, biz, url: rep.url || '', sessions,
+          why: 'the campaign is live and ' + sessions + ' people reached the page in 7 days, but NOT ONE key event fired' });
+        await logEvent(db, id, 'error', `\u{1F6A8} Silent failure: ${sessions} sessions in 7 days on ${rep.url} and zero key events. Either tracking broke or the page converts nobody.`);
+      } else if (sessions === 0) {
+        alarms.push({ id, biz, url: rep.url || '', sessions: 0,
+          why: 'the campaign is marked live but Google Analytics recorded ZERO sessions in 7 days — the ad is not running, or the tag is gone' });
+        await logEvent(db, id, 'error', `\u{1F6A8} Silent failure: campaign marked live but zero sessions in 7 days on ${rep.url}.`);
+      }
+    } catch {}
+  }
+  if (alarms.length) {
+    const html = '<p>Money may be going out with nothing coming back. ' + alarms.length + ' live campaign(s) tripped the silent-failure check:</p>' +
+      alarms.map((a) => '<p><b>' + a.biz + '</b><br>' + a.why + '<br><a href="' + a.url + '">' + a.url + '</a></p>').join('') +
+      '<p>First three things to check, in order: (1) is the tracking tag still in the GoHighLevel head code, (2) are the GA4 key events still imported as conversions in Google Ads, (3) has the funnel URL changed. Open the client in Mission Control and hit Re-check.</p>' +
+      '<p style="color:#B42318"><b>Until it is resolved, consider pausing spend in Google Ads.</b> Mission Control never pauses a campaign for you.</p>';
+    await notifyOwner(env, settings, '\u{1F6A8} ' + alarms.length + ' live campaign(s) spending with nothing to show', html);
+  }
+  return alarms.length;
+}
 
 // 📋 HEAD CODE FOR GOHIGHLEVEL (8/19/2026) — the exact tags she pastes, filled
 // in with THIS client's real IDs. Two ways, and never both at once:
@@ -6210,6 +6681,9 @@ export default {
       ));
       ctx.waitUntil(adsWatchdog(env).catch((e) =>
         logEvent(env.DB, null, 'error', `Ads watchdog failed: ${e.message}`)
+      ));
+      ctx.waitUntil(adsSilentFailure(env).catch((e) =>
+        logEvent(env.DB, null, 'error', `Silent-failure check failed: ${e.message}`)
       ));
       ctx.waitUntil(gscRankSnapshot(env).catch((e) =>
         logEvent(env.DB, null, 'error', `Rankings snapshot failed: ${e.message}`)

@@ -1538,6 +1538,7 @@ async function lpInject(id){
       h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsTabConnect(' + c.id + ', this)">Re-check</button>';
       h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsHeadCode(' + c.id + ')">&#129513; Head code</button>';
       h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px"' + (rep.brief ? '' : ' disabled title="Run Set it all up first"') + ' onclick="adsSheet(' + c.id + ')">&#128203; Build sheet</button>';
+      h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" title="Average ticket, close rate, target clients — the sheet back-solves the budget from these." onclick="adsEcon(' + c.id + ')">&#128181; Economics' + ((rep.econ && rep.econ.target_clients) ? ' &#10003;' : '') + '</button>';
       if (rep.track && !rep.live_at) h += '<button class="btn btn-green" style="font-size:11.5px;padding:7px 12px" onclick="adsGoLive(' + c.id + ', this)">I enabled it</button>';
       if (link) h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsAccountPrompt(' + c.id + ')">Edit account link</button>';
       h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsIdsPrompt(' + c.id + ')">&#127991; Tracking IDs</button>';
@@ -1782,6 +1783,82 @@ async function lpInject(id){
       if (d && d.error) { toast('⚠ ' + d.error); return; }
       modal('Head code for GoHighLevel — ' + (d.biz || ''), headCodeHtml(d, id));
     } catch (e) { toast('⚠ Could not build the head code'); }
+  };
+
+  // ══ ADS ECONOMICS — back-solve the budget from the client's own numbers ══
+  window.adsEcon = async function (id) {
+    var rep = {}; try { rep = JSON.parse((STATE.settings || {})['ads_' + id] || '{}'); } catch (e) {}
+    var e = rep.econ || {};
+    var f = function (lbl, key, val, hint, suffix) {
+      return '<label style="display:block;margin-top:12px">' +
+        '<div style="font-size:12.5px;font-weight:600;color:var(--navy,#0B1D33)">' + lbl + '</div>' +
+        '<div style="font-size:11.5px;color:var(--faint,#8A94A6);margin-bottom:4px">' + hint + '</div>' +
+        '<input id="ec_' + key + '" type="number" step="any" value="' + (val === undefined || val === null || val === 0 ? '' : val) + '" ' +
+        'style="width:160px;font-size:13px;padding:7px 10px;border:1px solid var(--line,#E6E9EF);border-radius:8px;background:#FBFCFE">' +
+        (suffix ? '<span style="font-size:12px;color:var(--faint,#8A94A6);margin-left:8px">' + suffix + '</span>' : '') +
+        '</label>';
+    };
+    var body = '<p style="font-size:12.5px;color:var(--muted,#5D6B7E);margin:0 0 4px">These six numbers back-solve the budget, the most you can pay per lead, and whether the math works at all. They are internal planning figures — they never appear in anything a client sees, and they are not a promise.</p>' +
+      f('Average value of a new client', 'ticket', e.ticket, 'What one new client is worth in revenue, first visit plus what they typically come back for.', 'dollars') +
+      f('Gross margin', 'margin', e.margin ? Math.round(e.margin * 100) : 60, 'What is left after the cost of delivering it. 60 is a reasonable default.', '%') +
+      f('Lead to client close rate', 'close_rate', e.close_rate ? Math.round(e.close_rate * 100) : 25, 'Of the people who enquire, how many actually book and pay.', '%') +
+      f('Target new clients per month', 'target_clients', e.target_clients, 'What the client is hoping for. Be honest here rather than optimistic.', 'clients') +
+      f('Expected cost per click', 'cpc', e.cpc, 'Use the HIGH end of the Keyword Planner range for their city, not the average.', 'dollars') +
+      f('Landing page conversion rate', 'lp_cvr', e.lp_cvr ? Math.round(e.lp_cvr * 100) : 8, 'Of the people who land on the page, how many enquire. 8 is a fair starting assumption.', '%') +
+      '<div style="margin-top:18px"><button class="btn btn-primary" style="font-size:12.5px" onclick="adsEconSave(' + id + ', this)">Save and rebuild the sheet</button></div>' +
+      '<div id="ecOut" style="margin-top:16px"></div>';
+    modal('Ads economics — what the numbers have to be', body);
+    if (rep.econ && rep.econ.target_clients) adsEconRender(rep.econ, null, id);
+  };
+
+  function adsEconRender(econ, model, id) {
+    var out = document.getElementById('ecOut'); if (!out) return;
+    if (!model) { out.innerHTML = '<div style="font-size:12px;color:var(--faint,#8A94A6)">Saved values loaded. Press save to recalculate.</div>'; return; }
+    var row = function (k, v, warn) {
+      return '<div style="display:flex;justify-content:space-between;gap:14px;padding:7px 0;border-bottom:1px solid var(--line,#E6E9EF)">' +
+        '<span style="font-size:13px;color:var(--muted,#5D6B7E)">' + k + '</span>' +
+        '<span style="font-size:13.5px;font-weight:600;color:' + (warn ? '#B42318' : 'var(--navy,#0B1D33)') + '">' + v + '</span></div>';
+    };
+    var h = '<div style="border:1px solid var(--line,#E6E9EF);border-radius:12px;padding:14px 16px">';
+    if (model.gross_per_client) h += row('Gross profit per new client', '$' + model.gross_per_client);
+    if (model.leads_needed) h += row('Leads needed per month', model.leads_needed);
+    if (model.max_cpl) h += row('Most you can pay per lead', '$' + model.max_cpl);
+    if (model.projected_cpl) h += row('Projected cost per lead', '$' + model.projected_cpl, model.headroom < 0);
+    if (model.monthly_budget) h += row('Budget the math implies', '$' + model.monthly_budget + '/mo  (~$' + model.daily_budget + '/day)');
+    if (model.floor_daily) h += row('Floor to learn anything', '$' + model.floor_daily + '/day');
+    if (model.headroom !== undefined && model.headroom !== null) {
+      h += row('Headroom per lead', (model.headroom >= 0 ? '$' + model.headroom : '-$' + Math.abs(model.headroom)), model.headroom < 0);
+    }
+    h += '</div>';
+    if (model.headroom < 0) {
+      h += '<div style="margin-top:12px;background:#FEF3F2;border:1px solid #FDA29B;border-radius:10px;padding:11px 14px;font-size:12.5px;color:#B42318">' +
+        '<b>The math does not work at this cost per click.</b> A lead would cost more than it earns. Three real fixes: raise what a client is worth (packages, memberships), raise the landing page conversion rate, or narrow to cheaper, higher-intent keywords. Do not solve it by spending more.</div>';
+    }
+    if (model.smart_bidding_ok === false) {
+      h += '<div style="margin-top:12px;background:#FFFAEB;border:1px solid #FEC84B;border-radius:10px;padding:11px 14px;font-size:12.5px;color:#B54708">' +
+        'Under 15 leads a month, Google\'s bidding cannot learn. Either raise the budget or optimise to a softer conversion first.</div>';
+    }
+    h += '<p style="font-size:11.5px;color:var(--faint,#8A94A6);margin-top:12px">Planning model, not a forecast and not a promise. Ad results are never guaranteeable — this tells you what would have to be true, and the silent-failure check tells you when reality drifts from it.</p>';
+    out.innerHTML = h;
+  }
+
+  window.adsEconSave = async function (id, btn) {
+    var g = function (k) { var el = document.getElementById('ec_' + k); return el ? el.value : ''; };
+    btn.disabled = true; btn.textContent = 'Saving…';
+    try {
+      var r = await api('/api/clients/' + id + '/ads-economics', { method: 'POST', body: JSON.stringify({
+        ticket: g('ticket'), margin: g('margin'), close_rate: g('close_rate'),
+        target_clients: g('target_clients'), cpc: g('cpc'), lp_cvr: g('lp_cvr') }) });
+      if (r && r.error) { toast('⚠ ' + r.error); }
+      else {
+        var rp = {}; try { rp = JSON.parse((STATE.settings || {})['ads_' + id] || '{}'); } catch (e) {}
+        rp.econ = r.econ; rp.brief = r.brief; STATE.settings['ads_' + id] = JSON.stringify(rp);
+        adsEconRender(r.econ, r.model, id);
+        toast('Numbers saved — the build sheet rebuilt around them');
+        try { renderAdsView(); } catch (e) {}
+      }
+    } catch (e) { toast('⚠ Could not save, try again'); }
+    btn.disabled = false; btn.textContent = 'Save and rebuild the sheet';
   };
 
   window.clarityPrompt = async function (id) {
