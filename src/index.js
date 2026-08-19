@@ -2750,8 +2750,11 @@ app.get('/manifest.json', (c) => c.json({
 app.get('/icon-192.png', (c) => c.body(b64bytes(ICON192), 200, { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=604800' }));
 app.get('/icon-512.png', (c) => c.body(b64bytes(ICON512), 200, { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=604800' }));
 
-// Everything below requires a session
+// Everything below requires a session — EXCEPT client-facing tokened links:
+// /exit/:id/:token (the offboarding download) carries its own HMAC token check
+// inside the route, so departing clients need no login to get their files.
 app.use('*', async (c, next) => {
+  if (c.req.path.startsWith('/exit/')) return next();
   if (await checkSession(c.env, c.req.header('Cookie'))) return next();
   if (c.req.path.startsWith('/api/')) return c.json({ error: 'unauthorized' }, 401);
   return c.html(loginHtml.replace('<!--ERROR-->', ''));
