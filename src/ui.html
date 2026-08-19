@@ -271,6 +271,11 @@
     <input id="proBiz" type="text" placeholder="business name">
     <input id="proCity" type="text" placeholder="city, state" style="max-width:150px">
     <button class="btn btn-ghost" id="proBtn" onclick="addProspect()" title="Builds them a real demo homepage before you've ever talked — send the link as your pitch.">Build demo →</button>
+    <span style="border-left:1px solid var(--line);align-self:stretch;margin:0 4px;"></span>
+    <b>📣 Ads-only client:</b>
+    <input id="adsEmail" type="email" placeholder="client email address">
+    <input id="adsName" type="text" placeholder="name (optional)" style="max-width:170px">
+    <button class="btn btn-ghost" id="adsBtn" onclick="addAdsClient()" title="They want Google Ads management only — no website build. Sends Intake 1 (their business details drive the keyword research) and puts them in the Ads lane.">Start ads client →</button>
   </div>
 
   <div id="moneyStrip"></div>
@@ -360,6 +365,8 @@ const STAGES = {
   intake2_done:   { label: '✓ Intake 2 done',     bg:'#ccfbf1', fg:'#0f766e' },
   generating:     { label: '⚙ Building site…',    bg:'#fce7f3', fg:'#be185d' },
   preview_ready:  { label: '★ Preview ready',     bg:'#dcfce7', fg:'#15803d' },
+  ads_setup:      { label: '📣 Ads — setting up',  bg:'#FFF4E5', fg:'#B54708' },
+  ads_live:       { label: '📣 Ads — running',     bg:'#0B1D33', fg:'#C7A86B' },
   live:           { label: '● Live',              bg:'#071B33', fg:'#ffffff' },
   archived:       { label: 'Archived',            bg:'#f1f5f9', fg:'#94a3b8' },
 };
@@ -444,9 +451,10 @@ function renderOverview() {
   }
 }
 
-const BOARD_COLS = ['New', 'Intake 1', 'Call', 'Closing', 'Paid', 'Building', 'Preview', 'Live'];
+const BOARD_COLS = ['New', 'Intake 1', 'Call', 'Closing', 'Paid', 'Building', 'Preview', 'Live', 'Ads'];
 function colFor(c) {
   let b = {}; try { b = JSON.parse(c.billing || '{}'); } catch {}
+  if (c.stage === 'ads_setup' || c.stage === 'ads_live') return 'Ads';
   if (c.stage === 'prospect') return 'New';
   if (c.stage === 'live') return 'Live';
   if (c.stage === 'preview_ready') return 'Preview';
@@ -576,6 +584,23 @@ async function addClient() {
   document.getElementById('newEmail').value = ''; document.getElementById('newName').value = '';
   toast('Intake 1 sent to ' + email + ' ✓');
   refresh();
+}
+
+async function addAdsClient() {
+  const email = document.getElementById('adsEmail').value.trim();
+  const name = document.getElementById('adsName').value.trim();
+  if (!email) return toast('Enter their email first');
+  const btn = document.getElementById('adsBtn'); btn.disabled = true;
+  try {
+    const r = await api('/api/clients', { method: 'POST', body: JSON.stringify({ email, name }) });
+    if (r.error) { toast('⚠ ' + r.error); btn.disabled = false; return; }
+    const e = await api('/api/clients/' + r.id + '/ads-enroll', { method: 'POST', body: JSON.stringify({ mode: 'ads_only' }) });
+    if (e.error) { toast('⚠ ' + e.error); btn.disabled = false; return; }
+    document.getElementById('adsEmail').value = ''; document.getElementById('adsName').value = '';
+    toast('Ads client started 📣 — Intake 1 sent, they are in the Ads lane');
+    refresh();
+  } catch (err) { toast('⚠ Could not start that one, try again'); }
+  btn.disabled = false;
 }
 
 async function sendIntake2(id, btn) {
@@ -1244,6 +1269,26 @@ async function lpInject(id){
     var when = rep && rep.at ? new Date(rep.at).toLocaleString('en-US', { timeZone: 'America/Chicago', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '';
     var h = '<div style="border-top:1px solid var(--line);margin-top:18px;padding-top:16px">';
     h += '<div style="font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);font-weight:700;margin-bottom:10px">&#128640; Ads Engine <span style="font-weight:400;letter-spacing:0;text-transform:none">&middot; your eyes only</span></div>';
+    var track = rep && rep.track ? rep.track : '';
+    if (!track) {
+      h += '<div style="background:#F7F9FC;border:1px solid var(--line);border-radius:10px;padding:12px;margin-bottom:12px">';
+      h += '<div style="font-size:12.5px;color:var(--muted);margin-bottom:9px">Not on ads management. $249/mo, plus whatever they spend with Google (their card pays Google directly).</div>';
+      h += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
+      h += '<button class="btn btn-green" style="font-size:12.5px" onclick="adsEnroll(' + id + ', \'addon\', this)">&#43; Add ads to their website</button>';
+      h += '<button class="btn btn-ghost" style="font-size:12.5px" onclick="adsEnroll(' + id + ', \'ads_only\', this)" title="They are an ads-only client — no website build, no website invoices.">Ads only (no website)</button>';
+      h += '</div></div>';
+    } else {
+      var since = rep.enrolled_at ? new Date(rep.enrolled_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '';
+      var lbl = track === 'ads_only' ? 'ADS ONLY &middot; no website' : 'ADS ADD-ON &middot; alongside their website';
+      h += '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:#0B1D33;color:#fff;border-radius:10px;padding:10px 13px;margin-bottom:12px">';
+      h += '<span style="font-family:var(--font-mono);font-size:10px;letter-spacing:.16em;color:#C7A86B">' + lbl + '</span>';
+      h += '<span style="font-size:12px;color:#B8C4D4">$' + (rep.monthly || 249) + '/mo' + (since ? ' &middot; since ' + since : '') + '</span>';
+      if (rep.live_at) h += '<span style="font-size:11px;color:#35D07F;font-weight:600">&#9679; CAMPAIGN RUNNING</span>';
+      h += '<span style="flex:1"></span>';
+      if (!rep.live_at) h += '<button class="btn btn-green" style="font-size:11.5px;padding:6px 11px" onclick="adsGoLive(' + id + ', this)" title="Click this after YOU enable the paused campaign inside Google Ads.">I enabled the campaign</button>';
+      h += '<button class="btn" style="font-size:11px;padding:6px 10px;background:rgba(255,255,255,.1);color:#B8C4D4;border:1px solid rgba(255,255,255,.2)" onclick="adsEnroll(' + id + ', \'cancel\', this)">Stop management</button>';
+      h += '</div>';
+    }
     h += '<div style="display:flex;gap:8px;margin-bottom:10px"><input id="adsUrl' + id + '" type="text" placeholder="Paste the landing page URL" value="' + (url ? url.replace(/"/g, '&quot;') : '') + '" style="flex:1;font-size:13px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:#fff">';
     h += '<button class="btn btn-primary" style="white-space:nowrap" onclick="adsConnect(' + id + ', this)">Connect</button></div>';
     h += '<div id="adsLights' + id + '" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">' + LKEYS.map(function (p) { return light(rep, p[0], p[1]); }).join('') + '</div>';
@@ -1324,6 +1369,35 @@ async function lpInject(id){
   var _rb = renderBoard;
   renderBoard = function () { _rb(); try { decorateAds(); } catch (e) {} };
   try { decorateAds(); } catch (e) {}
+  window.adsEnroll = async function (id, mode, btn) {
+    if (mode === 'cancel' && !confirm('Stop Google Ads management for this client? The campaign itself keeps running in Google until you pause it there.')) return;
+    btn.disabled = true;
+    try {
+      var r = await api('/api/clients/' + id + '/ads-enroll', { method: 'POST', body: JSON.stringify({ mode: mode }) });
+      if (r && r.error) { toast('⚠ ' + r.error); btn.disabled = false; return; }
+      try {
+        var rep = JSON.parse(STATE.settings['ads_' + id] || '{}');
+        if (mode === 'cancel') { delete rep.track; delete rep.monthly; } else { rep.track = mode; rep.monthly = 249; rep.enrolled_at = rep.enrolled_at || new Date().toISOString(); }
+        STATE.settings['ads_' + id] = JSON.stringify(rep);
+      } catch (e) {}
+      toast(mode === 'cancel' ? 'Ads management stopped' : (mode === 'ads_only' ? 'Ads-only client 📣' : 'Ads management added 📣'));
+      var wrap = document.getElementById('adsEngine' + id);
+      if (wrap) wrap.innerHTML = panelHtml(id);
+      refresh();
+    } catch (e) { toast('⚠ Could not save, try again'); btn.disabled = false; }
+  };
+  window.adsGoLive = async function (id, btn) {
+    btn.disabled = true;
+    try {
+      var r = await api('/api/clients/' + id + '/ads-live', { method: 'POST' });
+      if (r && r.error) { toast('⚠ ' + r.error); btn.disabled = false; return; }
+      try { var rep = JSON.parse(STATE.settings['ads_' + id] || '{}'); rep.live_at = new Date().toISOString(); STATE.settings['ads_' + id] = JSON.stringify(rep); } catch (e) {}
+      toast('Campaign marked live 🚀 — watchdog is on it daily');
+      var wrap = document.getElementById('adsEngine' + id);
+      if (wrap) wrap.innerHTML = panelHtml(id);
+      refresh();
+    } catch (e) { toast('⚠ Could not save, try again'); btn.disabled = false; }
+  };
   window.gscSave = async function (id, btn) {
     var inp = document.getElementById('gscProp' + id);
     var prop = inp ? inp.value.trim() : '';

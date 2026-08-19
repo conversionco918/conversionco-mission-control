@@ -5478,6 +5478,68 @@ app.post('/api/clients/:id/ga4-create', async (c) => {
   } catch (e) { return c.json({ pending: 'error', note: String(e && e.message || e).slice(0, 140) }); }
 });
 
+
+// ════════════════════════════════════════════════════════════════════════════
+// 📣 ADS ENROLLMENT (8/19/2026) — two ways a client can be on Google Ads:
+//   • "ads_only"  — they never wanted a website from us, just ad management.
+//     They still get Intake 1 (business details drive the keyword research),
+//     but they never enter the build queue and never get a website invoice.
+//   • "addon"     — an existing website client adds ads management later.
+//     Their website stage is untouched; the ads track runs alongside it.
+// Enrollment lives in settings ads_<id> so one client card holds both tracks.
+app.post('/api/clients/:id/ads-enroll', async (c) => {
+  const id = Number(c.req.param('id')) || 0;
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'no such client' }, 404);
+  let body = {}; try { body = await c.req.json(); } catch {}
+  const mode = String(body.mode || '').trim();
+  if (!['ads_only', 'addon', 'cancel'].includes(mode)) return c.json({ error: 'mode must be ads_only, addon, or cancel' }, 400);
+  const settings = await getSettings(db);
+  let rep = {}; try { rep = JSON.parse(settings['ads_' + id] || '{}'); } catch {}
+  const biz = client.business_name || client.name || client.email;
+
+  if (mode === 'cancel') {
+    delete rep.track; delete rep.monthly; rep.cancelled_at = new Date().toISOString();
+    await setSetting(db, 'ads_' + id, JSON.stringify(rep));
+    await logEvent(db, id, 'ads_unenrolled', `📣 Google Ads management stopped for ${biz} — the campaign itself stays exactly as it is in Google until you pause it there.`);
+    return c.json({ ok: true, track: '' });
+  }
+
+  rep.track = mode;
+  rep.monthly = 249;
+  rep.enrolled_at = rep.enrolled_at || new Date().toISOString();
+  delete rep.cancelled_at;
+  await setSetting(db, 'ads_' + id, JSON.stringify(rep));
+
+  // ads-only clients get their own lane on the board so they never look like a
+  // stalled website build. Existing website clients keep their stage untouched.
+  if (mode === 'ads_only' && !['ads_live', 'archived'].includes(client.stage)) {
+    await touchClient(db, id, { stage: 'ads_setup' });
+  }
+  await logEvent(db, id, 'ads_enrolled', mode === 'ads_only'
+    ? `📣 ${biz} signed up for Google Ads management ($249/mo) — ads only, no website build. Next: paste their landing page and Connect.`
+    : `📣 ${biz} added Google Ads management ($249/mo) on top of their website. Next: paste the landing page and Connect.`);
+  return c.json({ ok: true, track: mode, monthly: 249 });
+});
+
+// Campaign went live (she enabled the paused build in Google Ads). Ads-only
+// clients move to the running lane; website clients keep their own stage.
+app.post('/api/clients/:id/ads-live', async (c) => {
+  const id = Number(c.req.param('id')) || 0;
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'no such client' }, 404);
+  const settings = await getSettings(db);
+  let rep = {}; try { rep = JSON.parse(settings['ads_' + id] || '{}'); } catch {}
+  if (!rep.track) return c.json({ error: 'Enroll them in ads management first.' }, 400);
+  rep.live_at = new Date().toISOString();
+  await setSetting(db, 'ads_' + id, JSON.stringify(rep));
+  if (rep.track === 'ads_only' && client.stage !== 'archived') await touchClient(db, id, { stage: 'ads_live' });
+  await logEvent(db, id, 'ads_campaign_live', `🚀 Campaign ENABLED for ${client.business_name || client.name || client.email} — spend is live. The watchdog checks tracking daily and flags anything that breaks.`);
+  return c.json({ ok: true });
+});
+
 export default {
   fetch: app.fetch,
   async scheduled(event, env, ctx) {
