@@ -2641,6 +2641,11 @@ app.get('/t/:id/t.js', async (c) => {
   //     a normal submit listener never sees them. We listen for the postMessage
   //     those iframes send to the parent page and fire the event from there.
   //   • ?qa=1 marks the visit internal so her own testing never counts as a lead
+  // ?mode=events — bind the key events ONLY, load nothing. Use this when the
+  // page already carries Google's own gtag and Microsoft's own Clarity tag, so
+  // nothing is loaded twice. fire() below already calls window.gtag / window.clarity
+  // if they exist, so the four key events still land in both tools.
+  const eventsOnly = String(c.req.query('mode') || '') === 'events';
   let ga4 = '', clar = '', gtm = '', aw = '';
   try {
     const s = await getSettings(c.env.DB);
@@ -2657,6 +2662,8 @@ app.get('/t/:id/t.js', async (c) => {
   js += "window.dataLayer=window.dataLayer||[];";
   // our own beacon — always on, even with no Google ids yet
   js += "var p=encodeURIComponent(location.pathname||'/');(new Image()).src='" + BASE_URL + "/t/" + id + "/p.gif?p='+p+'&r='+Date.now();";
+
+  if (eventsOnly) { ga4 = ''; clar = ''; gtm = ''; aw = ''; }
 
   if (gtm) {
     js += "(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':new Date().getTime(),event:'gtm.js'});";
@@ -6090,6 +6097,77 @@ app.get('/api/clients/:id/ads-brief', async (c) => {
   const fresh = c.req.query('fresh') === '1';
   if (fresh || !rep.brief) { rep.brief = adsBrief(client, rep); await setSetting(db, 'ads_' + id, JSON.stringify(rep)); }
   return c.json({ ok: true, brief: rep.brief, links: adsDeepLinks(rep, settings) });
+});
+
+// 📋 HEAD CODE FOR GOHIGHLEVEL (8/19/2026) — the exact tags she pastes, filled
+// in with THIS client's real IDs. Two ways, and never both at once:
+//   A) one tag  — our /t/<id>/t.js, which loads Google Analytics + Clarity and
+//      binds the four key events (including the GoHighLevel iframe bridge)
+//   B) native   — Google's own gtag + Microsoft's own Clarity tag, plus our
+//      events-only tag so calls/texts/forms/bookings still get counted
+// Pasting A and B together would double-count pageviews; the UI says so plainly.
+app.get('/api/clients/:id/head-code', async (c) => {
+  const id = Number(c.req.param('id')) || 0;
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'no such client' }, 404);
+  const settings = await getSettings(db);
+  let rep = {}; try { rep = JSON.parse(settings['ads_' + id] || '{}'); } catch {}
+  const biz = client.business_name || client.name || client.email || ('Client ' + id);
+  const ga4 = String(rep.ga4_measurement || '').trim();
+  const clar = String(rep.clarity_id || '').trim();
+  const gtm = String(rep.gtm_id || '').trim();
+  const aw = String(rep.aw_id || '').trim();
+  const S = '<' + 'script';
+  const E = '<' + '/script>';
+
+  const one = `<!-- ConversionCo tracking for ${biz} -->\n` +
+    `<!-- Google Analytics + Clarity + call, text, form and booking events -->\n` +
+    `${S} defer src="${BASE_URL}/t/${id}/t.js">${E}`;
+
+  const eventsTag = `<!-- ConversionCo key events (call, text, form, booking) -->\n` +
+    `${S} defer src="${BASE_URL}/t/${id}/t.js?mode=events">${E}`;
+
+  const ga4Tag = ga4
+    ? `<!-- Google tag (gtag.js) -->\n${S} async src="https://www.googletagmanager.com/gtag/js?id=${ga4}">${E}\n` +
+      `${S}>\n  window.dataLayer = window.dataLayer || [];\n  function gtag(){dataLayer.push(arguments);}\n` +
+      `  gtag('js', new Date());\n  gtag('config', '${ga4}');\n${E}`
+    : '';
+
+  const clarityTag = clar
+    ? `<!-- Microsoft Clarity -->\n${S} type="text/javascript">\n  (function(c,l,a,r,i,t,y){\n` +
+      `      c[a]=c[a]||function(){(c[a].q=c[a].q||[]).push(arguments)};\n` +
+      `      t=l.createElement(r);t.async=1;t.src="https://www.clarity.ms/tag/"+i;\n` +
+      `      y=l.getElementsByTagName(r)[0];y.parentNode.insertBefore(t,y);\n` +
+      `  })(window, document, "clarity", "script", "${clar}");\n${E}`
+    : '';
+
+  const gtmTag = gtm
+    ? `<!-- Google Tag Manager -->\n${S}>(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':\n` +
+      `new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],\n` +
+      `j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=\n` +
+      `'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);\n` +
+      `})(window,document,'script','dataLayer','${gtm}');${E}`
+    : '';
+
+  const missing = [];
+  if (!ga4) missing.push({ k: 'ga4', label: 'Google Analytics', how: 'Press "Set it all up" — Mission Control creates the property and fills this in. Or paste an existing G- ID under Tracking IDs.' });
+  if (!clar) missing.push({ k: 'clarity', label: 'Microsoft Clarity', how: 'clarity.microsoft.com → sign in → New project → name it "' + biz + '", site type Website, paste the landing page URL → the project ID is in Settings → Overview. Paste it under Tracking IDs and this tag fills in.' });
+
+  return c.json({
+    ok: true, biz, ga4, clarity: clar, gtm, aw,
+    one, eventsTag, ga4Tag, clarityTag, gtmTag,
+    url: rep.url || '',
+    trackerOnPage: !!(rep.checks && rep.checks.tracker && rep.checks.tracker.ok),
+    missing,
+    where: [
+      'In GoHighLevel, open the funnel: Sites → Funnels → click the funnel.',
+      'Click the gear / Settings on that funnel → Tracking Code.',
+      'Paste into HEAD TRACKING CODE (not Body). Save.',
+      'To cover every funnel and site in the sub-account instead: Settings → Tracking Code → Head.',
+      'Publish or re-save the funnel, open the live URL once, then hit Re-check here.',
+    ],
+  });
 });
 
 // Portal analytics feed — the client's own numbers, on demand (GA4 is a live

@@ -1536,7 +1536,7 @@ async function lpInject(id){
       h += '<input id="adsTabUrl' + c.id + '" type="text" placeholder="landing page URL" value="' + (rep.url ? esc(rep.url) : '') + '" style="flex:1;min-width:220px;font-size:12.5px;padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:#FBFCFE">';
       h += '<button class="btn btn-primary" style="font-size:11.5px;padding:7px 12px" title="One paste: verify the page, create their Google Analytics, register the key events, turn on their portal card, write the build sheet, and open Google Ads." onclick="adsProvision(' + c.id + ', this)">&#9889; Set it all up</button>';
       h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsTabConnect(' + c.id + ', this)">Re-check</button>';
-      h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsCopySnippet(' + c.id + ')">&#128203; Tracking code</button>';
+      h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsHeadCode(' + c.id + ')">&#129513; Head code</button>';
       h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px"' + (rep.brief ? '' : ' disabled title="Run Set it all up first"') + ' onclick="adsSheet(' + c.id + ')">&#128203; Build sheet</button>';
       if (rep.track && !rep.live_at) h += '<button class="btn btn-green" style="font-size:11.5px;padding:7px 12px" onclick="adsGoLive(' + c.id + ', this)">I enabled it</button>';
       if (link) h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsAccountPrompt(' + c.id + ')">Edit account link</button>';
@@ -1690,10 +1690,22 @@ async function lpInject(id){
           warn += '<div style="background:#EFF4FF;border:1px solid #B2CCFF;border-radius:10px;padding:12px 14px;font-size:12.5px;margin-bottom:14px">' +
             'Google Analytics could not be created automatically (' + esc(r.ga4.pending) + '). Create the property by hand and paste the G- ID with <b>Tracking IDs</b> — the snippet picks it up within 5 minutes with no re-paste.</div>';
         }
-        modal('Ads setup — ' + (url.replace(/^https?:\/\//, '').slice(0, 44)),
+        var m = modal('Ads setup — ' + (url.replace(/^https?:\/\//, '').slice(0, 44)),
           warn + stepsHtml(r.steps) + linksHtml(r.links || {}, id) +
           '<p style="font-size:11.5px;color:var(--faint,#8A94A6);margin:10px 0 0">Mission Control never creates or enables an ad. It sets up the measurement, writes the sheet, and opens the door — you build the campaign and turn it on.</p>' +
+          '<div id="ccHead" style="margin-top:22px;padding-top:18px;border-top:2px solid var(--line,#E6E9EF)">' +
+          '<div style="font-size:13px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--navy,#0B1D33);margin-bottom:2px">Head code for GoHighLevel</div>' +
+          '<div style="font-size:12px;color:var(--faint,#8A94A6)">loading the exact tags for this client…</div></div>' +
           sheetHtml(r.brief));
+        // the exact tags, filled in with THIS client's real IDs — right here, the
+        // moment the page is connected, so she never has to go hunting for them
+        try {
+          var hc = await api('/api/clients/' + id + '/head-code');
+          var box = document.getElementById('ccHead');
+          if (box && hc && !hc.error) {
+            box.innerHTML = '<div style="font-size:13px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--navy,#0B1D33)">Head code for GoHighLevel</div>' + headCodeHtml(hc, id);
+          }
+        } catch (e) {}
         toast('Setup done ⚡');
         try { renderAdsView(); } catch (e) {}
       }
@@ -1707,6 +1719,84 @@ async function lpInject(id){
       if (r && r.error) { toast('⚠ ' + r.error); return; }
       modal('Campaign build sheet', linksHtml(r.links || {}, id) + sheetHtml(r.brief));
     } catch (e) { toast('⚠ Could not load the sheet'); }
+  };
+
+  // ══ HEAD CODE FOR GOHIGHLEVEL ═══════════════════════════════════════════
+  var CODEN = 0;
+  function codeBlock(title, code, note) {
+    if (!code) return '';
+    var cid = 'cc_code_' + (++CODEN);
+    return '<div style="margin-top:14px">' +
+      '<div style="display:flex;align-items:center;gap:10px">' +
+      '<div style="font-size:11.5px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--navy,#0B1D33)">' + esc(title) + '</div>' +
+      '<button class="btn btn-ghost" style="font-size:11px;padding:4px 9px" onclick="ccCopyEl(this,\'' + cid + '\')">&#128203; Copy</button></div>' +
+      (note ? '<div style="font-size:11.5px;color:var(--faint,#8A94A6);margin-top:3px">' + note + '</div>' : '') +
+      '<pre id="' + cid + '" style="background:#0B1D33;color:#D8E2EF;font-family:var(--font-mono,ui-monospace,monospace);font-size:11px;line-height:1.5;padding:12px 14px;border-radius:10px;margin-top:6px;overflow:auto;white-space:pre-wrap;word-break:break-word">' + esc(code) + '</pre></div>';
+  }
+  window.ccCopyEl = function (btn, elId) {
+    var el = document.getElementById(elId); if (!el) return;
+    var t = el.textContent;
+    if (navigator.clipboard) navigator.clipboard.writeText(t);
+    else { var ta = document.createElement('textarea'); ta.value = t; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); }
+    btn.textContent = 'Copied ✓'; setTimeout(function () { btn.innerHTML = '&#128203; Copy'; }, 1600);
+  };
+
+  function headCodeHtml(d, id) {
+    var h = '';
+    if (d.trackerOnPage) {
+      h += '<div style="background:#ECFDF3;border:1px solid #6CE9A6;border-radius:10px;padding:11px 14px;font-size:12.5px;margin-bottom:6px">' +
+        '&#10003; The tag is already on this page &mdash; nothing to paste unless you are switching methods.</div>';
+    }
+    h += '<div style="font-size:12.5px;color:var(--navy,#0B1D33);margin:4px 0 2px"><b>Where this goes in GoHighLevel</b></div>' +
+      '<ol style="font-size:12.5px;color:var(--muted,#5D6B7E);margin:4px 0 2px;padding-left:20px;line-height:1.65">' +
+      (d.where || []).map(function (w) { return '<li>' + esc(w) + '</li>'; }).join('') + '</ol>';
+
+    h += '<div style="margin-top:16px;padding:12px 14px;border:1.5px solid var(--gold,#C7A86B);border-radius:12px">' +
+      '<div style="font-size:13px;font-weight:700;color:var(--navy,#0B1D33)">Option A &mdash; one tag, does everything <span style="font-weight:500;color:var(--faint,#8A94A6)">(recommended)</span></div>' +
+      '<div style="font-size:12px;color:var(--muted,#5D6B7E);margin-top:3px">Loads Google Analytics' + (d.clarity ? ' and Clarity' : '') +
+      ', and binds call, text, form and booking events &mdash; including inside GoHighLevel&rsquo;s form and calendar iframes, which a plain tag cannot see. Change an ID here later and every page updates within five minutes with no re-paste.</div>' +
+      codeBlock('Paste into Head Tracking Code', d.one) + '</div>';
+
+    h += '<div style="margin-top:16px;padding:12px 14px;border:1px solid var(--line,#E6E9EF);border-radius:12px">' +
+      '<div style="font-size:13px;font-weight:700;color:var(--navy,#0B1D33)">Option B &mdash; Google&rsquo;s and Microsoft&rsquo;s own tags</div>' +
+      '<div style="font-size:12px;color:var(--muted,#5D6B7E);margin-top:3px">Use this if you want the native tags on the page. Paste all three blocks &mdash; the third one binds the key events without loading anything twice.</div>';
+    h += d.ga4Tag ? codeBlock('1 · Google Analytics (' + d.ga4 + ')', d.ga4Tag) :
+      '<div style="margin-top:12px;font-size:12.5px;color:#B54708;background:#FFFAEB;border:1px solid #FEC84B;border-radius:10px;padding:10px 12px">No Google Analytics ID yet &mdash; press <b>&#9889; Set it all up</b> and Mission Control creates the property.</div>';
+    h += d.clarityTag ? codeBlock('2 · Microsoft Clarity (' + d.clarity + ')', d.clarityTag) :
+      '<div style="margin-top:12px;font-size:12.5px;background:#EFF4FF;border:1px solid #B2CCFF;border-radius:10px;padding:10px 12px">' +
+      '<b>Clarity needs one sign-in from you.</b><br>clarity.microsoft.com &rarr; New project &rarr; name it &ldquo;' + esc(d.biz || '') + '&rdquo;, site type Website, paste the landing page URL. The project ID is in Settings &rarr; Overview.' +
+      '<div style="margin-top:8px"><button class="btn btn-primary" style="font-size:11.5px;padding:6px 11px" onclick="clarityPrompt(' + id + ')">Paste the Clarity ID</button>' +
+      ' <a class="btn btn-ghost" style="font-size:11.5px;padding:6px 11px;text-decoration:none" href="https://clarity.microsoft.com/projects" target="_blank" rel="noopener">Open Clarity &#8599;</a></div></div>';
+    h += codeBlock('3 · ConversionCo key events', d.eventsTag, 'Required with Option B &mdash; this is what counts calls, texts, forms and bookings.');
+    h += '</div>';
+
+    h += '<div style="margin-top:14px;background:#FEF3F2;border:1px solid #FDA29B;border-radius:10px;padding:10px 13px;font-size:12.5px;color:#B42318">' +
+      '<b>Pick one option, not both.</b> Pasting Option A and Option B together loads Google Analytics twice and every visit gets counted twice.</div>';
+    if (d.gtmTag) h += codeBlock('Google Tag Manager (' + d.gtm + ')', d.gtmTag, 'Only if this client uses their own GTM container.');
+    return h;
+  }
+
+  window.adsHeadCode = async function (id) {
+    try {
+      var d = await api('/api/clients/' + id + '/head-code');
+      if (d && d.error) { toast('⚠ ' + d.error); return; }
+      modal('Head code for GoHighLevel — ' + (d.biz || ''), headCodeHtml(d, id));
+    } catch (e) { toast('⚠ Could not build the head code'); }
+  };
+
+  window.clarityPrompt = async function (id) {
+    var cur = '';
+    try { cur = (JSON.parse((STATE.settings || {})['ads_' + id] || '{}')).clarity_id || ''; } catch (e) {}
+    var v = prompt('Microsoft Clarity project ID for this client.\n\nFind it at clarity.microsoft.com → your project → Settings → Overview.\nIt looks like: abcd1234ef', cur);
+    if (v === null) return;
+    try {
+      var r = await api('/api/clients/' + id + '/ads-ids', { method: 'POST', body: JSON.stringify({ clarity: v.trim() }) });
+      if (r && r.error) { toast('⚠ ' + r.error); return; }
+      var rp = {}; try { rp = JSON.parse((STATE.settings || {})['ads_' + id] || '{}'); } catch (e) {}
+      rp.clarity_id = r.clarity; STATE.settings['ads_' + id] = JSON.stringify(rp);
+      toast(v.trim() ? 'Clarity ID saved — the tag is filled in' : 'Clarity ID cleared');
+      window.adsHeadCode(id);
+    } catch (e) { toast('⚠ Could not save, try again'); }
   };
 })();
 </script>
