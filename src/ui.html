@@ -1935,14 +1935,16 @@ async function lpInject(id){
     if (!f) return '';
     var pill = function (t) { return '<span style="display:inline-block;background:#F2F4F7;color:var(--navy,#0B1D33);border-radius:99px;padding:3px 10px;font-size:12px;margin:0 5px 5px 0">' + esc(t) + '</span>'; };
     var h = '<p style="font-size:12.5px;color:var(--muted,#5D6B7E);margin:0 0 10px">Everything in the sheet below was built from this — not from a template. Read from ' +
-      ((f.pages || []).length) + ' page(s) of their own site.</p>';
+      ((f.pages || []).length) + ' page(s) of their own website, purely to learn what they sell.</p>' +
+      '<div style="background:#EFF4FF;border:1px solid #B2CCFF;border-radius:10px;padding:10px 13px;font-size:12.5px;margin-bottom:14px">' +
+      '<b>Their website is research, not a destination.</b> Every ad group points at the GoHighLevel landing page you built and pasted above.</div>';
     if ((f.offerings || []).length) h += '<div style="margin-bottom:10px"><div style="font-size:11.5px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--faint,#8A94A6);margin-bottom:5px">What they sell</div>' +
       f.offerings.map(function (o) { return pill(o.name + (o.price ? ' · $' + o.price : '')); }).join('') + '</div>';
     if ((f.memberships || []).length) h += '<div style="margin-bottom:10px"><div style="font-size:11.5px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--faint,#8A94A6);margin-bottom:5px">Memberships</div>' +
       f.memberships.map(function (o) { return pill(o.name + (o.price ? ' · $' + o.price : '')); }).join('') + '</div>';
     if ((f.cities || []).length) h += '<div style="margin-bottom:10px"><div style="font-size:11.5px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--faint,#8A94A6);margin-bottom:5px">Towns they serve</div>' +
       f.cities.map(function (c) { return pill(c.name + (c.page ? ' ↗' : '')); }).join('') +
-      '<div style="font-size:11.5px;color:var(--faint,#8A94A6);margin-top:2px">↗ means that town has its own landing page, so its ad group points straight at it.</div></div>';
+      '<div style="font-size:11.5px;color:var(--faint,#8A94A6);margin-top:2px">↗ means their website has a page for that town. That is how we found it — the ads still point at YOUR GoHighLevel landing page.</div></div>';
     if ((f.diffs || []).length) h += '<div style="margin-bottom:10px"><div style="font-size:11.5px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--faint,#8A94A6);margin-bottom:5px">How they are different</div>' +
       f.diffs.map(pill).join('') + '</div>';
     if ((f.trust || []).length) h += '<div style="margin-bottom:10px"><div style="font-size:11.5px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--faint,#8A94A6);margin-bottom:5px">Proof on the page</div>' +

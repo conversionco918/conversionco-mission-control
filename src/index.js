@@ -6421,7 +6421,7 @@ function adsPlan(client, rep, settings) {
   });
   if (problems.length) {
     groups.push({ name: 'Problem drips — ' + problems.slice(0, 4).map((o) => o.name).join(', '),
-      theme: 'why they search today', url: F.pageMap && F.pageMap.menu || entry,
+      theme: 'why they search today', url: entry,
       keywords: dripTerms(problems).concat(P.problem.flatMap((t) => [ex(t), ph(t)])) });
   } else {
     groups.push({ name: 'Problem and urgency', theme: 'why they search today', url: entry,
@@ -6429,21 +6429,21 @@ function adsPlan(client, rep, settings) {
   }
   if (outcomes.length) {
     groups.push({ name: 'Named drips — ' + outcomes.slice(0, 4).map((o) => o.name).join(', '),
-      theme: 'they already know what they want', url: F.pageMap && F.pageMap.menu || entry,
+      theme: 'they already know what they want', url: entry,
       keywords: dripTerms(outcomes) });
   }
   if (memberships.length) {
     const mt = memberships.flatMap((m) => [ex(m.name), ph(m.name + ' membership')]);
     groups.push({ name: 'Membership — ' + memberships.map((m) => m.name).join(', '),
       theme: 'recurring revenue, the cheapest lead you will buy',
-      url: (F.pageMap && F.pageMap.membership) || entry,
+      url: entry,
       keywords: mt.concat([ex(P.label + ' membership'), ph(P.label + ' membership'), cl ? ex(P.label + ' membership ' + cl) : ''].filter(Boolean)) });
   }
   // hyper-local ad groups, one per town that has its own landing page
   const cityGroups = (F.cities || []).filter((c) => c.page).slice(0, 5);
   for (const c of cityGroups) {
     const lc = c.name.toLowerCase();
-    groups.push({ name: 'City — ' + c.name, theme: 'hyper-local, its own landing page', url: c.page,
+    groups.push({ name: 'City — ' + c.name, theme: 'hyper-local keywords', url: entry,
       keywords: P.core.slice(0, 4).flatMap((t) => [ex(withCity(t, lc)), ph(withCity(t, lc))])
         .concat(problems.slice(0, 3).map((o) => ex(withCity(o.name.toLowerCase(), lc)))) });
   }
@@ -6500,6 +6500,10 @@ function adsPlan(client, rep, settings) {
   const plan = {
     v: 3, built: new Date().toISOString(), biz, city: city || cityFull, vertical: P.label,
     url: entry, derived, scannedPages: (F.pages || []).length,
+    // Every ad group sends traffic to the GoHighLevel landing page Tiffany built.
+    // The client's own website was read to learn WHAT THEY SELL — it is research,
+    // not a destination. Ads never point at a website page.
+    destination: 'All ad groups → the GoHighLevel landing page. The client website was read for research only.',
     facts: {
       offerings: offerings.map((o) => o.name + (o.price ? ' ($' + o.price + ')' : '')),
       memberships: memberships.map((m) => m.name + (m.price ? ' ($' + m.price + ')' : '')),
@@ -6585,8 +6589,13 @@ function adsPlan(client, rep, settings) {
   line('Landing page: ' + (entry || '(not connected)'));
   line('Built ' + plan.built.slice(0, 10) + (derived ? ' by reading ' + plan.scannedPages + ' page(s) of their own site.' : ' from the vertical library — no offerings were readable on the page.'));
   line('');
+  line('LANDING PAGE RULE: every ad group below points at YOUR GoHighLevel page,');
+  line('   ' + (entry || '(paste it first)'));
+  line('   Their own website was read to learn what they sell. It is research, never an ad destination.');
+  line('   Build a second GoHighLevel page for a town or a drip and point that ad group at it instead.');
+  line('');
   if (derived) {
-    line('0. WHAT WE READ OFF THEIR SITE — everything below is built from this');
+    line('0. WHAT WE READ OFF THEIR SITE — research only, but everything below is built from it');
     if (offerings.length) { line('   Offerings (' + offerings.length + '):'); for (const o of offerings) line('      • ' + o.name + (o.price ? '  $' + o.price : '')); }
     if (memberships.length) { line('   Memberships:'); for (const m of memberships) line('      • ' + m.name + (m.price ? '  $' + m.price : '')); }
     if (pageCities.length) line('   Towns they serve: ' + pageCities.join(', '));
@@ -6622,7 +6631,7 @@ function adsPlan(client, rep, settings) {
     for (const [k, v] of Object.entries(camp.settings)) line('   • ' + k + ': ' + v);
     for (const g of camp.adGroups) {
       line('   AD GROUP: ' + g.name);
-      if (g.url) line('      final URL → ' + g.url);
+      if (g.url) line('      final URL → ' + g.url + '   (your GoHighLevel page)');
       line('      ' + g.keywords.join('  '));
     }
     line(''); n++;
