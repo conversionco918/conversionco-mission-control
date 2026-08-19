@@ -1154,10 +1154,14 @@ async function lpInject(id){
     h += '<div style="display:flex;flex-wrap:wrap;gap:8px">';
     h += '<button class="btn btn-ghost" style="font-size:12.5px" onclick="adsCopySnippet(' + id + ')">&#128203; Copy tracking code</button>';
     h += '<button class="btn btn-ghost" style="font-size:12.5px"' + (rep && rep.ok ? '' : ' disabled title="Connect must be green first"') + ' onclick="adsBuildRequest(' + id + ', this)">&#128226; Request campaign build</button>';
+    if (rep && rep.url && rep.checks && rep.checks.ga4 && !rep.checks.ga4.ok && !rep.ga4_measurement) {
+      h += '<button class="btn btn-ghost" style="font-size:12.5px" onclick="ga4Create(' + id + ', this)">&#128202; Create GA4 property</button>';
+    }
     h += '</div>';
     if (rep && rep.build_requested) h += '<div style="font-size:11.5px;color:#047857;margin-top:8px">Campaign build requested ' + new Date(rep.build_requested).toLocaleString('en-US', { timeZone: 'America/Chicago', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) + ' &middot; it will land PAUSED for your approval</div>';
-    var gsc = (STATE.settings || {})['gsc_' + id] || '';
-    h += '<div style="display:flex;gap:8px;margin-top:12px;align-items:center"><input id="gscProp' + id + '" type="text" placeholder="Search Console property (sc-domain:their-site.com)" value="' + gsc.replace(/"/g, '&quot;') + '" style="flex:1;font-size:12.5px;padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:#fff">';
+    var gsc = '';
+    try { var gscSt = JSON.parse((STATE.settings || {})['gsc_' + id] || 'null'); gsc = (gscSt && gscSt.property) || ''; } catch (e) { gsc = ''; }
+    h += '<div style="display:flex;gap:8px;margin-top:12px;align-items:center"><input id="gscProp' + id + '" type="text" placeholder="Search Console domain (their-site.com — must be verified)" value="' + gsc.replace(/"/g, '&quot;') + '" style="flex:1;font-size:12.5px;padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:#fff">';
     h += '<button class="btn btn-ghost" style="font-size:12.5px;white-space:nowrap" onclick="gscSave(' + id + ', this)">Save</button></div>';
     h += '<div id="gscInfo' + id + '" style="font-size:11.5px;color:var(--muted);margin-top:6px">' + (gsc ? '&#11088; Rankings snapshots run daily from this property.' : 'Set the verified Search Console property to turn on the daily keyword rankings (standard for every client).') + '</div>';
     h += '<div style="font-size:11px;color:var(--muted);margin-top:8px">Flow: tracking green &#8594; research &#8594; build sheet &#8594; campaign lands PAUSED &#8594; you enable. No guarantees in client-facing copy, ever.</div>';
@@ -1230,13 +1234,30 @@ async function lpInject(id){
     try {
       var r = await api('/api/clients/' + id + '/gsc-property', { method: 'POST', body: JSON.stringify({ property: prop }) });
       if (r && r.error) { toast('⚠ ' + r.error); } else {
-        STATE.settings['gsc_' + id] = prop;
+        try { var stO = JSON.parse(STATE.settings['gsc_' + id] || '{}'); stO.property = r.property || prop; if (!stO.verified) stO.verified = 'manual'; STATE.settings['gsc_' + id] = JSON.stringify(stO); } catch (e) { STATE.settings['gsc_' + id] = JSON.stringify({ property: r.property || prop, verified: 'manual' }); }
         toast(prop ? 'Search Console connected ⭐ — first snapshot is running now' : 'Search Console property cleared');
         var info = document.getElementById('gscInfo' + id);
         if (info) info.innerHTML = prop ? '&#11088; Rankings snapshots run daily from this property.' : 'Set the verified Search Console property to turn on the daily keyword rankings (standard for every client).';
       }
     } catch (e) { toast('⚠ Save failed, try again'); }
     btn.disabled = false;
+  };
+  window.ga4Create = async function (id, btn) {
+    btn.disabled = true; btn.textContent = 'Creating…';
+    try {
+      var r = await api('/api/clients/' + id + '/ga4-create', { method: 'POST' });
+      if (r && r.ok) {
+        toast('GA4 property created 📊 ' + (r.measurement || '') + ' — the tracking snippet now serves it automatically');
+        try { var rep = JSON.parse(STATE.settings['ads_' + id] || '{}'); rep.ga4_property = r.property; rep.ga4_measurement = r.measurement; STATE.settings['ads_' + id] = JSON.stringify(rep); } catch (e) {}
+        var wrap = document.getElementById('adsEngine' + id);
+        if (wrap) wrap.innerHTML = panelHtml(id);
+      } else if (r && r.pending === 'scope') {
+        toast('⚠ Needs your one-time Google consent (checklist item 3) — then this works instantly');
+      } else {
+        toast('⚠ ' + ((r && (r.error || r.note || r.pending)) || 'Could not create yet'));
+      }
+    } catch (e) { toast('⚠ Create failed, try again'); }
+    btn.disabled = false; btn.textContent = '📊 Create GA4 property';
   };
   window.adsBuildRequest = async function (id, btn) {
     btn.disabled = true;
@@ -1249,6 +1270,105 @@ async function lpInject(id){
       if (wrap) wrap.innerHTML = panelHtml(id);
     } catch (e) { toast('⚠ Request failed, try again'); btn.disabled = false; }
   };
+})();
+</script>
+<style id="mcTheme">
+/* ══════════ MISSION CONTROL OFFICIAL THEME (8/18/2026) ══════════ */
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
+:root { --gold: #C7A86B; --signal: #22c55e; --mc-grid: rgba(255,255,255,.045); }
+body { font-family: 'IBM Plex Sans', -apple-system, 'Segoe UI', Roboto, sans-serif; }
+/* Command header */
+header { background: linear-gradient(135deg, #050e1d 0%, #071B33 55%, #0d2b4d 100%);
+  background-size: 100% 100%; border-bottom: 2px solid var(--gold); padding: 12px 24px; }
+header::before { content: ""; position: absolute; inset: 0; pointer-events: none;
+  background: repeating-linear-gradient(90deg, var(--mc-grid) 0 1px, transparent 1px 80px); }
+header { position: sticky; }
+header h1 { font-size: 16px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; }
+header .tag { font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: .22em; text-transform: uppercase;
+  background: transparent; border: 1px solid var(--gold); color: var(--gold); border-radius: 3px; padding: 3px 9px; }
+header button { background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.22); color: #e2e8f0;
+  border-radius: 6px; padding: 7px 13px; font-size: 12.5px; font-weight: 600; letter-spacing: .02em; cursor: pointer; transition: all .15s; }
+header button:hover { background: rgba(199,168,107,.18); border-color: var(--gold); color: #fff; }
+/* Ops status strip */
+#mcStrip { position: sticky; top: 55px; z-index: 19; display: flex; align-items: center; gap: 22px;
+  background: #0a1526; color: #94a3b8; border-bottom: 1px solid #1b2c45; padding: 6px 24px;
+  font-family: 'IBM Plex Mono', monospace; font-size: 11px; letter-spacing: .08em; }
+#mcStrip .lbl { color: #475569; text-transform: uppercase; font-size: 9.5px; letter-spacing: .18em; margin-right: 6px; }
+#mcStrip b { color: #e2e8f0; font-weight: 600; }
+#mcStrip .ok { color: var(--signal); } #mcStrip .warn { color: #fbbf24; }
+#mcStrip .dot { display: inline-block; width: 7px; height: 7px; border-radius: 99px; background: var(--signal);
+  margin-right: 6px; box-shadow: 0 0 6px var(--signal); animation: mcPulse 2.2s infinite; vertical-align: 1px; }
+#mcStrip .dot.warn { background: #fbbf24; box-shadow: 0 0 6px #fbbf24; }
+#mcStrip .spacer { flex: 1; }
+@keyframes mcPulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
+/* Stat tiles: flight-deck instruments */
+.stat { border-radius: 10px; border-top: 3px solid var(--navy); position: relative; overflow: hidden; }
+.stat::after { content: ""; position: absolute; top: -3px; left: 0; width: 42px; height: 3px; background: var(--gold); }
+.stat b { font-size: 9.5px; letter-spacing: .2em; font-weight: 600; }
+.stat > div:first-of-type, .stat .n { font-family: 'IBM Plex Mono', monospace; font-variant-numeric: tabular-nums; }
+/* Action-required banner */
+#needsStrip { border-radius: 10px; border: 1px solid #fcd34d; border-left: 4px solid var(--amber);
+  background: linear-gradient(180deg, #fffdf5, #fffbeb); box-shadow: 0 1px 4px rgba(217,119,6,.08); }
+#needsStrip b, #needsStrip h3 { text-transform: uppercase; letter-spacing: .14em; font-size: 11px; color: #92400e; }
+/* Panels + feed: console log */
+.panel { border-radius: 10px; }
+.panel h3 { font-size: 11px; letter-spacing: .18em; border-bottom: 1px solid var(--line); padding-bottom: 9px; }
+.feed time { font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; letter-spacing: .04em; }
+.feed > div { border-left: 2px solid var(--line); padding-left: 12px; position: relative; }
+.feed > div::before { content: ""; position: absolute; left: -4.5px; top: 6px; width: 7px; height: 7px;
+  border-radius: 99px; background: #cbd5e1; border: 1.5px solid #fff; }
+/* Board: launch rails */
+.bcol { background: #e8edf4; border: 1px solid #dde5ee; border-radius: 10px; }
+.bcol h4 { font-size: 10px; letter-spacing: .16em; color: #334155; border-bottom: 2px solid #cbd8e6; margin-bottom: 8px; }
+.bcard { border-radius: 8px; transition: box-shadow .15s, transform .15s; }
+.bcard:hover { box-shadow: 0 6px 18px rgba(7,27,51,.14); transform: translateY(-1px); }
+/* Chips: status pills with dots */
+.chip { text-transform: uppercase; font-size: 9.5px !important; letter-spacing: .1em; font-weight: 700 !important; border-radius: 4px !important; }
+/* Tables */
+th { font-family: 'IBM Plex Mono', monospace; font-size: 10px !important; letter-spacing: .16em !important; }
+td { font-variant-numeric: tabular-nums; }
+/* View toggle */
+.viewbar button { border-radius: 6px; text-transform: uppercase; font-size: 11px; letter-spacing: .1em; font-weight: 700; }
+/* Scrollbars */
+::-webkit-scrollbar { width: 9px; height: 9px; } ::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 99px; } ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+</style>
+<script>
+// 🛰 OPS STATUS STRIP (8/18/2026) — live clock + system status under the header.
+(function () {
+  var strip = document.createElement('div');
+  strip.id = 'mcStrip';
+  document.querySelector('header').insertAdjacentElement('afterend', strip);
+  function fmt(d, tz) {
+    return d.toLocaleTimeString('en-US', { timeZone: tz, hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  }
+  function render() {
+    var cs = (window.STATE && STATE.clients) || [];
+    var evs = (window.STATE && STATE.events) || [];
+    var dayAgo = Date.now() - 86400000;
+    var errs = 0;
+    for (var i = 0; i < evs.length; i++) {
+      if (evs[i].type === 'error') {
+        var t = Date.parse((evs[i].created_at || '').replace(' ', 'T') + 'Z');
+        if (t > dayAgo) errs++;
+      }
+    }
+    var live = cs.filter(function (c) { return c.stage === 'live'; }).length;
+    var building = cs.filter(function (c) { return ['generating', 'intake2_done'].indexOf(c.stage) >= 0; }).length;
+    var review = cs.filter(function (c) { return c.stage === 'preview_ready'; }).length;
+    var now = new Date();
+    strip.innerHTML =
+      '<span>' + (errs ? '<span class="dot warn"></span><span class="warn">' + errs + ' ALERT' + (errs > 1 ? 'S' : '') + ' (24H)</span>' : '<span class="dot"></span><span class="ok">ALL SYSTEMS NOMINAL</span>') + '</span>' +
+      '<span><span class="lbl">Clients</span><b>' + cs.length + '</b></span>' +
+      '<span><span class="lbl">Live</span><b>' + live + '</b></span>' +
+      (building ? '<span><span class="lbl">Building</span><b>' + building + '</b></span>' : '') +
+      (review ? '<span><span class="lbl">For review</span><b>' + review + '</b></span>' : '') +
+      '<span class="spacer"></span>' +
+      '<span><span class="lbl">Local</span><b>' + fmt(now, 'America/Chicago') + '</b></span>' +
+      '<span><span class="lbl">UTC</span><b>' + fmt(now, 'UTC') + '</b></span>';
+  }
+  render();
+  setInterval(render, 1000);
 })();
 </script>
 </body>

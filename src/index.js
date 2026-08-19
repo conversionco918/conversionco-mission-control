@@ -2547,10 +2547,36 @@ ${msgF ? `<blockquote style="border-left:3px solid #C9A254;padding-left:12px;col
 // 🔎 Visitor counting for sites we DON'T host: one line pasted into their site —
 // <script defer src="<BASE>/t/<clientId>/t.js"></script> — sends a 1px beacon per
 // page view into the same hits table (slug ext-<id>), bot-filtered like /preview.
-app.get('/t/:id/t.js', (c) => {
+app.get('/t/:id/t.js', async (c) => {
   const id = Number(c.req.param('id')) || 0;
-  const js = "(function(){try{var p=encodeURIComponent(location.pathname||'/');(new Image()).src='" + BASE_URL + "/t/" + id + "/p.gif?p='+p+'&r='+Date.now();}catch(e){}})();";
-  return c.body(js, 200, { 'Content-Type': 'application/javascript', 'Cache-Control': 'public, max-age=86400', 'Access-Control-Allow-Origin': '*' });
+  // ONE-PASTE TRACKING (8/18/2026): visitor beacon always; when the client's GA4
+  // measurement id / Clarity id are saved (settings ads_<id>), the same snippet
+  // also loads gtag + Clarity and auto-binds the 4 key events to tel:/sms:/form/
+  // booking elements. ?qa=1 visits are tagged internal (never counted as leads).
+  let ga4 = '', clar = '';
+  try {
+    const s = await getSettings(c.env.DB);
+    const rep = JSON.parse(s['ads_' + id] || '{}');
+    ga4 = String(rep.ga4_measurement || (rep.checks && rep.checks.ga4 && rep.checks.ga4.id) || '').replace(/[^A-Z0-9-]/g, '');
+    clar = String(rep.clarity_id || (rep.checks && rep.checks.clarity && rep.checks.clarity.id) || '').replace(/[^A-Za-z0-9]/g, '');
+  } catch {}
+  let js = "(function(){try{var qa=/[?&]qa=1/.test(location.search);";
+  js += "var p=encodeURIComponent(location.pathname||'/');(new Image()).src='" + BASE_URL + "/t/" + id + "/p.gif?p='+p+'&r='+Date.now();";
+  if (ga4) {
+    js += "var s=document.createElement('script');s.async=1;s.src='https://www.googletagmanager.com/gtag/js?id=" + ga4 + "';document.head.appendChild(s);";
+    js += "window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}window.gtag=window.gtag||gtag;";
+    js += "gtag('js',new Date());gtag('config','" + ga4 + "',qa?{traffic_type:'internal'}:{});";
+    js += "var fire=function(n){try{window.gtag('event',n,qa?{traffic_type:'internal'}:{});}catch(e){}};";
+    js += "document.addEventListener('click',function(e){var a=e.target&&e.target.closest&&e.target.closest('a');if(!a)return;var href=a.getAttribute('href')||'';";
+    js += "if(href.indexOf('tel:')===0)fire('call_click');else if(href.indexOf('sms:')===0)fire('sms_click');";
+    js += "else if(/janeapp\\.com|calendar\\.google\\.com\\/calendar\\/appointments|calendly\\.com|booking/i.test(href))fire('book_click');},true);";
+    js += "document.addEventListener('submit',function(e){fire('form_submit');},true);";
+  }
+  if (clar) {
+    js += "(function(w,d,t,u){w.clarity=w.clarity||function(){(w.clarity.q=w.clarity.q||[]).push(arguments)};var e=d.createElement(t);e.async=1;e.src=u;d.head.appendChild(e);})(window,document,'script','https://www.clarity.ms/tag/" + clar + "');";
+  }
+  js += "}catch(e){}})();";
+  return c.body(js, 200, { 'Content-Type': 'application/javascript', 'Cache-Control': 'public, max-age=300', 'Access-Control-Allow-Origin': '*' });
 });
 app.get('/t/:id/p.gif', async (c) => {
   const id = Number(c.req.param('id')) || 0;
@@ -5316,49 +5342,35 @@ async function adsWatchdog(env) {
 }
 
 // ⭐ GSC RANKINGS SNAPSHOT (8/18/2026, daily noon cron) — the moneymaker lane.
-// For every client with settings gsc_<id> = their VERIFIED Search Console
-// property (e.g. sc-domain:example.com), pull the last 28 days of query data
-// and store today's snapshot in rank_history. ACCURACY LAW: only Google's own
-// numbers are stored; clients with no property or no data store nothing.
+// Rides the EXISTING GSC autopilot state (settings gsc_<id> = {property, verified,...},
+// maintained by gscEnsureClient/gscPullAll): for every client whose property is
+// verified, pull 28 days of query data via gscQueryStats and store today's
+// snapshot in rank_history. ACCURACY LAW: only Google's own numbers are stored.
 async function gscRankSnapshot(env) {
   const db = env.DB;
-  if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET || !env.GOOGLE_REFRESH_TOKEN) return;
+  if (!gscConfigured(env)) return;
   const settings = await getSettings(db);
-  const props = Object.keys(settings).filter((k) => /^gsc_\d+$/.test(k) && settings[k]);
-  if (!props.length) return;
-  let token = '';
-  try {
-    const tr = await fetch('https://oauth2.googleapis.com/token', {
-      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET, refresh_token: env.GOOGLE_REFRESH_TOKEN, grant_type: 'refresh_token' }),
-    });
-    const td = await tr.json();
-    token = td.access_token || '';
-    if (!token) throw new Error(td.error || 'no token');
-  } catch (e) {
-    await logEvent(db, null, 'error', `Rankings snapshot: Google sign-in failed (${String(e.message).slice(0, 80)})`);
-    return;
-  }
   const day = new Date().toISOString().slice(0, 10);
-  const start = new Date(Date.now() - 28 * 86400 * 1000).toISOString().slice(0, 10);
-  for (const k of props) {
+  const keys = Object.keys(settings).filter((k) => /^gsc_\d+$/.test(k));
+  for (const k of keys) {
     const id = Number(k.slice(4));
-    const site = settings[k];
+    let st = null; try { st = JSON.parse(settings[k] || 'null'); } catch {}
+    if (!st || !st.property || !st.verified) continue;
     try {
-      const r = await fetch('https://www.googleapis.com/webmasters/v3/sites/' + encodeURIComponent(site) + '/searchAnalytics/query', {
-        method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ startDate: start, endDate: day, dimensions: ['query'], rowLimit: 25 }),
-      });
-      if (!r.ok) { await logEvent(db, id, 'error', `Rankings snapshot failed for ${site}: HTTP ${r.status}`); continue; }
-      const data = await r.json();
-      const rows = data.rows || [];
-      for (const row of rows) {
+      const stats = await gscQueryStats(env, st.property, 28);
+      const rows = (stats && stats.rows) || [];
+      for (const row of rows.slice(0, 25)) {
+        const q = String(row.q || (row.keys && row.keys[0]) || '').slice(0, 120);
+        if (!q) continue;
+        const pos = Math.round(Number(row.pos || row.position || 0) * 10) / 10;
+        const clicks = Number(row.clicks || 0) || 0;
+        const impr = Number(row.imp || row.impr || row.impressions || 0) || 0;
         await db.prepare(`INSERT INTO rank_history (client_id, q, day, pos, clicks, impr) VALUES (?, ?, ?, ?, ?, ?)
           ON CONFLICT(client_id, q, day) DO UPDATE SET pos = excluded.pos, clicks = excluded.clicks, impr = excluded.impr`)
-          .bind(id, String(row.keys[0]).slice(0, 120), day, Math.round((row.position || 0) * 10) / 10, row.clicks || 0, row.impressions || 0).run();
+          .bind(id, q, day, pos, clicks, impr).run();
       }
     } catch (e) {
-      await logEvent(db, id, 'error', `Rankings snapshot error for ${site}: ${String(e && e.message || e).slice(0, 100)}`);
+      await logEvent(db, id, 'error', `Rankings snapshot error for ${st.property}: ${String(e && e.message || e).slice(0, 100)}`);
     }
   }
 }
@@ -5367,18 +5379,26 @@ async function gscRankSnapshot(env) {
 app.post('/api/clients/:id/gsc-property', async (c) => {
   const id = Number(c.req.param('id')) || 0;
   let body = {}; try { body = await c.req.json(); } catch {}
-  const prop = String(body.property || '').trim().slice(0, 200);
-  await setSetting(c.env.DB, 'gsc_' + id, prop);
-  await logEvent(c.env.DB, id, 'gsc_property', prop ? `⭐ Search Console property set: ${prop} — daily rankings snapshots begin at the next noon check` : 'Search Console property cleared');
-  if (prop) c.executionCtx.waitUntil(gscRankSnapshot(c.env).catch(() => {}));
-  return c.json({ ok: true, property: prop });
+  const raw = String(body.property || '').trim().slice(0, 200);
+  const domain = raw.replace(/^sc-domain:/i, '').replace(/^https?:\/\//i, '').replace(/^www\./, '').replace(/\/.*$/, '');
+  if (!domain) return c.json({ error: 'Give me the domain (like their-site.com) — it must already be verified in Search Console.' }, 400);
+  const settings = await getSettings(c.env.DB);
+  let st = {}; try { st = JSON.parse(settings['gsc_' + id] || '{}'); } catch {}
+  if (typeof st !== 'object' || st === null || Array.isArray(st)) st = {};
+  st.property = domain;
+  if (!st.verified) st.verified = 'manual';
+  await setSetting(c.env.DB, 'gsc_' + id, JSON.stringify(st));
+  await logEvent(c.env.DB, id, 'gsc_property', `⭐ Search Console property set: ${domain} — daily rankings snapshots begin at the next noon check`);
+  c.executionCtx.waitUntil(gscRankSnapshot(c.env).catch(() => {}));
+  return c.json({ ok: true, property: domain });
 });
 
 // Rankings read: latest day per keyword + movement vs ~7 days earlier.
 app.get('/api/clients/:id/rankings', async (c) => {
   const id = Number(c.req.param('id')) || 0;
   const settings = await getSettings(c.env.DB);
-  const prop = settings['gsc_' + id] || '';
+  let stR = null; try { stR = JSON.parse(settings['gsc_' + id] || 'null'); } catch {}
+  const prop = (stR && stR.property) || '';
   if (!prop) return c.json({ pending: 'no-property' });
   const rows = (await c.env.DB.prepare(
     `SELECT q, day, pos, clicks, impr FROM rank_history WHERE client_id = ? AND day >= date('now','-35 days') ORDER BY day ASC`
@@ -5396,6 +5416,63 @@ app.get('/api/clients/:id/rankings', async (c) => {
   }).filter((x) => x.day === latestDay)
     .sort((a, b) => b.impr - a.impr).slice(0, 15);
   return c.json({ property: prop, day: latestDay, keywords: list });
+});
+
+
+// 🧪 GA4 AUTO-CREATE (8/18/2026, dormant until analytics.edit scope lands):
+// creates the client's GA4 property + web stream via the Admin API and saves
+// ga4_property (numeric id) + ga4_measurement (G-XXXX) into settings ads_<id>.
+// The one-paste snippet (/t/:id/t.js) then serves gtag automatically.
+app.post('/api/clients/:id/ga4-create', async (c) => {
+  const id = Number(c.req.param('id')) || 0;
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'no such client' }, 404);
+  const settings = await getSettings(db);
+  let rep = {}; try { rep = JSON.parse(settings['ads_' + id] || '{}'); } catch {}
+  if (rep.ga4_measurement) return c.json({ ok: true, already: true, measurement: rep.ga4_measurement });
+  if (!rep.url) return c.json({ error: 'Connect the landing page first.' }, 400);
+  if (!c.env.GOOGLE_CLIENT_ID || !c.env.GOOGLE_CLIENT_SECRET || !c.env.GOOGLE_REFRESH_TOKEN) return c.json({ pending: 'no-google-auth' });
+  try {
+    const tr = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ client_id: c.env.GOOGLE_CLIENT_ID, client_secret: c.env.GOOGLE_CLIENT_SECRET, refresh_token: c.env.GOOGLE_REFRESH_TOKEN, grant_type: 'refresh_token' }),
+    });
+    const td = await tr.json();
+    if (!td.access_token) return c.json({ pending: 'token-failed' });
+    const H = { Authorization: 'Bearer ' + td.access_token, 'Content-Type': 'application/json' };
+    // account id: first GA account on the authorized user
+    const accs = await fetch('https://analyticsadmin.googleapis.com/v1beta/accounts', { headers: H }).then((r) => r.json());
+    if (accs.error) return c.json({ pending: accs.error.status === 'PERMISSION_DENIED' ? 'scope' : 'accounts-' + (accs.error.code || '?'), note: String(accs.error.message || '').slice(0, 140) });
+    const acct = (accs.accounts || [])[0];
+    if (!acct) return c.json({ pending: 'no-ga-account', note: 'Sign into analytics.google.com once with conversionco918 to create the account shell.' });
+    const bizName = String(client.name || client.email || ('Client ' + id)).slice(0, 90);
+    const prop = await fetch('https://analyticsadmin.googleapis.com/v1beta/properties', {
+      method: 'POST', headers: H,
+      body: JSON.stringify({ parent: acct.name, displayName: bizName, timeZone: 'America/Chicago', currencyCode: 'USD', industryCategory: 'HEALTHCARE' }),
+    }).then((r) => r.json());
+    if (prop.error) return c.json({ pending: 'property-' + (prop.error.code || '?'), note: String(prop.error.message || '').slice(0, 140) });
+    let host = ''; try { host = new URL(rep.url).origin; } catch {}
+    const stream = await fetch('https://analyticsadmin.googleapis.com/v1beta/' + prop.name + '/dataStreams', {
+      method: 'POST', headers: H,
+      body: JSON.stringify({ type: 'WEB_DATA_STREAM', displayName: bizName + ' site', webStreamData: { defaultUri: host || 'https://example.com' } }),
+    }).then((r) => r.json());
+    if (stream.error) return c.json({ pending: 'stream-' + (stream.error.code || '?'), note: String(stream.error.message || '').slice(0, 140) });
+    const measurement = (stream.webStreamData && stream.webStreamData.measurementId) || '';
+    rep.ga4_property = String(prop.name || '').replace('properties/', '');
+    rep.ga4_measurement = measurement;
+    await setSetting(db, 'ads_' + id, JSON.stringify(rep));
+    // register the 4 key events (best effort — failures do not block)
+    for (const ev of ['call_click', 'sms_click', 'form_submit', 'book_click']) {
+      try {
+        await fetch('https://analyticsadmin.googleapis.com/v1beta/' + prop.name + '/keyEvents', {
+          method: 'POST', headers: H, body: JSON.stringify({ eventName: ev, countingMethod: 'ONCE_PER_EVENT' }),
+        });
+      } catch {}
+    }
+    await logEvent(db, id, 'ga4_created', `📊 GA4 property created for ${bizName} — ${measurement}. The tracking snippet now serves Google Analytics automatically; re-paste NOT needed.`);
+    return c.json({ ok: true, property: rep.ga4_property, measurement });
+  } catch (e) { return c.json({ pending: 'error', note: String(e && e.message || e).slice(0, 140) }); }
 });
 
 export default {
