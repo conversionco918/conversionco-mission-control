@@ -2874,6 +2874,9 @@ app.get('/icon-512.png', (c) => c.body(b64bytes(ICON512), 200, { 'Content-Type':
 // inside the route, so departing clients need no login to get their files.
 app.use('*', async (c, next) => {
   if (c.req.path.startsWith('/exit/')) return next();
+  // /portal-ads/:id/:token — the client's own analytics feed; the route checks
+  // its own HMAC token, exactly like every other /portal-* lane above.
+  if (c.req.path.startsWith('/portal-ads/')) return next();
   if (await checkSession(c.env, c.req.header('Cookie'))) return next();
   if (c.req.path.startsWith('/api/')) return c.json({ error: 'unauthorized' }, 401);
   return c.html(loginHtml.replace('<!--ERROR-->', ''));
