@@ -6508,6 +6508,96 @@ app.get('/api/google-health', async (c) => {
   return new Response(r.body, r);
 });
 
+// 🧭 LAUNCH RUNBOOK (8/19/2026) — the one-day-per-client sequence, computed
+// from real state rather than ticked by hand. Twelve steps from "they said yes"
+// to "the campaign is running", each one either already true in the data or
+// waiting on a named action. The Ads row shows only the NEXT step, so the
+// answer to "what do I do now" is always one line, never a hunt.
+// Two steps cannot be detected (conversions imported, campaign built) — those
+// are hers to tick, and they are the two that happen inside Google's UI.
+function adsRunbook(client, rep, settings, id) {
+  const gsc = (() => { try { return JSON.parse(settings['gsc_' + id] || '{}'); } catch { return {}; } })();
+  const ck = rep.checks || {};
+  const manual = rep.steps || {};
+  const steps = [
+    { k: 'enrolled', label: 'On the ads track', done: !!rep.track,
+      why: 'Puts them on the Ads board and starts the $249/mo clock.',
+      todo: 'Open their card and press "Add ads" or "Ads only".' },
+    { k: 'economics', label: 'Economics entered', done: !!(rep.econ && rep.econ.target_clients),
+      why: 'Without it you are guessing at budget and cannot tell a client what is realistic.',
+      todo: 'Press Economics and enter their average ticket, close rate and target.' },
+    { k: 'page', label: 'Landing page connected', done: !!rep.url,
+      why: 'Everything downstream keys off this URL.',
+      todo: 'Paste the GoHighLevel funnel link and press Set it all up.' },
+    { k: 'snippet', label: 'Tracking code live on the page', done: !!(ck.tracker && ck.tracker.ok),
+      why: 'No tag, no data. Every number in this system starts here.',
+      todo: 'Press Head code, copy Option A, paste it into the GHL funnel head, save, then Re-check.' },
+    { k: 'ga4', label: 'Google Analytics property', done: !!rep.ga4_measurement,
+      why: 'The client-facing numbers and the conversions Google Ads bids on both come from here.',
+      todo: 'Set it all up creates it. If it came back pending, create it by hand and paste the G- ID under IDs.' },
+    { k: 'events', label: 'Key events firing', done: !!(rep.ga4_measurement && ck.tracker && ck.tracker.ok),
+      why: 'call_click, sms_click, form_submit and book_click are what a conversion actually is here.',
+      todo: 'Both the property and the snippet have to be in place; then load the page once and Re-check.' },
+    { k: 'clarity', label: 'Clarity session replay', done: !!rep.clarity_id, optional: true,
+      why: 'Watching ten real sessions explains a bad conversion rate faster than any report.',
+      todo: 'clarity.microsoft.com → new project → paste the ID under Head code.' },
+    { k: 'gsc', label: 'Search Console attached', done: !!(gsc && gsc.property), optional: true,
+      why: 'Free rankings data, and it feeds the portal rankings card.',
+      todo: 'Verify the domain in Search Console; Set it all up attaches it automatically after that.' },
+    { k: 'account', label: 'Google Ads account linked', done: !!rep.ads_cid || !!rep.ads_url,
+      why: 'Without the customer ID every deep link in here points at an account picker instead of their account.',
+      todo: 'Create the account under your manager account, then paste the 10-digit ID.' },
+    { k: 'conversions', label: 'Conversions imported into Google Ads', done: !!manual.conversions,
+      why: 'THE one that quietly ruins accounts. Bidding on no conversion data burns budget at full speed.',
+      todo: 'Tools → Data manager → link GA4 → Goals → Conversions → Import the four key events. Then tick this.',
+      tick: true },
+    { k: 'campaign', label: 'Campaign built (still paused)', done: !!manual.campaign,
+      why: 'Yours to build. The build sheet has every setting, keyword, negative and headline.',
+      todo: 'Open Build sheet, then build it in Google Ads and leave it paused. Then tick this.',
+      tick: true },
+    { k: 'billing', label: 'Ads management billing', done: rep.sub_status === 'active',
+      why: '$249/mo does not invoice itself.',
+      todo: rep.sub_link ? 'Link is created — send it to the client.' : 'Press $249/mo billing to create the link.' },
+    { k: 'live', label: 'Campaign enabled', done: !!rep.live_at,
+      why: 'The moment spend starts, the daily silent-failure check starts watching this client.',
+      todo: 'Enable it in Google Ads yourself, then press "I enabled it" here.' },
+  ];
+  const required = steps.filter((x) => !x.optional);
+  const doneN = required.filter((x) => x.done).length;
+  const next = steps.find((x) => !x.done && !x.optional) || steps.find((x) => !x.done) || null;
+  return { steps, done: doneN, total: required.length, next, ready: doneN === required.length };
+}
+
+app.get('/api/clients/:id/ads-runbook', async (c) => {
+  const id = Number(c.req.param('id')) || 0;
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'no such client' }, 404);
+  const settings = await getSettings(db);
+  let rep = {}; try { rep = JSON.parse(settings['ads_' + id] || '{}'); } catch {}
+  return c.json({ ok: true, biz: client.business_name || client.name || client.email, ...adsRunbook(client, rep, settings, id) });
+});
+
+// The two steps that happen inside Google's UI and cannot be detected from here.
+app.post('/api/clients/:id/ads-step', async (c) => {
+  const id = Number(c.req.param('id')) || 0;
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'no such client' }, 404);
+  let body = {}; try { body = await c.req.json(); } catch {}
+  const key = String(body.key || '');
+  if (!['conversions', 'campaign'].includes(key)) return c.json({ error: 'that step is detected automatically, not ticked' }, 400);
+  const settings = await getSettings(db);
+  let rep = {}; try { rep = JSON.parse(settings['ads_' + id] || '{}'); } catch {}
+  rep.steps = rep.steps || {};
+  const on = body.done !== false;
+  if (on) rep.steps[key] = new Date().toISOString(); else delete rep.steps[key];
+  await setSetting(db, 'ads_' + id, JSON.stringify(rep));
+  const LABEL = { conversions: 'Conversions imported into Google Ads', campaign: 'Campaign built (still paused)' };
+  await logEvent(db, id, 'ads_step', `\u{1F9ED} ${LABEL[key]} — marked ${on ? 'done' : 'not done'} for ${client.business_name || client.name || client.email}`);
+  return c.json({ ok: true, ...adsRunbook(client, rep, settings, id) });
+});
+
 // 📬 WEEKLY ADS REPORT TO THE CLIENT (8/19/2026, Mondays) — the single
 // highest-leverage thing for Tiffany's calendar. Clients who get a clear,
 // honest weekly number stop emailing to ask how it is going. Every figure here

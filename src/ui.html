@@ -1549,6 +1549,7 @@ async function lpInject(id){
       if (link) h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsAccountPrompt(' + c.id + ')">Edit account link</button>';
       h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsIdsPrompt(' + c.id + ')">&#127991; IDs</button>';
       h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="openDrawer(' + c.id + ')">Open card</button>';
+      h += '</div><div id="rb' + c.id + '" style="font-size:12.5px;color:var(--faint,#8A94A6);padding:0 0 12px">…</div><div style="display:none">';
       h += '</div></td></tr>';
     });
     h += '</tbody></table>';
@@ -1905,8 +1906,71 @@ async function lpInject(id){
   };
   var _rav = window.renderAdsView;
   if (typeof _rav === 'function') {
-    window.renderAdsView = function () { var r = _rav.apply(this, arguments); try { googleHealth(); } catch (e) {} return r; };
+    window.renderAdsView = function () { var r = _rav.apply(this, arguments); try { googleHealth(); } catch (e) {} try { adsRunbookStrips(); } catch (e) {} return r; };
   }
+
+  // ══ LAUNCH RUNBOOK — one line that always says what to do next ═══════════
+  window.adsRunbookStrips = async function () {
+    var ids = [];
+    document.querySelectorAll('[id^="rb"]').forEach(function (el) {
+      var n = Number(el.id.slice(2)); if (n) ids.push(n);
+    });
+    for (var i = 0; i < ids.length; i++) {
+      (function (id) {
+        api('/api/clients/' + id + '/ads-runbook').then(function (r) {
+          var el = document.getElementById('rb' + id); if (!el || !r || r.error) return;
+          if (r.ready) {
+            el.innerHTML = '<span style="color:#067647;font-weight:600">&#10003; All ' + r.total + ' launch steps done.</span> ' +
+              '<span style="color:var(--faint,#8A94A6)">The silent-failure check is watching this client daily.</span> ' +
+              '<button class="btn btn-ghost" style="font-size:11px;padding:3px 9px;margin-left:6px" onclick="adsRunbook(' + id + ')">Runbook</button>';
+            return;
+          }
+          el.innerHTML = '<span style="font-family:var(--font-mono,monospace);font-size:11px;color:var(--faint,#8A94A6)">' + r.done + '/' + r.total + '</span>' +
+            ' &nbsp;<b style="color:var(--navy,#0B1D33)">Next:</b> ' + esc(r.next ? r.next.label : '') +
+            ' <span style="color:var(--faint,#8A94A6)">&mdash; ' + esc(r.next ? r.next.todo : '') + '</span>' +
+            ' <button class="btn btn-ghost" style="font-size:11px;padding:3px 9px;margin-left:6px" onclick="adsRunbook(' + id + ')">Runbook</button>';
+        }).catch(function () { var el = document.getElementById('rb' + id); if (el) el.textContent = ''; });
+      })(ids[i]);
+    }
+  };
+
+  function runbookHtml(r, id) {
+    var h = '<div style="display:flex;align-items:baseline;gap:12px;margin-bottom:10px">' +
+      '<div style="font-family:Georgia,serif;font-size:34px;line-height:1;color:var(--navy,#0B1D33)">' + r.done + '<span style="font-size:18px;color:var(--faint,#8A94A6)">/' + r.total + '</span></div>' +
+      '<div style="font-size:12.5px;color:var(--muted,#5D6B7E)">launch steps done' + (r.ready ? ' — this client is fully live' : '') + '</div></div>';
+    h += r.steps.map(function (s) {
+      var col = s.done ? '#0F9D58' : (s.optional ? '#98A2B3' : '#C7A86B');
+      return '<div style="display:flex;gap:11px;align-items:flex-start;padding:10px 0;border-bottom:1px solid var(--line,#E6E9EF)">' +
+        '<div style="width:20px;height:20px;border-radius:50%;flex:none;background:' + col + ';color:#fff;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700">' + (s.done ? '✓' : '•') + '</div>' +
+        '<div style="flex:1;min-width:0">' +
+        '<div style="font-size:13.5px;font-weight:600;color:var(--navy,#0B1D33)">' + esc(s.label) + (s.optional ? ' <span style="font-weight:400;font-size:11px;color:var(--faint,#8A94A6)">optional</span>' : '') + '</div>' +
+        '<div style="font-size:12px;color:var(--muted,#5D6B7E);margin-top:1px">' + esc(s.why) + '</div>' +
+        (s.done ? '' : '<div style="font-size:12px;color:var(--navy,#0B1D33);margin-top:3px"><b>Do:</b> ' + esc(s.todo) + '</div>') +
+        '</div>' +
+        (s.tick ? '<button class="btn btn-ghost" style="font-size:11px;padding:4px 10px;flex:none" onclick="adsStep(' + id + ', \'' + s.k + '\', ' + (s.done ? 'false' : 'true') + ')">' + (s.done ? 'Undo' : 'Mark done') + '</button>' : '') +
+        '</div>';
+    }).join('');
+    h += '<p style="font-size:11.5px;color:var(--faint,#8A94A6);margin-top:12px">Every step except the two marked buttons is read from live data — nothing here is ticked optimistically. The two exceptions happen inside Google Ads, where this tool cannot see.</p>';
+    return h;
+  }
+
+  window.adsRunbook = async function (id) {
+    try {
+      var r = await api('/api/clients/' + id + '/ads-runbook');
+      if (r && r.error) { toast('⚠ ' + r.error); return; }
+      modal('Launch runbook — ' + (r.biz || ''), runbookHtml(r, id));
+    } catch (e) { toast('⚠ Could not load the runbook'); }
+  };
+
+  window.adsStep = async function (id, key, done) {
+    try {
+      var r = await api('/api/clients/' + id + '/ads-step', { method: 'POST', body: JSON.stringify({ key: key, done: done }) });
+      if (r && r.error) { toast('⚠ ' + r.error); return; }
+      var box = document.getElementById('ccModBody');
+      if (box) box.innerHTML = runbookHtml(r, id);
+      try { adsRunbookStrips(); } catch (e) {}
+    } catch (e) { toast('⚠ Could not save'); }
+  };
 
   window.adsBilling = async function (id, btn) {
     var rep = {}; try { rep = JSON.parse((STATE.settings || {})['ads_' + id] || '{}'); } catch (e) {}
