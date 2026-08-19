@@ -1505,6 +1505,7 @@ async function lpInject(id){
     h += '<span style="flex:1"></span>';
     if (mcc) h += '<a class="btn btn-ghost" style="font-size:12.5px;text-decoration:none" href="https://ads.google.com/aw/accounts" target="_blank" rel="noopener">Open Google Ads &#8599;</a>';
     h += '</div>';
+    h += '<div id="gHealth" class="panel" style="margin-bottom:16px;display:flex;align-items:center;gap:18px;flex-wrap:wrap;font-size:12.5px;color:var(--faint,#8A94A6)">Checking the Google connection…</div>';
 
     if (!list.length) {
       h += '<div class="panel"><div class="empty">No one is on ads management yet.<br><span style="font-size:12.5px">Start an ads-only client from the bar at the top, or open any client and use &ldquo;Add ads to their website&rdquo;.</span></div></div>';
@@ -1876,6 +1877,32 @@ async function lpInject(id){
     } catch (e) { toast('⚠ Could not save, try again'); }
     btn.disabled = false; btn.textContent = 'Save and rebuild the sheet';
   };
+
+  // ══ the four Google powers, at a glance ═════════════════════════════════
+  var _gh = null;
+  window.googleHealth = async function () {
+    var box = document.getElementById('gHealth'); if (!box) return;
+    try {
+      if (!_gh) _gh = await api('/api/google-health');
+      var d = _gh;
+      var LABEL = { search_console: 'Search Console', calendar: 'Calendar', analytics_admin: 'Analytics setup', analytics_summaries: 'Analytics data' };
+      var dot = function (state) {
+        var col = state === 'ok' ? '#0F9D58' : '#B42318';
+        return '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + col + ';margin-right:6px"></span>';
+      };
+      var h = '<div style="font-family:var(--font-mono);font-size:9.5px;letter-spacing:.2em;text-transform:uppercase;color:var(--faint)">Google connection</div>';
+      Object.keys(LABEL).forEach(function (k) {
+        h += '<div>' + dot(d[k]) + '<span style="color:var(--navy,#0B1D33)">' + LABEL[k] + '</span></div>';
+      });
+      h += '<div>' + (d.ga4_ready ? '<span style="color:#0F9D58">✓</span> can create new Analytics properties' : '<span style="color:#B42318">✗</span> no Analytics account to build on') + '</div>';
+      if (!d.token) h = '<div style="color:#B42318"><b>Google is disconnected.</b> The refresh token is not working — nothing that needs Google will run until it is replaced.</div>';
+      box.innerHTML = h;
+    } catch (e) { box.textContent = ''; }
+  };
+  var _rav = window.renderAdsView;
+  if (typeof _rav === 'function') {
+    window.renderAdsView = function () { var r = _rav.apply(this, arguments); try { googleHealth(); } catch (e) {} return r; };
+  }
 
   window.adsBilling = async function (id, btn) {
     var rep = {}; try { rep = JSON.parse((STATE.settings || {})['ads_' + id] || '{}'); } catch (e) {}

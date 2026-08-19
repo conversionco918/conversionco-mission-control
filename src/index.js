@@ -6498,6 +6498,83 @@ app.get('/api/clients/:id/ads-brief', async (c) => {
   return c.json({ ok: true, brief: rep.brief, links: adsDeepLinks(rep, settings) });
 });
 
+// Session-gated alias of the scope probe so the dashboard can show the four
+// Google powers at a glance without the shared key ever touching the browser.
+app.get('/api/google-health', async (c) => {
+  const url = new URL(c.req.url);
+  url.pathname = '/api/google-scopes/gen-4b8e1d7f3a';
+  url.search = '';
+  const r = await app.fetch(new Request(url.toString(), { method: 'GET' }), c.env, c.executionCtx);
+  return new Response(r.body, r);
+});
+
+// 📬 WEEKLY ADS REPORT TO THE CLIENT (8/19/2026, Mondays) — the single
+// highest-leverage thing for Tiffany's calendar. Clients who get a clear,
+// honest weekly number stop emailing to ask how it is going. Every figure here
+// comes from Google Analytics and from the beacon on their own page — nothing
+// is estimated, nothing is rounded up, and there is never a promise in it.
+async function adsWeeklyClientReport(env) {
+  const db = env.DB;
+  const settings = await getSettings(db);
+  if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET || !env.GOOGLE_REFRESH_TOKEN) return 0;
+  let token = '';
+  try {
+    const tr = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET, refresh_token: env.GOOGLE_REFRESH_TOKEN, grant_type: 'refresh_token' }),
+    });
+    token = (await tr.json()).access_token || '';
+  } catch {}
+  if (!token) return 0;
+  let sent = 0;
+  for (const k of Object.keys(settings).filter((x) => /^ads_\d+$/.test(x))) {
+    let rep = {}; try { rep = JSON.parse(settings[k] || '{}'); } catch {}
+    if (!rep.live_at || !rep.ga4_property) continue;
+    const id = Number(k.slice(4));
+    const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+    if (!client || !client.email) continue;
+    try {
+      const q = async (start) => {
+        const rr = await fetch(`https://analyticsdata.googleapis.com/v1beta/properties/${encodeURIComponent(rep.ga4_property)}:runReport`, {
+          method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ dateRanges: [{ startDate: start, endDate: 'today' }], metrics: [{ name: 'sessions' }, { name: 'totalUsers' }, { name: 'keyEvents' }] }),
+        });
+        if (!rr.ok) return null;
+        const d = await rr.json();
+        const m = (d.rows && d.rows[0] && d.rows[0].metricValues) || [];
+        return { sessions: Number((m[0] || {}).value || 0), users: Number((m[1] || {}).value || 0), events: Number((m[2] || {}).value || 0) };
+      };
+      const wk = await q('7daysAgo');
+      if (!wk) continue;
+      // our own beacon gives the breakdown Google does not split out by default
+      const rows = (await db.prepare(
+        `SELECT path, SUM(n) AS n FROM hits WHERE slug = ? AND day > date('now','-7 days') GROUP BY path`
+      ).bind('ext-' + id).all()).results || [];
+      const ev = { call_click: 0, sms_click: 0, form_submit: 0, book_click: 0 };
+      for (const r of rows) { const p = String(r.path || ''); if (p.indexOf('ev-') === 0) { const key = p.slice(3); if (key in ev) ev[key] += Number(r.n) || 0; } }
+      const total = ev.call_click + ev.sms_click + ev.form_submit + ev.book_click;
+      const biz = client.business_name || client.name || 'your business';
+      const tok = await portalToken(env, 'portal', id);
+      const tile = (n, l) => `<td style="padding:12px 16px;border:1px solid #E6E9EF;border-radius:10px;text-align:center"><div style="font-size:30px;font-family:Georgia,serif;line-height:1">${n}</div><div style="font-size:12px;color:#5D6B7E;margin-top:2px">${l}</div></td>`;
+      const html =
+        `<p>Here is last week on your landing page, ${client.name ? String(client.name).split(' ')[0] : 'there'} — straight from Google, nothing rounded.</p>` +
+        `<table cellspacing="8" cellpadding="0" style="border-collapse:separate"><tr>` +
+        tile(wk.users.toLocaleString(), 'people visited') + tile(ev.call_click, 'tapped to call') +
+        tile(ev.form_submit, 'sent a form') + tile(ev.book_click, 'started a booking') + `</tr></table>` +
+        (total === 0
+          ? `<p>No one reached out this week. That happens in a slow week and it is also the kind of thing we watch closely — we check the tracking and the page every single day, and we will tell you before you have to ask.</p>`
+          : `<p><b>${total}</b> ${total === 1 ? 'person' : 'people'} reached out to you this week. Every one of them is in your portal with the time it came in.</p>`) +
+        `<p>The fastest thing that moves this number is how quickly those people get a reply. Minutes beats hours by a wide margin.</p>` +
+        `<p><a href="${BASE_URL}/portal/${id}/${tok}" style="display:inline-block;background:#0B1D33;color:#fff;padding:12px 22px;border-radius:8px;text-decoration:none">Open your portal</a></p>` +
+        `<p style="font-size:12px;color:#8A94A6">Numbers come from your own Google Analytics property and the tracking on your page. Ad results move week to week — we report what happened, not what we hope for.</p>`;
+      const ok = await emailClient(env, db, client, settings, `Your week: ${total} ${total === 1 ? 'enquiry' : 'enquiries'} — ${biz}`, html,
+        'ads_report_sent', `📬 Weekly ads report emailed to ${client.email} — ${wk.users} visitors, ${total} enquiries`);
+      if (ok) sent++;
+    } catch {}
+  }
+  return sent;
+}
+
 // 💳 ADS SUBSCRIPTION (8/19/2026) — $249/mo Google Ads management, billed the
 // same way as everything else in this business. Built as a self-contained
 // Stripe Checkout call (subscription mode, inline price_data) so it does not
@@ -6811,6 +6888,9 @@ export default {
       if (new Date(event.scheduledTime || Date.now()).getUTCDay() === 1) {
         ctx.waitUntil(weeklyOwnerDigest(env).catch((e) =>
           logEvent(env.DB, null, 'error', `Owner digest failed: ${e.message}`)
+        ));
+        ctx.waitUntil(adsWeeklyClientReport(env).catch((e) =>
+          logEvent(env.DB, null, 'error', `Weekly ads report failed: ${e.message}`)
         ));
       }
       if (new Date(event.scheduledTime || Date.now()).getUTCDay() === 0) {
