@@ -5816,6 +5816,8 @@ function adsBrief(client, rep) {
   const V = String(client.vertical || 'iv').toLowerCase();
   const P = VERTICAL_ADS[V] || VERTICAL_ADS.iv;
   const phone = String(client.phone || '').trim();
+  const pd = phone.replace(/\D/g, '').replace(/^1(?=\d{10}$)/, '');
+  const phoneNice = pd.length === 10 ? '(' + pd.slice(0, 3) + ') ' + pd.slice(3, 6) + '-' + pd.slice(6) : phone;
 
   // ── keywords: exact first (Ben Heath: exact carries the budget, phrase scouts)
   const kwCore = [];
@@ -5831,7 +5833,7 @@ function adsBrief(client, rep) {
     ...(biz ? [biz] : []),
     ...P.headlines,
     ...(city ? ['Serving ' + city + ' & Nearby'] : []),
-    ...(phone ? ['Call ' + phone] : []),
+    ...(phoneNice ? ['Call ' + phoneNice] : []),
   ], 30);
 
   const descriptions = adsFit(P.descriptions.map((d) => (city && d.length + city.length + 5 <= 90 ? d : d)), 90);
@@ -5863,7 +5865,7 @@ function adsBrief(client, rep) {
     callouts: adsFit(P.callouts, 25),
     sitelinks: (P.sitelinks || []).filter((s) => s[0].length <= 25 && s[1].length <= 35),
     assets: [
-      phone ? 'Call asset: ' + phone + ' (turn on call reporting so calls count as conversions)' : 'Call asset: add the business phone number',
+      phoneNice ? 'Call asset: ' + phoneNice + ' (turn on call reporting so calls count as conversions)' : 'Call asset: add the business phone number',
       'Location asset: link the Google Business Profile once it is verified',
       'Structured snippet: Services → ' + P.core.slice(0, 4).join(', '),
     ],
@@ -5886,7 +5888,10 @@ function adsBrief(client, rep) {
   L.push('Landing page: ' + (rep.url || '(not connected)'));
   L.push('');
   L.push('1. CAMPAIGN SETTINGS');
-  for (const [k, v] of Object.entries(brief.campaign)) L.push('   • ' + k + ': ' + v);
+  const CLBL = { name: 'Campaign name', type: 'Campaign type', goal: 'Goal', budget: 'Daily budget',
+    bidding: 'Bidding', locations: 'Locations', locationSetting: 'Location setting (critical)',
+    schedule: 'Ad schedule', devices: 'Devices', network: 'Networks' };
+  for (const [k, v] of Object.entries(brief.campaign)) L.push('   • ' + (CLBL[k] || k) + ': ' + v);
   L.push('');
   L.push('2. AD GROUPS + KEYWORDS');
   for (const g of brief.adGroups) { L.push('   ' + g.name); L.push('      ' + g.keywords.join('  ')); }
