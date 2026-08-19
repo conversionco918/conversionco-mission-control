@@ -4121,6 +4121,7 @@ app.post('/api/settings', async (c) => {
     'intake1_subject', 'intake1_body', 'intake2_subject', 'intake2_body',
     'booking_link', 'booking_subject', 'booking_body',
     'notify_email', 'sites_repo', 'review_link',
+    'ads_mcc_id', 'ads_dev_token_status',
   ];
   for (const k of allowed) if (k in body) await setSetting(c.env.DB, k, body[k]);
   return c.json({ ok: true });
