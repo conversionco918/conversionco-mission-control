@@ -2804,6 +2804,15 @@ app.get('/api/google-scopes/:key', async (c) => {
   await probe('calendar', 'https://www.googleapis.com/calendar/v3/users/me/calendarList?maxResults=1');
   await probe('analytics_admin', 'https://analyticsadmin.googleapis.com/v1beta/accounts');
   await probe('analytics_summaries', 'https://analyticsadmin.googleapis.com/v1beta/accountSummaries');
+  // scope alone is not enough: GA4 auto-create needs an Analytics ACCOUNT shell
+  // to hang the property on. Count it, so a green scope never hides an empty one.
+  if (out.analytics_admin === 'ok') {
+    try {
+      const a = await fetch('https://analyticsadmin.googleapis.com/v1beta/accounts', { headers: H }).then((r) => r.json());
+      out.ga_accounts = ((a && a.accounts) || []).length;
+      out.ga4_ready = out.ga_accounts > 0;
+    } catch { out.ga_accounts = null; }
+  }
   out.reads = { search_console: 'Search Console rankings', calendar: 'Meet/Calendar after-call autopilot',
     analytics_admin: 'GA4 property auto-create', analytics_summaries: 'GA4 numbers in the portal' };
   return c.json(out);
