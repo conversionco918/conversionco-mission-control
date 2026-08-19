@@ -1534,9 +1534,10 @@ async function lpInject(id){
       h += '<tr><td colspan="6" style="padding-top:0;border-bottom:1px solid var(--line)">';
       h += '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding-bottom:12px">';
       h += '<input id="adsTabUrl' + c.id + '" type="text" placeholder="landing page URL" value="' + (rep.url ? esc(rep.url) : '') + '" style="flex:1;min-width:220px;font-size:12.5px;padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:#FBFCFE">';
-      h += '<button class="btn btn-primary" style="font-size:11.5px;padding:7px 12px" onclick="adsTabConnect(' + c.id + ', this)">Connect</button>';
+      h += '<button class="btn btn-primary" style="font-size:11.5px;padding:7px 12px" title="One paste: verify the page, create their Google Analytics, register the key events, turn on their portal card, write the build sheet, and open Google Ads." onclick="adsProvision(' + c.id + ', this)">&#9889; Set it all up</button>';
+      h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsTabConnect(' + c.id + ', this)">Re-check</button>';
       h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsCopySnippet(' + c.id + ')">&#128203; Tracking code</button>';
-      h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px"' + (rep.ok ? '' : ' disabled title="Tracking must be green first"') + ' onclick="adsBuildRequest(' + c.id + ', this)">&#128226; Request build</button>';
+      h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px"' + (rep.brief ? '' : ' disabled title="Run Set it all up first"') + ' onclick="adsSheet(' + c.id + ')">&#128203; Build sheet</button>';
       if (rep.track && !rep.live_at) h += '<button class="btn btn-green" style="font-size:11.5px;padding:7px 12px" onclick="adsGoLive(' + c.id + ', this)">I enabled it</button>';
       if (link) h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsAccountPrompt(' + c.id + ')">Edit account link</button>';
       h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsIdsPrompt(' + c.id + ')">&#127991; Tracking IDs</button>';
@@ -1597,6 +1598,116 @@ async function lpInject(id){
   if (typeof _rf === 'function') {
     window.refresh = async function () { var r = await _rf.apply(this, arguments); if (VIEW === 'ads') { try { renderAdsView(); } catch (e) {} } return r; };
   }
+})();
+</script>
+
+<!-- ═══ ADS PROVISION v1 (8/19/2026) — one paste does the whole setup ═══ -->
+<style>
+  #ccMod{position:fixed;inset:0;background:rgba(11,29,51,.55);backdrop-filter:blur(3px);display:none;z-index:9000;align-items:flex-start;justify-content:center;padding:40px 16px;overflow:auto}
+  #ccMod.on{display:flex}
+  #ccModBox{background:#fff;border-radius:16px;max-width:860px;width:100%;box-shadow:0 30px 80px rgba(11,29,51,.35);overflow:hidden}
+  #ccModHead{background:var(--navy,#0B1D33);color:#fff;padding:18px 22px;display:flex;align-items:center;gap:12px}
+  #ccModHead h3{margin:0;font-size:16px;font-weight:600;letter-spacing:.01em}
+  #ccModHead .x{margin-left:auto;cursor:pointer;opacity:.7;font-size:20px;line-height:1}
+  #ccModBody{padding:20px 22px 26px}
+  .ccStep{display:flex;gap:10px;align-items:flex-start;padding:9px 0;border-bottom:1px solid var(--line,#E6E9EF)}
+  .ccStep .d{width:20px;height:20px;border-radius:50%;flex:none;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#fff}
+  .ccStep .lb{font-size:13.5px;font-weight:600;color:var(--navy,#0B1D33)}
+  .ccStep .dt{font-size:11.5px;color:var(--faint,#8A94A6);font-family:var(--font-mono,monospace);word-break:break-all}
+  .ccGo{display:flex;gap:8px;flex-wrap:wrap;margin:18px 0 6px}
+  #ccSheet{background:#0B1D33;color:#D8E2EF;font-family:var(--font-mono,ui-monospace,monospace);font-size:11.5px;line-height:1.55;padding:16px;border-radius:12px;max-height:340px;overflow:auto;white-space:pre-wrap;margin-top:6px}
+</style>
+<script>
+(function () {
+  function repOf(id) { try { return JSON.parse((STATE.settings || {})['ads_' + id] || '{}'); } catch (e) { return {}; } }
+  function modal(title, html) {
+    var m = document.getElementById('ccMod');
+    if (!m) {
+      m = document.createElement('div'); m.id = 'ccMod';
+      m.innerHTML = '<div id="ccModBox"><div id="ccModHead"><h3></h3><span class="x">&times;</span></div><div id="ccModBody"></div></div>';
+      document.body.appendChild(m);
+      m.addEventListener('click', function (e) { if (e.target === m || e.target.className === 'x') m.classList.remove('on'); });
+    }
+    m.querySelector('#ccModHead h3').textContent = title;
+    m.querySelector('#ccModBody').innerHTML = html;
+    m.classList.add('on');
+    return m;
+  }
+  window.ccModal = modal;
+
+  function stepsHtml(steps) {
+    return (steps || []).map(function (s) {
+      var col = s.done ? '#0F9D58' : '#C7A86B';
+      return '<div class="ccStep"><div class="d" style="background:' + col + '">' + (s.done ? '&#10003;' : '&#8226;') + '</div>' +
+        '<div><div class="lb">' + esc(s.label) + '</div><div class="dt">' + esc(s.detail || '') + '</div></div></div>';
+    }).join('');
+  }
+
+  function linksHtml(links, id) {
+    var b = [];
+    if (links.newCampaign) b.push('<a class="btn btn-primary" style="text-decoration:none;font-size:12.5px" href="' + esc(links.newCampaign) + '" target="_blank" rel="noopener">&#128226; Build the campaign in Google Ads &#8599;</a>');
+    else b.push('<a class="btn btn-primary" style="text-decoration:none;font-size:12.5px" href="' + esc(links.createAccount) + '" target="_blank" rel="noopener">&#10133; Create their Google Ads account &#8599;</a>');
+    if (!links.cid) b.push('<button class="btn btn-ghost" style="font-size:12.5px" onclick="adsAccountPrompt(' + id + ')">Paste their 10-digit ID</button>');
+    if (links.linkGa4) b.push('<a class="btn btn-ghost" style="text-decoration:none;font-size:12.5px" href="' + esc(links.linkGa4) + '" target="_blank" rel="noopener">Link GA4 in Ads &#8599;</a>');
+    if (links.conversions) b.push('<a class="btn btn-ghost" style="text-decoration:none;font-size:12.5px" href="' + esc(links.conversions) + '" target="_blank" rel="noopener">Import conversions &#8599;</a>');
+    b.push('<a class="btn btn-ghost" style="text-decoration:none;font-size:12.5px" href="' + esc(links.ga4) + '" target="_blank" rel="noopener">Google Analytics &#8599;</a>');
+    return '<div class="ccGo">' + b.join('') + '</div>';
+  }
+
+  function sheetHtml(brief) {
+    if (!brief || !brief.text) return '';
+    return '<div style="display:flex;align-items:center;gap:10px;margin-top:20px">' +
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:var(--faint,#8A94A6)">Campaign build sheet</div>' +
+      '<button class="btn btn-ghost" style="font-size:11.5px;padding:5px 10px" onclick="ccCopySheet(this)">&#128203; Copy all</button></div>' +
+      '<div id="ccSheet">' + esc(brief.text) + '</div>';
+  }
+
+  window.ccCopySheet = function (btn) {
+    var el = document.getElementById('ccSheet'); if (!el) return;
+    var t = el.textContent;
+    if (navigator.clipboard) navigator.clipboard.writeText(t);
+    else { var ta = document.createElement('textarea'); ta.value = t; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); }
+    btn.textContent = 'Copied ✓'; setTimeout(function () { btn.innerHTML = '&#128203; Copy all'; }, 1800);
+  };
+
+  window.adsProvision = async function (id, btn) {
+    var inp = document.getElementById('adsTabUrl' + id);
+    var url = inp ? inp.value.trim() : (repOf(id).url || '');
+    if (!url) { toast('Paste their GoHighLevel landing page URL first'); return; }
+    var label = btn ? btn.innerHTML : '';
+    if (btn) { btn.disabled = true; btn.textContent = 'Setting up…'; }
+    try {
+      var r = await api('/api/clients/' + id + '/ads-provision', { method: 'POST', body: JSON.stringify({ url: url }) });
+      if (r && r.error) { toast('⚠ ' + r.error); }
+      else {
+        STATE.settings['ads_' + id] = JSON.stringify(r.report);
+        var warn = '';
+        if (r.report && r.report.checks && r.report.checks.tracker && !r.report.checks.tracker.ok) {
+          warn = '<div style="background:#FFFAEB;border:1px solid #FEC84B;border-radius:10px;padding:12px 14px;font-size:12.5px;margin-bottom:14px">' +
+            'The tracking snippet is not on the page yet. Copy it with <b>Tracking code</b>, paste it into the GoHighLevel funnel&rsquo;s <b>head tracking code</b>, save, then hit <b>Re-check</b>. Everything else below is already done.</div>';
+        }
+        if (r.ga4 && r.ga4.pending) {
+          warn += '<div style="background:#EFF4FF;border:1px solid #B2CCFF;border-radius:10px;padding:12px 14px;font-size:12.5px;margin-bottom:14px">' +
+            'Google Analytics could not be created automatically (' + esc(r.ga4.pending) + '). Create the property by hand and paste the G- ID with <b>Tracking IDs</b> — the snippet picks it up within 5 minutes with no re-paste.</div>';
+        }
+        modal('Ads setup — ' + (url.replace(/^https?:\/\//, '').slice(0, 44)),
+          warn + stepsHtml(r.steps) + linksHtml(r.links || {}, id) +
+          '<p style="font-size:11.5px;color:var(--faint,#8A94A6);margin:10px 0 0">Mission Control never creates or enables an ad. It sets up the measurement, writes the sheet, and opens the door — you build the campaign and turn it on.</p>' +
+          sheetHtml(r.brief));
+        toast('Setup done ⚡');
+        try { renderAdsView(); } catch (e) {}
+      }
+    } catch (e) { toast('⚠ Setup failed, try again'); }
+    if (btn) { btn.disabled = false; btn.innerHTML = label || '&#9889; Set it all up'; }
+  };
+
+  window.adsSheet = async function (id) {
+    try {
+      var r = await api('/api/clients/' + id + '/ads-brief');
+      if (r && r.error) { toast('⚠ ' + r.error); return; }
+      modal('Campaign build sheet', linksHtml(r.links || {}, id) + sheetHtml(r.brief));
+    } catch (e) { toast('⚠ Could not load the sheet'); }
+  };
 })();
 </script>
 </body>

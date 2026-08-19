@@ -1691,6 +1691,26 @@ app.get('/portal/:id/:token', async (c) => {
   }
   // review pulse — engines record it into ranks.json weekly (honest approximations)
   const reviews = (ranks && ranks.reviews && ranks.reviews.you) ? ranks.reviews : null;
+  // 📣 ADS / ANALYTICS (8/19/2026) — the client's own marketing numbers, shown
+  // to THEM. Our own beacon counts (hits slug ext-<id>, path ev-<name>) render
+  // instantly; the live Google Analytics totals are fetched by the page after
+  // load from /portal-ads so a slow Google call never blocks the portal.
+  let adsRep = null, adsEv = null;
+  try {
+    const ar = JSON.parse(settings['ads_' + id] || '{}');
+    if (ar && ar.url && ar.portal_analytics !== false) {
+      adsRep = ar;
+      const evRowsAds = (await db.prepare(
+        `SELECT path, SUM(n) AS n FROM hits WHERE slug = ? AND day > date('now','-28 days') GROUP BY path`
+      ).bind('ext-' + id).all()).results || [];
+      adsEv = { views: 0, call_click: 0, sms_click: 0, form_submit: 0, book_click: 0 };
+      for (const r of evRowsAds) {
+        const p = String(r.path || '');
+        if (p.indexOf('ev-') === 0) { const k = p.slice(3); if (k in adsEv) adsEv[k] += Number(r.n) || 0; }
+        else adsEv.views += Number(r.n) || 0;
+      }
+    }
+  } catch {}
   // photo library
   const photoSlots = new Set(((await db.prepare(`SELECT path FROM site_files WHERE slug = ? AND path LIKE 'photo-%'`).bind(`_assets-${id}`).all()).results || []).map((r) => Number(String(r.path).replace('photo-', '')) || 0));
   // share-a-win image data
@@ -1864,6 +1884,25 @@ app.get('/portal/:id/:token', async (c) => {
       </div>
     </div>`).join('')}
   </div>` : ''}
+
+  ${adsRep ? `<div class="card" style="--sec:#1A73E8"><span class="eyebrow">Your Marketing</span><h2>What your landing page is doing</h2>
+    <p class="note" style="margin:0 0 14px">Last 28 days, measured on your own page — every tap counted the moment it happened.</p>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px">
+      ${[['Page views', adsEv.views], ['Calls tapped', adsEv.call_click], ['Texts tapped', adsEv.sms_click], ['Forms sent', adsEv.form_submit], ['Bookings started', adsEv.book_click]]
+        .map(([lbl, n]) => `<div style="background:var(--wash,#FAF9F6);border:1px solid var(--line);border-radius:12px;padding:14px">
+          <div style="font-family:'Cormorant Garamond',serif;font-size:34px;line-height:1">${Number(n) || 0}</div>
+          <div style="font-size:12px;color:var(--muted);margin-top:2px">${lbl}</div></div>`).join('')}
+    </div>
+    <div id="ga4box" style="margin-top:14px;font-size:13.5px;color:var(--muted)">Loading your Google Analytics totals…</div>
+    <p class="note" style="margin-top:12px">Calls, texts, forms, and bookings are tracked as key events in your own Google Analytics property${adsRep.ga4_measurement ? ` (${escq(adsRep.ga4_measurement)})` : ''} — so the numbers here and the numbers in Google agree.</p>
+  </div>
+  <script>
+    fetch('/portal-ads/${id}/${tok}').then(r => r.json()).then(d => {
+      var b = document.getElementById('ga4box'); if (!b) return;
+      if (d && d.ok) b.innerHTML = 'Google Analytics, last 28 days: <b>' + d.sessions.toLocaleString() + '</b> sessions · <b>' + d.users.toLocaleString() + '</b> people · <b>' + d.keyEvents.toLocaleString() + '</b> key events.';
+      else b.textContent = 'Google Analytics totals are still warming up — your own counts above are live either way.';
+    }).catch(function(){ var b = document.getElementById('ga4box'); if (b) b.textContent = ''; });
+  </script>` : ''}
 
   ${reviews ? `<div class="card" style="--sec:#BE123C"><span class="eyebrow">Reviews</span><h2>Your review pulse</h2>
     <div style="display:flex;gap:20px;align-items:baseline;flex-wrap:wrap">
@@ -5520,41 +5559,44 @@ app.get('/api/clients/:id/rankings', async (c) => {
 // creates the client's GA4 property + web stream via the Admin API and saves
 // ga4_property (numeric id) + ga4_measurement (G-XXXX) into settings ads_<id>.
 // The one-paste snippet (/t/:id/t.js) then serves gtag automatically.
-app.post('/api/clients/:id/ga4-create', async (c) => {
-  const id = Number(c.req.param('id')) || 0;
-  const db = c.env.DB;
+// GA4 provisioning, callable from any lane (idempotent): creates the client's
+// own GA4 property + web data stream + the four key events, and stores
+// ga4_property / ga4_measurement into settings ads_<id> so /t/:id/t.js serves
+// Google Analytics automatically with NO re-paste on the client's page.
+async function ga4Ensure(env, id) {
+  const db = env.DB;
   const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
-  if (!client) return c.json({ error: 'no such client' }, 404);
+  if (!client) return { error: 'no such client' };
   const settings = await getSettings(db);
   let rep = {}; try { rep = JSON.parse(settings['ads_' + id] || '{}'); } catch {}
-  if (rep.ga4_measurement) return c.json({ ok: true, already: true, measurement: rep.ga4_measurement });
-  if (!rep.url) return c.json({ error: 'Connect the landing page first.' }, 400);
-  if (!c.env.GOOGLE_CLIENT_ID || !c.env.GOOGLE_CLIENT_SECRET || !c.env.GOOGLE_REFRESH_TOKEN) return c.json({ pending: 'no-google-auth' });
+  if (rep.ga4_measurement) return { ok: true, already: true, property: rep.ga4_property || '', measurement: rep.ga4_measurement };
+  if (!rep.url) return { error: 'Connect the landing page first.' };
+  if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET || !env.GOOGLE_REFRESH_TOKEN) return { pending: 'no-google-auth' };
   try {
     const tr = await fetch('https://oauth2.googleapis.com/token', {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ client_id: c.env.GOOGLE_CLIENT_ID, client_secret: c.env.GOOGLE_CLIENT_SECRET, refresh_token: c.env.GOOGLE_REFRESH_TOKEN, grant_type: 'refresh_token' }),
+      body: new URLSearchParams({ client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET, refresh_token: env.GOOGLE_REFRESH_TOKEN, grant_type: 'refresh_token' }),
     });
     const td = await tr.json();
-    if (!td.access_token) return c.json({ pending: 'token-failed' });
+    if (!td.access_token) return { pending: 'token-failed' };
     const H = { Authorization: 'Bearer ' + td.access_token, 'Content-Type': 'application/json' };
     // account id: first GA account on the authorized user
     const accs = await fetch('https://analyticsadmin.googleapis.com/v1beta/accounts', { headers: H }).then((r) => r.json());
-    if (accs.error) return c.json({ pending: accs.error.status === 'PERMISSION_DENIED' ? 'scope' : 'accounts-' + (accs.error.code || '?'), note: String(accs.error.message || '').slice(0, 140) });
+    if (accs.error) return { pending: accs.error.status === 'PERMISSION_DENIED' ? 'scope' : 'accounts-' + (accs.error.code || '?'), note: String(accs.error.message || '').slice(0, 140) };
     const acct = (accs.accounts || [])[0];
-    if (!acct) return c.json({ pending: 'no-ga-account', note: 'Sign into analytics.google.com once with conversionco918 to create the account shell.' });
+    if (!acct) return { pending: 'no-ga-account', note: 'Sign into analytics.google.com once with conversionco918 to create the account shell.' };
     const bizName = String(client.name || client.email || ('Client ' + id)).slice(0, 90);
     const prop = await fetch('https://analyticsadmin.googleapis.com/v1beta/properties', {
       method: 'POST', headers: H,
       body: JSON.stringify({ parent: acct.name, displayName: bizName, timeZone: 'America/Chicago', currencyCode: 'USD', industryCategory: 'HEALTHCARE' }),
     }).then((r) => r.json());
-    if (prop.error) return c.json({ pending: 'property-' + (prop.error.code || '?'), note: String(prop.error.message || '').slice(0, 140) });
+    if (prop.error) return { pending: 'property-' + (prop.error.code || '?'), note: String(prop.error.message || '').slice(0, 140) };
     let host = ''; try { host = new URL(rep.url).origin; } catch {}
     const stream = await fetch('https://analyticsadmin.googleapis.com/v1beta/' + prop.name + '/dataStreams', {
       method: 'POST', headers: H,
       body: JSON.stringify({ type: 'WEB_DATA_STREAM', displayName: bizName + ' site', webStreamData: { defaultUri: host || 'https://example.com' } }),
     }).then((r) => r.json());
-    if (stream.error) return c.json({ pending: 'stream-' + (stream.error.code || '?'), note: String(stream.error.message || '').slice(0, 140) });
+    if (stream.error) return { pending: 'stream-' + (stream.error.code || '?'), note: String(stream.error.message || '').slice(0, 140) };
     const measurement = (stream.webStreamData && stream.webStreamData.measurementId) || '';
     rep.ga4_property = String(prop.name || '').replace('properties/', '');
     rep.ga4_measurement = measurement;
@@ -5568,8 +5610,13 @@ app.post('/api/clients/:id/ga4-create', async (c) => {
       } catch {}
     }
     await logEvent(db, id, 'ga4_created', `📊 GA4 property created for ${bizName} — ${measurement}. The tracking snippet now serves Google Analytics automatically; re-paste NOT needed.`);
-    return c.json({ ok: true, property: rep.ga4_property, measurement });
-  } catch (e) { return c.json({ pending: 'error', note: String(e && e.message || e).slice(0, 140) }); }
+    return { ok: true, property: rep.ga4_property, measurement };
+  } catch (e) { return { pending: 'error', note: String(e && e.message || e).slice(0, 140) }; }
+}
+
+app.post('/api/clients/:id/ga4-create', async (c) => {
+  const r = await ga4Ensure(c.env, Number(c.req.param('id')) || 0);
+  return c.json(r, r.error ? 400 : 200);
 });
 
 
@@ -5657,6 +5704,324 @@ app.post('/api/clients/:id/ads-account', async (c) => {
   await setSetting(db, 'ads_' + id, JSON.stringify(rep));
   await logEvent(db, id, 'ads_account', raw ? `📣 Google Ads account linked for ${client.business_name || client.name || client.email}` : 'Google Ads account link cleared');
   return c.json({ ok: true, ads_cid: rep.ads_cid || '', ads_url: rep.ads_url || '' });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// 📣 ONE-PASTE ADS PROVISION (8/19/2026) — Tiffany pastes the GoHighLevel
+// landing page ONCE and Mission Control does every piece of plumbing that
+// normally takes an hour of clicking:
+//   1. verifies the page (tags, call links, form, policy words)
+//   2. creates the client's own GA4 property + web stream + the four key
+//      events, and saves the measurement id so /t/<id>/t.js serves it live
+//   3. turns the portal analytics card on for that client
+//   4. writes the campaign build sheet (Ben-Heath structure) she copies from
+//   5. hands back the deep links that drop her straight into Google Ads
+// SHE builds the campaign herself — this lane never touches spend, never
+// creates an ad, and never promises a result. It only removes the plumbing.
+
+const VERTICAL_ADS = {
+  iv: {
+    label: 'IV therapy',
+    core: ['iv therapy', 'iv hydration', 'mobile iv', 'iv drip', 'vitamin iv therapy', 'iv fluids'],
+    intent: ['hangover iv', 'iv therapy near me', 'at home iv therapy', 'iv hydration near me', 'mobile iv nurse'],
+    negatives: ['free', 'jobs', 'job', 'hiring', 'salary', 'school', 'training', 'certification', 'course', 'classes',
+      'how to become', 'nurse job', 'diy', 'at home kit', 'kit', 'supplies', 'wholesale', 'amazon', 'reddit',
+      'side effects', 'symptoms', 'dangers', 'insurance', 'medicaid', 'medicare', 'hospital', 'urgent care', 'er'],
+    headlines: ['Mobile IV — We Come to You', 'Feel Better in 45 Minutes', 'Delivered by a Licensed RN',
+      'Same-Day Appointments', 'No Clinic. No Waiting Room.', 'Hydration Without the Drive',
+      'Book Today, Treated Today', 'Fluids, Vitamins, Fast', 'A Nurse at Your Door',
+      'Rehydrate. Recover. Repeat.', 'Text Us for Today’s Times'],
+    descriptions: ['A licensed nurse comes to you with the drip you need. Booking takes under a minute.',
+      'No clinic, no waiting room. Treated at home, at work, or wherever you happen to be.',
+      'Same-day times are often open. Call or text and we will confirm your appointment today.',
+      'Tell us how you feel and we will match you to the right drip before we arrive.'],
+    callouts: ['Licensed Nurses', 'Same-Day Times', 'We Come to You', 'Transparent Pricing'],
+    sitelinks: [['Our Drip Menu', 'See every drip and what is in it.'], ['Pricing', 'Simple pricing, no surprises.'],
+      ['Book Now', 'Pick a time that works for you.'], ['About Us', 'Meet the nurse behind the bag.']],
+  },
+  'med-spa': {
+    label: 'med spa',
+    core: ['med spa', 'medspa', 'medical spa', 'facial treatment', 'skin treatment'],
+    intent: ['med spa near me', 'best med spa', 'medspa consultation'],
+    negatives: ['free', 'jobs', 'hiring', 'salary', 'school', 'training', 'certification', 'course', 'diy',
+      'at home', 'reddit', 'wholesale', 'supplies', 'groupon', 'side effects', 'dangers'],
+    headlines: ['Med Spa Consultations', 'Results You Can See', 'Book Your Consultation', 'Treated by Licensed Pros',
+      'Same-Week Appointments', 'Quiet, Private, Unhurried', 'A Plan Built for Your Skin'],
+    descriptions: ['A licensed provider maps a plan for your skin before anything is booked.',
+      'Private, unhurried appointments. Ask every question you have — we have the time.',
+      'Consultations are quick to book and easy to reschedule if life gets in the way.'],
+    callouts: ['Licensed Providers', 'Private Suites', 'Same-Week Times', 'Clear Pricing'],
+    sitelinks: [['Our Services', 'Every treatment we offer.'], ['Pricing', 'Clear pricing up front.'],
+      ['Book a Consult', 'Find a time this week.'], ['About Us', 'Meet your provider.']],
+  },
+  injector: {
+    label: 'injectables',
+    core: ['botox', 'lip filler', 'dermal filler', 'injectables'],
+    intent: ['botox near me', 'lip filler near me', 'filler consultation'],
+    negatives: ['free', 'jobs', 'hiring', 'school', 'training', 'certification', 'course', 'diy', 'at home',
+      'reddit', 'wholesale', 'supplies', 'buy online', 'side effects', 'gone wrong', 'dissolve'],
+    headlines: ['Consultations, Not Pressure', 'Subtle, Natural Results', 'Book Your Consultation',
+      'Licensed Injector', 'Same-Week Appointments', 'Your Face, Still Yours'],
+    descriptions: ['A licensed injector talks through your goals before anything is decided.',
+      'Natural, conservative work — we would rather do less and have you come back.',
+      'Consultations are easy to book and there is never pressure to treat that day.'],
+    callouts: ['Licensed Injector', 'Natural Results', 'Consultations', 'Clear Pricing'],
+    sitelinks: [['Our Services', 'What we treat and how.'], ['Pricing', 'Clear pricing up front.'],
+      ['Book a Consult', 'Find a time this week.'], ['About Us', 'Meet your injector.']],
+  },
+  'weight-loss': {
+    label: 'medical weight loss',
+    core: ['medical weight loss', 'weight loss clinic', 'weight loss program', 'weight loss doctor'],
+    intent: ['weight loss clinic near me', 'medical weight loss near me', 'weight loss consultation'],
+    negatives: ['free', 'jobs', 'hiring', 'school', 'training', 'certification', 'diy', 'at home', 'reddit',
+      'wholesale', 'buy online', 'coupon', 'insurance', 'medicaid', 'medicare', 'side effects', 'dangers'],
+    headlines: ['Medical Weight Loss', 'A Plan Built Around You', 'Book Your Consultation',
+      'Provider-Led, Not a Fad', 'Same-Week Appointments', 'Real Support, Every Week'],
+    descriptions: ['A licensed provider builds the plan and stays with you through every check-in.',
+      'Consultations are unhurried. Bring your history and your questions — all of them.',
+      'Weekly support, honest expectations, and a plan that fits the life you actually have.'],
+    callouts: ['Licensed Providers', 'Weekly Check-Ins', 'Clear Pricing', 'Same-Week Times'],
+    sitelinks: [['Our Program', 'How the program works.'], ['Pricing', 'Clear pricing up front.'],
+      ['Book a Consult', 'Find a time this week.'], ['About Us', 'Meet your provider.']],
+  },
+  'lash-brow': {
+    label: 'lashes & brows',
+    core: ['lash extensions', 'eyelash extensions', 'brow lamination', 'lash lift'],
+    intent: ['lash extensions near me', 'brow artist near me', 'lash fill'],
+    negatives: ['free', 'jobs', 'hiring', 'school', 'training', 'certification', 'course', 'diy', 'at home',
+      'kit', 'supplies', 'wholesale', 'amazon', 'reddit', 'how to'],
+    headlines: ['Lashes That Last', 'Book Your Lash Appointment', 'Brows, Shaped for You',
+      'Certified Lash Artist', 'Same-Week Appointments', 'Wake Up Ready'],
+    descriptions: ['A certified artist maps every set to your eye shape — no two sets are the same.',
+      'Easy online booking, gentle application, and aftercare you will actually follow.',
+      'New sets and fills both bookable online. Reschedule any time if life happens.'],
+    callouts: ['Certified Artists', 'Online Booking', 'Fills Welcome', 'Clear Pricing'],
+    sitelinks: [['Our Services', 'Sets, fills, and brows.'], ['Pricing', 'Clear pricing up front.'],
+      ['Book Now', 'Pick your time.'], ['About Us', 'Meet your artist.']],
+  },
+};
+
+// Google Ads asset character limits — anything that does not fit is dropped,
+// never truncated mid-word (a cut-off headline is worse than one fewer).
+function adsFit(list, n) { return (list || []).map((s) => String(s || '').trim()).filter((s) => s && s.length <= n); }
+
+function adsBrief(client, rep) {
+  let i1 = {}; try { i1 = JSON.parse(client.intake1_data || '{}'); } catch {}
+  const biz = String(client.business_name || i1['Business Name'] || client.name || 'Your business').trim();
+  const cityFull = String(i1['Primary City & State'] || i1['Location'] || '').trim();
+  const city = (cityFull.split(',')[0] || '').trim();
+  const V = String(client.vertical || 'iv').toLowerCase();
+  const P = VERTICAL_ADS[V] || VERTICAL_ADS.iv;
+  const phone = String(client.phone || '').trim();
+
+  // ── keywords: exact first (Ben Heath: exact carries the budget, phrase scouts)
+  const kwCore = [];
+  for (const t of P.core) {
+    kwCore.push('[' + t + ']');
+    if (city) kwCore.push('[' + t + ' ' + city.toLowerCase() + ']');
+  }
+  const kwLocal = city ? P.core.slice(0, 4).flatMap((t) => ['"' + t + ' ' + city.toLowerCase() + '"', '"' + t + ' near me"']) : P.core.slice(0, 4).map((t) => '"' + t + ' near me"');
+  const kwIntent = P.intent.flatMap((t) => ['[' + t + ']', '"' + t + '"']);
+
+  const headlines = adsFit([
+    ...(city ? [P.label.replace(/\b\w/g, (m) => m.toUpperCase()) + ' in ' + city] : []),
+    ...(biz ? [biz] : []),
+    ...P.headlines,
+    ...(city ? ['Serving ' + city + ' & Nearby'] : []),
+    ...(phone ? ['Call ' + phone] : []),
+  ], 30);
+
+  const descriptions = adsFit(P.descriptions.map((d) => (city && d.length + city.length + 5 <= 90 ? d : d)), 90);
+
+  const brief = {
+    v: 1,
+    built: new Date().toISOString(),
+    biz, city: cityFull || city, vertical: P.label,
+    url: rep.url || '',
+    campaign: {
+      name: biz + ' — Search — ' + (city || 'Local'),
+      type: 'Search (no Display Network, no Search Partners — uncheck both)',
+      goal: 'Leads · without a goal guidance (pick "Create a campaign without a goal\'s guidance")',
+      budget: '$25–$40/day to start. Do not start higher — you cannot learn from noise.',
+      bidding: 'Start on Maximize Clicks with a max CPC cap of ~$4. Switch to Maximize Conversions only after 15–30 recorded conversions.',
+      locations: (city ? 'Radius targeting: 12–20 miles around ' + city : 'Radius targeting around the service area'),
+      locationSetting: 'Location options → Presence: "People in or regularly in your targeted locations". NEVER leave it on the default (interest) — that is the #1 wasted-spend mistake.',
+      schedule: 'If calls are the main conversion, run the ad schedule against real answer hours. If the form/booking is the main conversion, run all hours.',
+      devices: 'Leave all devices on for two weeks, then read the device report before adjusting.',
+      network: 'Search only. Display expansion OFF.',
+    },
+    adGroups: [
+      { name: 'Core — ' + P.label, keywords: kwCore },
+      { name: 'Local — ' + (city || 'near me'), keywords: kwLocal },
+      { name: 'Intent — problem/urgency', keywords: kwIntent },
+    ],
+    negatives: P.negatives,
+    headlines, descriptions,
+    callouts: adsFit(P.callouts, 25),
+    sitelinks: (P.sitelinks || []).filter((s) => s[0].length <= 25 && s[1].length <= 35),
+    assets: [
+      phone ? 'Call asset: ' + phone + ' (turn on call reporting so calls count as conversions)' : 'Call asset: add the business phone number',
+      'Location asset: link the Google Business Profile once it is verified',
+      'Structured snippet: Services → ' + P.core.slice(0, 4).join(', '),
+    ],
+    conversions: [
+      'Tools → Data manager → link the GA4 property (already created by Mission Control)',
+      'Goals → Conversions → Import → Google Analytics 4 → import: call_click, sms_click, form_submit, book_click',
+      'Set form_submit and book_click as Primary. Set call_click and sms_click as Primary only if you answer reliably; otherwise Secondary.',
+      'Leave "Include in Conversions" ON for primaries — that is what Smart Bidding learns from.',
+    ],
+    policy: [
+      'No outcome or cure claims anywhere in the ad or on the landing page — healthcare copy gets disapproved for this first.',
+      'No prescription drug names in ad text.',
+      'Landing page must show a real business name, a working phone number, and privacy + terms links, or Google flags "destination not working".',
+      'The ad promise and the landing page headline must match, word for word where possible.',
+    ],
+  };
+
+  const L = [];
+  L.push('CAMPAIGN BUILD SHEET — ' + biz + (city ? ' (' + city + ')' : ''));
+  L.push('Landing page: ' + (rep.url || '(not connected)'));
+  L.push('');
+  L.push('1. CAMPAIGN SETTINGS');
+  for (const [k, v] of Object.entries(brief.campaign)) L.push('   • ' + k + ': ' + v);
+  L.push('');
+  L.push('2. AD GROUPS + KEYWORDS');
+  for (const g of brief.adGroups) { L.push('   ' + g.name); L.push('      ' + g.keywords.join('  ')); }
+  L.push('');
+  L.push('3. NEGATIVE KEYWORDS (paste as a negative list, broad match)');
+  L.push('   ' + brief.negatives.join(', '));
+  L.push('');
+  L.push('4. HEADLINES (' + headlines.length + ', all within 30 characters)');
+  for (const h of headlines) L.push('   • ' + h);
+  L.push('');
+  L.push('5. DESCRIPTIONS (all within 90 characters)');
+  for (const d of descriptions) L.push('   • ' + d);
+  L.push('');
+  L.push('6. ASSETS');
+  for (const a of brief.assets) L.push('   • ' + a);
+  L.push('   • Callouts: ' + brief.callouts.join(' · '));
+  for (const s of brief.sitelinks) L.push('   • Sitelink: ' + s[0] + ' — ' + s[1]);
+  L.push('');
+  L.push('7. CONVERSION TRACKING (do this BEFORE you enable the campaign)');
+  for (const s of brief.conversions) L.push('   • ' + s);
+  L.push('');
+  L.push('8. POLICY GUARDRAILS');
+  for (const s of brief.policy) L.push('   • ' + s);
+  L.push('');
+  L.push('Built by Mission Control. Tracking is already live on the page — every');
+  L.push('conversion you import above is already firing.');
+  brief.text = L.join('\n');
+  return brief;
+}
+
+// Deep links that drop her exactly where she needs to be in Google's UI.
+function adsDeepLinks(rep, settings) {
+  const cid = String(rep.ads_cid || '').replace(/\D/g, '');
+  const mcc = String((settings && settings.ads_mcc_id) || '').replace(/\D/g, '');
+  const q = cid ? '?__c=' + cid : '';
+  return {
+    cid,
+    account: rep.ads_url || (cid ? 'https://ads.google.com/aw/overview' + q : 'https://ads.google.com/nav/selectaccount'),
+    newCampaign: cid ? 'https://ads.google.com/aw/campaigns/new' + q : '',
+    campaigns: cid ? 'https://ads.google.com/aw/campaigns' + q : '',
+    conversions: cid ? 'https://ads.google.com/aw/conversions' + q : '',
+    linkGa4: cid ? 'https://ads.google.com/aw/linkedaccounts' + q : '',
+    createAccount: mcc ? 'https://ads.google.com/aw/accountmanagement?__c=' + mcc : 'https://ads.google.com/nav/selectaccount',
+    ga4: rep.ga4_property ? 'https://analytics.google.com/analytics/web/#/p' + rep.ga4_property + '/reports/intelligenthome' : 'https://analytics.google.com/',
+    clarity: rep.clarity_id ? 'https://clarity.microsoft.com/projects/view/' + rep.clarity_id + '/dashboard' : 'https://clarity.microsoft.com/',
+  };
+}
+
+// THE ONE PASTE. Body: { url, track? }.
+app.post('/api/clients/:id/ads-provision', async (c) => {
+  const id = Number(c.req.param('id')) || 0;
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'no such client' }, 404);
+  let body = {}; try { body = await c.req.json(); } catch {}
+  let settings = await getSettings(db);
+  let rep = {}; try { rep = JSON.parse(settings['ads_' + id] || '{}'); } catch {}
+
+  let url = String(body.url || rep.url || '').trim();
+  if (url && !/^https?:\/\//i.test(url)) url = 'https://' + url;
+  try { new URL(url); } catch { return c.json({ error: 'Paste the full landing page URL (the GoHighLevel funnel link).' }, 400); }
+
+  // 1 — verify the page
+  const report = await adsVerify(c.env, id, url);
+  rep = { ...rep, ...report, url };
+  if (!rep.track) { rep.track = String(body.track || 'addon'); rep.monthly = 249; rep.enrolled_at = rep.enrolled_at || new Date().toISOString(); }
+  await setSetting(db, 'ads_' + id, JSON.stringify(rep));
+
+  // 2 — GA4 property + key events (idempotent; safe to call every paste)
+  const ga4 = await ga4Ensure(c.env, id);
+  settings = await getSettings(db);
+  try { rep = JSON.parse(settings['ads_' + id] || '{}'); } catch {}
+
+  // 3 — portal analytics card ON for this client
+  rep.portal_analytics = rep.portal_analytics === false ? false : true;
+
+  // 4 — the build sheet she works from
+  rep.brief = adsBrief(client, rep);
+  rep.provisioned_at = new Date().toISOString();
+  await setSetting(db, 'ads_' + id, JSON.stringify(rep));
+
+  const links = adsDeepLinks(rep, settings);
+  const lights = ['ga4', 'clarity', 'phone', 'form', 'policy', 'tracker']
+    .map((k) => (report.checks[k] && report.checks[k].ok ? '✓' : '✗') + k).join(' ');
+  await logEvent(db, id, 'ads_provisioned',
+    `\u{1F4E3} Ads provision on ${url} — ${lights}${ga4.measurement ? ' · GA4 ' + ga4.measurement : ''}${ga4.pending ? ' · GA4 pending (' + ga4.pending + ')' : ''}. Build sheet ready; campaign is Tiffany's to build in Google Ads.`);
+
+  const steps = [
+    { k: 'snippet', done: !!(report.checks.tracker && report.checks.tracker.ok),
+      label: 'Tracking snippet on the page', detail: `<script defer src="${BASE_URL}/t/${id}/t.js"></script> in the GHL funnel head` },
+    { k: 'ga4', done: !!(rep.ga4_measurement), label: 'Google Analytics property', detail: rep.ga4_measurement || (ga4.pending ? 'pending: ' + ga4.pending : 'not created') },
+    { k: 'events', done: !!(rep.ga4_measurement), label: 'Key events registered', detail: 'call_click · sms_click · form_submit · book_click' },
+    { k: 'portal', done: true, label: 'Client portal analytics card', detail: 'live on their portal now' },
+    { k: 'account', done: !!links.cid, label: 'Google Ads account linked', detail: links.cid ? links.cid : 'paste the 10-digit customer ID in the Ads tab' },
+    { k: 'brief', done: true, label: 'Campaign build sheet', detail: rep.brief.headlines.length + ' headlines · ' + rep.brief.adGroups.length + ' ad groups' },
+    { k: 'campaign', done: !!rep.live_at, label: 'Campaign built + enabled (yours)', detail: 'Mission Control never enables spend' },
+  ];
+  return c.json({ ok: true, report: rep, ga4, links, steps, brief: rep.brief });
+});
+
+// Re-read (or regenerate) the build sheet without re-verifying the page.
+app.get('/api/clients/:id/ads-brief', async (c) => {
+  const id = Number(c.req.param('id')) || 0;
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'no such client' }, 404);
+  const settings = await getSettings(db);
+  let rep = {}; try { rep = JSON.parse(settings['ads_' + id] || '{}'); } catch {}
+  const fresh = c.req.query('fresh') === '1';
+  if (fresh || !rep.brief) { rep.brief = adsBrief(client, rep); await setSetting(db, 'ads_' + id, JSON.stringify(rep)); }
+  return c.json({ ok: true, brief: rep.brief, links: adsDeepLinks(rep, settings) });
+});
+
+// Portal analytics feed — the client's own numbers, on demand (GA4 is a live
+// call, so the portal renders our own counts instantly and fills this in after).
+app.get('/portal-ads/:id/:token', async (c) => {
+  const id = Number(c.req.param('id')) || 0;
+  if (c.req.param('token') !== await portalToken(c.env, 'portal', id)) return c.json({ error: 'nope' }, 403);
+  const settings = await getSettings(c.env.DB);
+  let rep = {}; try { rep = JSON.parse(settings['ads_' + id] || '{}'); } catch {}
+  if (!rep.ga4_property) return c.json({ pending: 'no-property' });
+  if (!c.env.GOOGLE_CLIENT_ID || !c.env.GOOGLE_CLIENT_SECRET || !c.env.GOOGLE_REFRESH_TOKEN) return c.json({ pending: 'no-google-auth' });
+  try {
+    const tr = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ client_id: c.env.GOOGLE_CLIENT_ID, client_secret: c.env.GOOGLE_CLIENT_SECRET, refresh_token: c.env.GOOGLE_REFRESH_TOKEN, grant_type: 'refresh_token' }),
+    });
+    const td = await tr.json();
+    if (!td.access_token) return c.json({ pending: 'token-failed' });
+    const rr = await fetch(`https://analyticsdata.googleapis.com/v1beta/properties/${encodeURIComponent(rep.ga4_property)}:runReport`, {
+      method: 'POST', headers: { Authorization: 'Bearer ' + td.access_token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dateRanges: [{ startDate: '28daysAgo', endDate: 'today' }], metrics: [{ name: 'sessions' }, { name: 'keyEvents' }, { name: 'totalUsers' }] }),
+    });
+    if (!rr.ok) return c.json({ pending: 'api-' + rr.status });
+    const data = await rr.json();
+    const m = (data.rows && data.rows[0] && data.rows[0].metricValues) || [];
+    return c.json({ ok: true, sessions: Number((m[0] || {}).value || 0), keyEvents: Number((m[1] || {}).value || 0), users: Number((m[2] || {}).value || 0) });
+  } catch (e) { return c.json({ pending: 'error' }); }
 });
 
 export default {
