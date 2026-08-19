@@ -1539,6 +1539,7 @@ async function lpInject(id){
       h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsHeadCode(' + c.id + ')">&#129513; Head code</button>';
       h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px"' + (rep.brief ? '' : ' disabled title="Run Set it all up first"') + ' onclick="adsSheet(' + c.id + ')">&#128203; Build sheet</button>';
       h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" title="Average ticket, close rate, target clients — the sheet back-solves the budget from these." onclick="adsEcon(' + c.id + ')">&#128181; Economics' + ((rep.econ && rep.econ.target_clients) ? ' &#10003;' : '') + '</button>';
+      h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" title="Create the $249/mo Stripe billing link for ads management." onclick="adsBilling(' + c.id + ', this)">&#128179; ' + (rep.sub_status === 'active' ? 'Billing live &#10003;' : rep.sub_link ? 'Billing link' : '$249/mo billing') + '</button>';
       if (rep.track && !rep.live_at) h += '<button class="btn btn-green" style="font-size:11.5px;padding:7px 12px" onclick="adsGoLive(' + c.id + ', this)">I enabled it</button>';
       if (link) h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsAccountPrompt(' + c.id + ')">Edit account link</button>';
       h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsIdsPrompt(' + c.id + ')">&#127991; Tracking IDs</button>';
@@ -1832,7 +1833,22 @@ async function lpInject(id){
     h += '</div>';
     if (model.headroom < 0) {
       h += '<div style="margin-top:12px;background:#FEF3F2;border:1px solid #FDA29B;border-radius:10px;padding:11px 14px;font-size:12.5px;color:#B42318">' +
-        '<b>The math does not work at this cost per click.</b> A lead would cost more than it earns. Three real fixes: raise what a client is worth (packages, memberships), raise the landing page conversion rate, or narrow to cheaper, higher-intent keywords. Do not solve it by spending more.</div>';
+        '<b>The math does not work at these numbers.</b> A lead would cost more than it earns. Spending more does not fix it — it just loses faster.</div>';
+      if (model.required) {
+        h += '<div style="margin-top:12px;border:1.5px solid var(--gold,#C7A86B);border-radius:12px;padding:12px 14px">' +
+          '<div style="font-size:12.5px;font-weight:700;color:var(--navy,#0B1D33);margin-bottom:6px">What would have to be true — any one of these closes the gap</div>' +
+          '<ul style="margin:0;padding-left:18px;font-size:12.5px;color:var(--muted,#5D6B7E);line-height:1.7">' +
+          '<li>A new client is worth <b>$' + model.required.ticket + '</b> instead of $' + model.ticket +
+            ' <span style="color:var(--faint,#8A94A6)">(count memberships, packages and repeat visits, not one visit)</span></li>' +
+          '<li>The landing page converts at <b>' + model.required.lp_cvr + '%</b> instead of ' + Math.round(model.lp_cvr * 100) + '%</li>' +
+          '<li>Cost per click comes in at <b>$' + model.required.cpc + '</b> instead of $' + model.cpc +
+            ' <span style="color:var(--faint,#8A94A6)">(tighter, higher-intent keywords)</span></li>' +
+          '</ul></div>';
+      }
+    } else if (model.required) {
+      h += '<div style="margin-top:12px;background:#ECFDF3;border:1px solid #6CE9A6;border-radius:10px;padding:11px 14px;font-size:12.5px;color:#067647">' +
+        'The math works. It stops working if a client drops below <b>$' + model.required.ticket + '</b> in value, the page falls under <b>' +
+        model.required.lp_cvr + '%</b>, or the cost per click passes <b>$' + model.required.cpc + '</b>.</div>';
     }
     if (model.smart_bidding_ok === false) {
       h += '<div style="margin-top:12px;background:#FFFAEB;border:1px solid #FEC84B;border-radius:10px;padding:11px 14px;font-size:12.5px;color:#B54708">' +
@@ -1859,6 +1875,30 @@ async function lpInject(id){
       }
     } catch (e) { toast('⚠ Could not save, try again'); }
     btn.disabled = false; btn.textContent = 'Save and rebuild the sheet';
+  };
+
+  window.adsBilling = async function (id, btn) {
+    var rep = {}; try { rep = JSON.parse((STATE.settings || {})['ads_' + id] || '{}'); } catch (e) {}
+    if (rep.sub_status === 'active') { toast('Ads billing is already live for this client — $249/mo'); return; }
+    if (rep.sub_link) {
+      if (navigator.clipboard) navigator.clipboard.writeText(rep.sub_link);
+      toast('Billing link copied 💳 — send it to the client, they enter their own card');
+      return;
+    }
+    var label = btn ? btn.innerHTML : '';
+    btn.disabled = true; btn.textContent = 'Creating…';
+    try {
+      var r = await api('/api/clients/' + id + '/ads-subscription', { method: 'POST', body: '{}' });
+      if (r && r.error) { toast('⚠ ' + r.error); }
+      else {
+        rep.sub_link = r.url; rep.sub_status = 'pending';
+        STATE.settings['ads_' + id] = JSON.stringify(rep);
+        if (navigator.clipboard) navigator.clipboard.writeText(r.url);
+        toast('$249/mo billing link created and copied 💳 — send it to the client');
+        try { renderAdsView(); } catch (e) {}
+      }
+    } catch (e) { toast('⚠ Could not create the billing link'); }
+    btn.disabled = false; btn.innerHTML = label || '&#128179; $249/mo billing';
   };
 
   window.clarityPrompt = async function (id) {

@@ -5758,8 +5758,8 @@ app.post('/api/clients/:id/ads-enroll', async (c) => {
     await touchClient(db, id, { stage: 'ads_setup' });
   }
   await logEvent(db, id, 'ads_enrolled', mode === 'ads_only'
-    ? `📣 ${biz} signed up for Google Ads management ($249/mo) — ads only, no website build. Next: paste their landing page and Connect.`
-    : `📣 ${biz} added Google Ads management ($249/mo) on top of their website. Next: paste the landing page and Connect.`);
+    ? `📣 ${biz} signed up for Google Ads management ($249/mo) — ads only, no website build. Next: paste their landing page and hit Set it all up, then send the billing link.`
+    : `📣 ${biz} added Google Ads management ($249/mo) on top of their website. Next: paste the landing page and hit Set it all up, then send the billing link.`);
   return c.json({ ok: true, track: mode, monthly: 249 });
 });
 
@@ -6132,6 +6132,22 @@ function adsEconomics(econ) {
   }
   if (cpc > 0) out.floor_daily = Math.round(cpc * 5); // Heath: high-range CPC × 5 is the learn-anything floor
   if (out.projected_cpl && out.max_cpl) out.headroom = out.max_cpl - out.projected_cpl;
+  // "What would have to be true" — solve each lever for break-even, so a plan
+  // that does not pencil comes with the three real ways to fix it rather than
+  // a shrug. Break-even is max_cpl >= projected_cpl.
+  if (out.projected_cpl && out.max_cpl && close > 0 && margin > 0 && lpCvr > 0 && cpc > 0) {
+    out.required = {
+      // client value needed so the affordable CPL covers the projected CPL
+      ticket: Math.ceil(out.projected_cpl / (close * margin)),
+      // page conversion rate needed at this CPC
+      lp_cvr: Math.round((cpc / out.max_cpl) * 1000) / 10,
+      // CPC that this page conversion rate can carry
+      cpc: Math.round(out.max_cpl * lpCvr * 100) / 100,
+    };
+    out.required.ticket_gap = out.required.ticket - ticket;
+    out.required.cvr_gap = Math.round((out.required.lp_cvr - lpCvr * 100) * 10) / 10;
+    out.required.cpc_gap = Math.round((cpc - out.required.cpc) * 100) / 100;
+  }
   // Smart Bidding needs 15 conversions / 30 days to function at all
   if (out.leads_needed) out.smart_bidding_ok = out.leads_needed >= 15;
   return out;
@@ -6297,7 +6313,13 @@ function adsPlan(client, rep, settings) {
     if (econ.max_cpl) line('   • Most you can pay per lead and still profit: $' + econ.max_cpl);
     if (econ.projected_cpl) line('   • Projected cost per lead at $' + econ.cpc + ' CPC and ' + Math.round(econ.lp_cvr * 100) + '% page conversion: $' + econ.projected_cpl);
     if (econ.monthly_budget) line('   • Budget that math implies: $' + econ.monthly_budget + '/month (~$' + econ.daily_budget + '/day)');
-    if (econ.headroom != null) line('   • Headroom per lead: ' + (econ.headroom >= 0 ? '$' + econ.headroom + ' — the math works' : '-$' + Math.abs(econ.headroom) + ' — the math does NOT work at this CPC; raise the ticket, raise page conversion, or narrow the keywords'));
+    if (econ.headroom != null) line('   • Headroom per lead: ' + (econ.headroom >= 0 ? '$' + econ.headroom + ' — the math works' : '-$' + Math.abs(econ.headroom) + ' — the math does NOT work at these numbers'));
+    if (econ.required && econ.headroom < 0) {
+      line('   • WHAT WOULD HAVE TO BE TRUE — any ONE of these closes the gap:');
+      line('       - a new client is worth $' + econ.required.ticket + ' instead of $' + econ.ticket + ' (memberships, packages, repeat visits counted properly)');
+      line('       - the landing page converts at ' + econ.required.lp_cvr + '% instead of ' + Math.round(econ.lp_cvr * 100) + '%');
+      line('       - the cost per click comes in at $' + econ.required.cpc + ' instead of $' + econ.cpc + ' (tighter, higher-intent keywords)');
+    }
     if (econ.smart_bidding_ok === false) line('   • WARNING: under 15 leads/month, Smart Bidding cannot learn. Either raise budget or optimise to a softer conversion first.');
     line('   • These are planning numbers, not promises. Nobody can guarantee ad results.');
     line('');
@@ -6475,6 +6497,95 @@ app.get('/api/clients/:id/ads-brief', async (c) => {
   if (fresh || !rep.brief) { rep.brief = adsBrief(client, rep); await setSetting(db, 'ads_' + id, JSON.stringify(rep)); }
   return c.json({ ok: true, brief: rep.brief, links: adsDeepLinks(rep, settings) });
 });
+
+// 💳 ADS SUBSCRIPTION (8/19/2026) — $249/mo Google Ads management, billed the
+// same way as everything else in this business. Built as a self-contained
+// Stripe Checkout call (subscription mode, inline price_data) so it does not
+// collide with the single hosting/care subscription each client already has:
+// ads billing lives in settings ads_<id>, website billing stays in clients.billing.
+// Tiffany sends the link; the client enters their own card on Stripe's page.
+// Nothing here ever touches a card number.
+const ADS_MONTHLY_CENTS = 24900;
+
+async function adsCheckout(env, client, rep) {
+  if (!env.STRIPE_SECRET_KEY) throw new Error('STRIPE_SECRET_KEY is not set on the worker');
+  const cust = await ensureCustomer(env.STRIPE_SECRET_KEY, client.email, client.name || client.business_name || '');
+  const biz = client.business_name || client.name || client.email;
+  const back = client.live_url || (rep && rep.url) || BASE_URL;
+  const body = new URLSearchParams();
+  body.set('mode', 'subscription');
+  body.set('customer', cust.id);
+  body.set('success_url', back);
+  body.set('cancel_url', back);
+  body.set('allow_promotion_codes', 'true');
+  body.set('line_items[0][quantity]', '1');
+  body.set('line_items[0][price_data][currency]', 'usd');
+  body.set('line_items[0][price_data][unit_amount]', String(ADS_MONTHLY_CENTS));
+  body.set('line_items[0][price_data][recurring][interval]', 'month');
+  body.set('line_items[0][price_data][product_data][name]', ('Google Ads management — ' + biz).slice(0, 250));
+  body.set('line_items[0][price_data][product_data][description]',
+    'Monthly management of your Google Ads account: campaign build and upkeep, keyword and negative maintenance, conversion tracking, and reporting in your client portal. Ad spend is paid separately by you, directly to Google.');
+  body.set('subscription_data[metadata][client_id]', String(client.id));
+  body.set('subscription_data[metadata][plan]', 'ads249');
+  body.set('metadata[client_id]', String(client.id));
+  body.set('metadata[plan]', 'ads249');
+  const res = await fetch('https://api.stripe.com/v1/checkout/sessions', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + env.STRIPE_SECRET_KEY, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+  });
+  const j = await res.json();
+  if (!res.ok || j.error) throw new Error((j.error && j.error.message) || ('Stripe ' + res.status));
+  return { id: j.id, url: j.url, customer: cust.id };
+}
+
+app.post('/api/clients/:id/ads-subscription', async (c) => {
+  const id = Number(c.req.param('id')) || 0;
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'no such client' }, 404);
+  if (!client.email) return c.json({ error: 'This client has no email address on file yet.' }, 400);
+  const settings = await getSettings(db);
+  let rep = {}; try { rep = JSON.parse(settings['ads_' + id] || '{}'); } catch {}
+  if (!rep.track) return c.json({ error: 'Enrol them in ads management first.' }, 400);
+  try {
+    const sess = await adsCheckout(c.env, client, rep);
+    rep.sub_session_id = sess.id; rep.sub_link = sess.url; rep.sub_status = 'pending';
+    rep.sub_customer = sess.customer; rep.sub_amount = ADS_MONTHLY_CENTS / 100;
+    await setSetting(db, 'ads_' + id, JSON.stringify(rep));
+    await logEvent(db, id, 'ads_billing_link',
+      `\u{1F4B3} Ads management billing link created for ${client.business_name || client.name || client.email} — $249/mo. Send it to them; they enter their own card on Stripe.`);
+    return c.json({ ok: true, url: sess.url });
+  } catch (e) { return c.json({ error: 'Stripe: ' + String(e.message).slice(0, 160) }, 502); }
+});
+
+// Fold the ads subscription into the same daily sweep that checks tag health,
+// so a pending link that gets paid flips to active without anyone remembering.
+async function adsBillingSweep(env) {
+  if (!env.STRIPE_SECRET_KEY) return 0;
+  const db = env.DB;
+  const settings = await getSettings(db);
+  let flipped = 0;
+  for (const k of Object.keys(settings).filter((x) => /^ads_\d+$/.test(x))) {
+    let rep = {}; try { rep = JSON.parse(settings[k] || '{}'); } catch {}
+    if (!rep.sub_session_id || rep.sub_status === 'active') continue;
+    const id = Number(k.slice(4));
+    const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+    if (!client) continue;
+    try {
+      const st = await checkoutStatus(env.STRIPE_SECRET_KEY, rep.sub_session_id);
+      const paid = st && (st.status === 'complete' || st.payment_status === 'paid' || st.subscription);
+      if (paid) {
+        rep.sub_status = 'active'; rep.sub_started = new Date().toISOString();
+        await setSetting(db, k, JSON.stringify(rep));
+        await logEvent(db, id, 'ads_billing_active',
+          `\u{1F4B0} Ads management billing is live for ${client.business_name || client.name || client.email} — $249/mo recurring.`);
+        flipped++;
+      }
+    } catch {}
+  }
+  return flipped;
+}
 
 // 💵 ADS ECONOMICS (8/19/2026) — the honest version of a client target.
 // Back-solves from what the client actually earns: average ticket, margin,
@@ -6684,6 +6795,9 @@ export default {
       ));
       ctx.waitUntil(adsSilentFailure(env).catch((e) =>
         logEvent(env.DB, null, 'error', `Silent-failure check failed: ${e.message}`)
+      ));
+      ctx.waitUntil(adsBillingSweep(env).catch((e) =>
+        logEvent(env.DB, null, 'error', `Ads billing sweep failed: ${e.message}`)
       ));
       ctx.waitUntil(gscRankSnapshot(env).catch((e) =>
         logEvent(env.DB, null, 'error', `Rankings snapshot failed: ${e.message}`)
