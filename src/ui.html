@@ -1542,6 +1542,7 @@ async function lpInject(id){
       h += SEP();
       h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsHeadCode(' + c.id + ')">&#129513; Head code</button>';
       h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px"' + (rep.brief ? '' : ' disabled title="Run Set it all up first"') + ' onclick="adsSheet(' + c.id + ')">&#128203; Build sheet</button>';
+      h += '<button class="btn btn-green" style="font-size:11.5px;padding:7px 12px"' + (rep.brief && rep.url ? '' : ' disabled title="Run Set it all up first"') + ' title="Download the campaign as two CSVs and import them into Google Ads Editor — the whole campaign builds itself, paused." onclick="adsCsv(' + c.id + ')">&#11015; Build it for me</button>';
       h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" title="Average ticket, close rate, target clients — the sheet back-solves the budget and tells you if the math works." onclick="adsEcon(' + c.id + ')">&#128181; Economics' + ((rep.econ && rep.econ.target_clients) ? ' &#10003;' : '') + '</button>';
       h += SEP();
       h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" title="Create the Stripe billing link — $249/mo management, plus the $300 landing page if it is part of the deal." onclick="adsBilling(' + c.id + ', this)">&#128179; ' + (rep.sub_status === 'active' ? 'Billing live &#10003;' : rep.sub_link ? 'Billing link' : (rep.lp_fee ? '$' + rep.lp_fee + ' + $249/mo' : '$249/mo billing')) + '</button>';
@@ -1912,6 +1913,47 @@ async function lpInject(id){
   }
 
   // ══ LAUNCH RUNBOOK — one line that always says what to do next ═══════════
+  // ══ CAMPAIGN CSV → Google Ads Editor ═══════════════════════════════════
+  async function dl(id, part) {
+    var r = await fetch('/api/clients/' + id + '/ads-csv?part=' + part, { credentials: 'same-origin' });
+    if (!r.ok) { var e = await r.json().catch(function () { return {}; }); throw new Error(e.error || ('HTTP ' + r.status)); }
+    var cd = r.headers.get('content-disposition') || '';
+    var m = cd.match(/filename="([^"]+)"/);
+    var blob = await r.blob();
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = m ? m[1] : ('campaign-' + part + '.csv');
+    document.body.appendChild(a); a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+    return a.download;
+  }
+
+  window.adsCsv = async function (id) {
+    try {
+      var f1 = await dl(id, 'structure');
+      await new Promise(function (r) { setTimeout(r, 600); });
+      var f2 = await dl(id, 'ads');
+      var step = function (n, t, d) {
+        return '<div style="display:flex;gap:11px;align-items:flex-start;padding:10px 0;border-bottom:1px solid var(--line,#E6E9EF)">' +
+          '<div style="width:22px;height:22px;border-radius:50%;flex:none;background:var(--navy,#0B1D33);color:#fff;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700">' + n + '</div>' +
+          '<div><div style="font-size:13.5px;font-weight:600;color:var(--navy,#0B1D33)">' + t + '</div>' +
+          '<div style="font-size:12.5px;color:var(--muted,#5D6B7E);margin-top:1px">' + d + '</div></div></div>';
+      };
+      modal('Two files downloaded — now build it in one minute',
+        '<div style="background:#ECFDF3;border:1px solid #6CE9A6;border-radius:10px;padding:11px 14px;font-size:12.5px;margin-bottom:14px">' +
+        '<b>' + esc(f1) + '</b> and <b>' + esc(f2) + '</b> are in your Downloads.</div>' +
+        step(1, 'Open Google Ads Editor and pick this client\'s account', 'Free desktop app from Google. Get recent changes first so it is in sync.') +
+        step(2, 'Account → Import → From file → choose the <b>1-structure</b> file', 'This creates the campaigns, locations, ad groups, every keyword and every negative. Editor shows a preview before anything is kept.') +
+        step(3, 'Go to Ads → Responsive search ads → Make multiple changes → Paste from clipboard', 'Open the <b>2-ads</b> file, copy everything, paste it there, and tick “My data includes columns for campaigns and/or ad groups”. This is Google\'s own documented path for bulk ads.') +
+        step(4, 'Keep proposed changes, then set the four things a CSV cannot carry', 'Conversion goals (import the four GA4 key events) · Location options → <b>Presence</b>, not presence-or-interest · Ad schedule to your answer hours · Display Network and Search Partners off.') +
+        step(5, 'Press <b>Post</b>', 'Nothing exists in the account until you Post. Everything lands <b>PAUSED</b> — you enable it when you are ready, then press “I enabled it” back here.') +
+        '<div style="margin-top:14px;background:#FFFAEB;border:1px solid #FEC84B;border-radius:10px;padding:11px 14px;font-size:12.5px;color:#B54708">' +
+        'Editor may flag town names it cannot resolve with a yellow warning — confirm the right one when it asks. That check is deliberate; guessing a location ID silently would be worse.</div>' +
+        '<p style="font-size:11.5px;color:var(--faint,#8A94A6);margin-top:12px">The campaign is created paused, with no conversion goals set, so it cannot spend before you have checked it.</p>');
+      toast('Two CSVs downloaded ⬇ — import them into Google Ads Editor');
+    } catch (e) { toast('⚠ ' + (e.message || 'Could not build the CSV')); }
+  };
+
   window.adsRescan = async function (id, btn) {
     var label = btn ? btn.innerHTML : '';
     if (btn) { btn.disabled = true; btn.textContent = 'Reading…'; }
@@ -2019,8 +2061,16 @@ async function lpInject(id){
     var rep = {}; try { rep = JSON.parse((STATE.settings || {})['ads_' + id] || '{}'); } catch (e) {}
     if (rep.sub_status === 'active') { toast('Ads billing is already live for this client — $249/mo'); return; }
     if (rep.sub_link) {
-      if (navigator.clipboard) navigator.clipboard.writeText(rep.sub_link);
-      toast('Billing link copied 💳 — send it to the client, they enter their own card');
+      if (confirm('Email this billing link straight to ' + (rep.sub_sent_at ? 'the client again' : 'the client') + '?\n\nOK = send it now.\nCancel = just copy it to your clipboard.')) {
+        try {
+          var sr = await api('/api/clients/' + id + '/ads-billing-send', { method: 'POST', body: '{}' });
+          if (sr && sr.error) toast('⚠ ' + sr.error);
+          else { rep.sub_sent_at = new Date().toISOString(); STATE.settings['ads_' + id] = JSON.stringify(rep); toast('Billing link emailed to ' + sr.to + ' 📧'); }
+        } catch (e) { toast('⚠ Could not send'); }
+      } else if (navigator.clipboard) {
+        navigator.clipboard.writeText(rep.sub_link);
+        toast('Billing link copied 💳');
+      }
       return;
     }
     // the $300 landing page normally arrives from Intake 1; ask once if it did not

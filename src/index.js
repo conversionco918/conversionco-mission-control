@@ -6835,6 +6835,168 @@ app.post('/api/clients/:id/ads-provision', async (c) => {
   return c.json({ ok: true, report: rep, ga4, links, steps, brief: rep.brief, adopted, gsc: gscAttached });
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+// ⬇ CAMPAIGN CSV (8/19/2026) — the biggest automation available without the
+// Google Ads API. Instead of typing the build sheet into Google Ads by hand for
+// an hour, she downloads two files, imports them into Google Ads Editor, and
+// the entire campaign exists — paused — in about a minute.
+//
+// Route and format are per Google's own docs (support.google.com/google-ads/
+// editor/answer/57747 and /56368):
+//   • Google Ads Editor infers the entity type of each row from WHICH identity
+//     columns are populated. Campaign only = campaign settings. Campaign +
+//     Location = a location target. Campaign + Keyword with Criterion type
+//     "Campaign negative" = a campaign negative. Campaign + Ad group = ad group
+//     settings. Campaign + Ad group + Keyword = a keyword. Campaign + Ad group
+//     + Headline 1 = a responsive search ad.
+//   • Headers are matched case- and space-insensitively.
+//   • Pinning is expressed as "Headline N position" = 1, 2 or 3.
+//
+// TWO FILES ON PURPOSE. Editor has no "Ad type" column, so an RSA row in a
+// mixed file is identified only by Headline 1 being populated. Google's own
+// documented path for bulk RSAs is the Responsive search ads view → Make
+// multiple changes → paste. Splitting the files follows Google's grain instead
+// of betting her account on an undocumented inference.
+function csvCell(v) {
+  const s = String(v == null ? '' : v);
+  return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+function csvRows(header, rows) {
+  return [header.map(csvCell).join(',')]
+    .concat(rows.map((r) => header.map((h) => csvCell(r[h] === undefined ? '' : r[h])).join(',')))
+    .join('\r\n') + '\r\n';
+}
+// keywords are stored as [exact] and "phrase" — Editor wants the bare text plus
+// a Criterion type column, so unwrap them here rather than shipping the brackets
+function csvKeyword(k) {
+  const s = String(k || '').trim();
+  if (s.startsWith('[') && s.endsWith(']')) return { text: s.slice(1, -1).trim(), type: 'Exact' };
+  if (s.startsWith('"') && s.endsWith('"')) return { text: s.slice(1, -1).trim(), type: 'Phrase' };
+  return { text: s, type: 'Broad' };
+}
+
+function adsCsvStructure(plan, opts) {
+  const O = opts || {};
+  const budget = Number(O.budget) || 30;
+  const start = O.start || new Date(Date.now() + 86400000).toISOString().slice(0, 10);
+  const H = ['Campaign', 'Campaign type', 'Campaign status', 'Campaign daily budget', 'Bid strategy type',
+    'Networks', 'Languages', 'Start date', 'Location', 'Ad group', 'Ad group status', 'Keyword',
+    'Criterion type', 'Status'];
+  const rows = [];
+  const nonBrand = plan.campaigns.find((c) => c.role === 'non-brand');
+  const brand = plan.campaigns.find((c) => c.role === 'brand');
+
+  for (const camp of [nonBrand, brand].filter(Boolean)) {
+    const isBrand = camp.role === 'brand';
+    rows.push({
+      Campaign: camp.name, 'Campaign type': 'Search', 'Campaign status': 'Paused',
+      'Campaign daily budget': (isBrand ? Math.max(3, Math.round(budget * 0.1)) : budget).toFixed(2),
+      'Bid strategy type': 'Maximize conversions', Networks: 'Google Search', Languages: 'en',
+      'Start date': start,
+    });
+    // locations — names, not IDs. Editor flags anything it cannot resolve with a
+    // yellow warning and makes her confirm, which is the safe failure here.
+    for (const loc of (O.locations || [])) rows.push({ Campaign: camp.name, Location: loc });
+    // negatives ride the non-brand campaign only. Putting "free" or "cheap" on a
+    // brand campaign would block people searching the business by name.
+    if (!isBrand) {
+      for (const n of (plan.negatives || [])) {
+        rows.push({ Campaign: camp.name, Keyword: n, 'Criterion type': 'Campaign negative' });
+      }
+    }
+    for (const g of camp.adGroups) {
+      rows.push({ Campaign: camp.name, 'Ad group': g.name, 'Ad group status': 'Enabled' });
+      const seen = new Set();
+      for (const k of g.keywords) {
+        const kw = csvKeyword(k);
+        if (!kw.text) continue;
+        const key = kw.text + '|' + kw.type;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        rows.push({ Campaign: camp.name, 'Ad group': g.name, Keyword: kw.text,
+          'Criterion type': kw.type, Status: 'Enabled' });
+      }
+    }
+  }
+  return csvRows(H, rows);
+}
+
+function adsCsvAds(plan, opts) {
+  const O = opts || {};
+  const H = ['Campaign', 'Ad group'];
+  for (let i = 1; i <= 15; i++) H.push('Headline ' + i);
+  for (let i = 1; i <= 3; i++) H.push('Headline ' + i + ' position');
+  for (let i = 1; i <= 4; i++) H.push('Description ' + i);
+  H.push('Final URL', 'Path 1', 'Path 2', 'Status');
+  const rows = [];
+  const heads = plan.rsa.headlines || [];
+  const descs = plan.rsa.descriptions || [];
+  const pins = plan.rsa.pinH1 || [];
+  const path1 = String(O.path1 || '').replace(/[^A-Za-z0-9-]/g, '').slice(0, 15);
+
+  for (const camp of plan.campaigns) {
+    for (const g of camp.adGroups) {
+      // lead with a headline that names THIS ad group's theme, pinned to slot 1,
+      // so the ad always echoes the search that triggered it
+      const themeHead = heads.find((h) => {
+        const n = g.name.toLowerCase();
+        return n.includes(h.toLowerCase().split(' in ')[0].toLowerCase()) ||
+          h.toLowerCase().includes(n.replace(/^city — |^named drips — |^problem drips — |^core — /, '').split(',')[0].toLowerCase());
+      });
+      const ordered = [];
+      if (themeHead) ordered.push(themeHead);
+      for (const p of pins) if (!ordered.includes(p)) ordered.push(p);
+      for (const h of heads) if (!ordered.includes(h)) ordered.push(h);
+      const row = { Campaign: camp.name, 'Ad group': g.name, 'Final URL': g.url || plan.url,
+        'Path 1': path1, Status: 'Enabled' };
+      ordered.slice(0, 15).forEach((h, i) => { row['Headline ' + (i + 1)] = h; });
+      // pin only the first slot; over-pinning collapses the combinations Google
+      // is supposed to be testing
+      row['Headline 1 position'] = 1;
+      descs.slice(0, 4).forEach((d, i) => { row['Description ' + (i + 1)] = d; });
+      rows.push(row);
+    }
+  }
+  return csvRows(H, rows);
+}
+
+// GET ?part=structure|ads — returns a downloadable CSV for Google Ads Editor.
+app.get('/api/clients/:id/ads-csv', async (c) => {
+  const id = Number(c.req.param('id')) || 0;
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'no such client' }, 404);
+  const settings = await getSettings(db);
+  let rep = {}; try { rep = JSON.parse(settings['ads_' + id] || '{}'); } catch {}
+  if (!rep.url) return c.json({ error: 'Connect the landing page first.' }, 400);
+  const plan = rep.brief && rep.brief.v === 3 ? rep.brief : adsPlan(client, rep, settings);
+  const econ = adsEconomics(rep.econ, rep.facts);
+  const F = rep.facts || {};
+  let i1 = {}; try { i1 = JSON.parse(client.intake1_data || '{}'); } catch {}
+  const state = String(i1['Primary City & State'] || i1['Location'] || '').split(',')[1] || '';
+  const locs = ((F.cities || []).map((x) => x.name).filter(Boolean).slice(0, 12))
+    .map((n) => (state ? n + ',' + state.trim() + ',United States' : n));
+  const opts = {
+    budget: econ.daily_budget || econ.floor_daily || 30,
+    locations: locs.length ? locs : (plan.city ? [plan.city] : []),
+    path1: (plan.city || '').replace(/\s+/g, '-'),
+  };
+  const part = String(c.req.query('part') || 'structure');
+  const body = part === 'ads' ? adsCsvAds(plan, opts) : adsCsvStructure(plan, opts);
+  const safe = String(client.business_name || client.name || ('client-' + id)).replace(/[^A-Za-z0-9]+/g, '-').slice(0, 40);
+  const name = safe + (part === 'ads' ? '-2-ads.csv' : '-1-structure.csv');
+  if (part === 'ads') {
+    await logEvent(db, id, 'ads_csv',
+      `\u{2B07} Campaign CSV downloaded for ${client.business_name || client.name || client.email} — ` +
+      `${plan.campaigns.reduce((a, x) => a + x.adGroups.length, 0)} ad groups, ${plan.negatives.length} negatives, ` +
+      `budget $${opts.budget}/day. Import into Google Ads Editor; it lands PAUSED.`);
+  }
+  return c.body(body, 200, {
+    'Content-Type': 'text/csv; charset=utf-8',
+    'Content-Disposition': 'attachment; filename="' + name + '"',
+  });
+});
+
 // 🔬 RESCAN — she changed the page (new drip, new member benefit, new town).
 // Re-reads the site and rebuilds the whole plan around what is there now.
 app.post('/api/clients/:id/ads-rescan', async (c) => {
@@ -7116,6 +7278,39 @@ app.post('/api/clients/:id/ads-subscription', async (c) => {
       'Send it to them; they enter their own card on Stripe.');
     return c.json({ ok: true, url: sess.url });
   } catch (e) { return c.json({ error: 'Stripe: ' + String(e.message).slice(0, 160) }, 502); }
+});
+
+// 📧 SEND THE BILLING LINK — one press instead of copy, switch to email, paste.
+app.post('/api/clients/:id/ads-billing-send', async (c) => {
+  const id = Number(c.req.param('id')) || 0;
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'no such client' }, 404);
+  if (!client.email) return c.json({ error: 'No email address on file for this client.' }, 400);
+  const settings = await getSettings(db);
+  let rep = {}; try { rep = JSON.parse(settings['ads_' + id] || '{}'); } catch {}
+  if (!rep.sub_link) return c.json({ error: 'Create the billing link first.' }, 400);
+  const biz = client.business_name || client.name || 'your business';
+  const first = String(client.name || '').split(' ')[0] || 'there';
+  const setup = Number(rep.lp_fee || 0);
+  const html =
+    `<p>Hi ${first},</p>` +
+    `<p>Here is the secure link to start your Google Ads management for <b>${biz}</b>.</p>` +
+    `<p>` + (setup
+      ? `It sets up <b>$${setup} today</b> for your landing page, then <b>$249 a month</b> for management.`
+      : `It sets up <b>$249 a month</b> for management.`) +
+    ` Your advertising budget is separate and is paid by you directly to Google — we never hold or bill your ad spend.</p>` +
+    `<p><a href="${rep.sub_link}" style="display:inline-block;background:#0B1D33;color:#fff;padding:13px 24px;border-radius:8px;text-decoration:none">Set up your billing</a></p>` +
+    `<p style="font-size:13px;color:#5D6B7E">You enter your card on Stripe's own page — we never see it. Month to month, cancel any time with 30 days' notice.</p>` +
+    `<p>Once that is done I will build your campaign and walk you through it before anything goes live.</p>` +
+    `<p>— Tiffany, ConversionCo</p>`;
+  const ok = await emailClient(c.env, db, client, settings,
+    `Your Google Ads setup — ${biz}`, html, 'ads_billing_sent',
+    `\u{1F4E7} Ads billing link emailed to ${client.email}` + (setup ? ` — $${setup} + $249/mo` : ' — $249/mo'));
+  if (!ok) return c.json({ error: 'Email did not send — check the GoHighLevel connection.' }, 502);
+  rep.sub_sent_at = new Date().toISOString();
+  await setSetting(db, 'ads_' + id, JSON.stringify(rep));
+  return c.json({ ok: true, to: client.email });
 });
 
 // Landing-page fee toggle — normally set from Intake 1, editable here.
