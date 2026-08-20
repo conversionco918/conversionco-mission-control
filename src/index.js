@@ -137,6 +137,24 @@ app.use('*', async (c, next) => {
   const settings = await getSettings(c.env.DB);
   const slug = settings[`livehost_${host}`] || settings[`livehost_${host.replace(/^www\./, '')}`];
   if (!slug) return next();
+
+  // 🔎 SEO LAW — ONE ADDRESS PER SITE (Tiffany 8/20: "whatever helps seo").
+  // www.example.com and example.com are two different addresses to Google. If
+  // both answer 200, Google can keep two records and split the credit from
+  // links, reviews and directory listings between them. A canonical tag is a
+  // suggestion Google may ignore; a 301 is a rule it cannot. So www permanently
+  // redirects to the bare domain, carrying path and query untouched, and every
+  // link anywhere on the internet lands on the one canonical address.
+  // 301 (not 302) is deliberate: only a permanent redirect passes ranking value.
+  if (host.startsWith('www.')) {
+    const bare = host.slice(4);
+    if (settings[`livehost_${bare}`]) {
+      const url = new URL(c.req.url);
+      url.host = bare; url.protocol = 'https:'; url.port = '';
+      return c.redirect(url.toString(), 301);
+    }
+  }
+
   let path = c.req.path.replace(/^\/+/, '') || 'index.html';
   if (path === '' || path.endsWith('/')) path += 'index.html';
   let row = await c.env.DB.prepare('SELECT * FROM site_files WHERE slug = ? AND path = ?').bind(slug, path).first();
