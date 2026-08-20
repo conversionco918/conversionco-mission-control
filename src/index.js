@@ -2694,9 +2694,12 @@ app.post('/lead/:slug', async (c) => {
     const settingsK = await getSettings(db);
     const kitId = String(settingsK['kit_form_' + slug] || settingsK.kit_form_id || '').replace(/\D/g, '');
     const kitKey = c.env.KIT_API_KEY;
-    if (kitId && !kitKey) {
-      await logEvent(db, clientId, 'error', `Kit form ${kitId} is configured but the KIT_API_KEY secret is missing on the worker, so ${kitEmail} was NOT added to the list (the lead itself was saved).`);
-    } else if (kitId && kitKey) {
+    // NO ALARM when there is no API key. The page already subscribed this
+    // address from the visitor's browser (window.ccListSubscribe), which is the
+    // supported path — the server-side call is an optional backstop for leads
+    // that arrive from somewhere other than the website. Logging an error here
+    // marked every ordinary lead as a failure.
+    if (kitId && kitKey) {
       c.executionCtx.waitUntil((async () => {
         const hdrs = { 'Content-Type': 'application/json', Accept: 'application/json', 'X-Kit-Api-Key': kitKey };
         try {
@@ -3189,7 +3192,7 @@ async function computeOverview(db, clients, settings) {
   const revFailed = (await db.prepare(`SELECT client_id, request FROM revisions WHERE status='failed' ORDER BY id DESC LIMIT 20`).all()).results || [];
   const revFailedByClient = {};
   for (const r of revFailed) (revFailedByClient[r.client_id] = revFailedByClient[r.client_id] || []).push(r.request);
-  const newLeads = (await db.prepare(`SELECT l.*, c.business_name AS cbiz, c.name AS cname FROM leads l LEFT JOIN clients c ON c.id = l.client_id WHERE l.created_at > datetime('now','-2 days') ORDER BY l.id DESC LIMIT 20`).all()).results || [];
+  const newLeads = (await db.prepare(`SELECT l.*, c.business_name AS cbiz, c.name AS cname FROM leads l LEFT JOIN clients c ON c.id = l.client_id WHERE l.created_at > datetime('now','-2 days') AND (l.status IS NULL OR l.status = '') ORDER BY l.id DESC LIMIT 20`).all()).results || [];
 
   let collected = 0, outstanding = 0, hostingCount = 0, mrrTotal = 0;
   const needs = [], health = {};
@@ -6227,11 +6230,14 @@ async function adsWatchdog(env) {
   const problems = [];
   for (const k of keys) {
     let prev = {}; try { prev = JSON.parse(settings[k] || '{}'); } catch {}
-    if (!prev.url) continue;
     const id = Number(k.slice(4));
-    // orphan guard: the card was deleted — clear the key instead of polling forever
+    // Orphan guard FIRST: a deleted card's key must be cleared even when it
+    // carries no url, otherwise it is skipped by the url check below and lingers
+    // forever. (Ordering bug found 8/20 — ads_34 only cleared because it
+    // happened to have a url.)
     const stillHere = await db.prepare('SELECT id FROM clients WHERE id = ?').bind(id).first();
-    if (!stillHere) { await setSetting(db, k, ''); continue; }
+    if (!stillHere) { if (settings[k]) await setSetting(db, k, ''); continue; }
+    if (!prev.url) continue;
     const rep = await adsVerify(env, id, prev.url);
     await setSetting(db, k, JSON.stringify({ ...prev, ...rep }));
     const regress = [];
