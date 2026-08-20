@@ -2616,6 +2616,32 @@ app.post('/lead/:slug', async (c) => {
   await db.prepare(`INSERT INTO leads (client_id, slug, name, email, phone, message, source) VALUES (?, ?, ?, ?, ?, ?, ?)`)
     .bind(clientId, slug, String(f.name || '').slice(0, 120), String(f.email || '').slice(0, 160), String(f.phone || '').slice(0, 40), String(f.message || '').slice(0, 1500), source).run();
   await logEvent(db, clientId, 'lead_received', `🔥 New lead on ${slug} (via ${source}): ${f.name || 'no name'} ${f.phone || f.email || ''}`);
+  // 📧 KIT (ConvertKit) — if a Kit form id is configured, subscribe the email
+  // address to it as well, so the site's join box feeds her list without the
+  // page ever having to talk to Kit directly. The form id is not a secret and
+  // Kit's public subscribe endpoint needs no API key, so nothing sensitive
+  // lives on the page or passes through the browser. Best effort: a Kit outage
+  // must never cost her the lead, which is already saved above.
+  const kitEmail = String(f.email || '').trim();
+  if (kitEmail && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(kitEmail)) {
+    const settingsK = await getSettings(db);
+    const kitId = String(settingsK['kit_form_' + slug] || settingsK.kit_form_id || '').replace(/\D/g, '');
+    if (kitId) {
+      c.executionCtx.waitUntil((async () => {
+        try {
+          const kr = await fetch('https://app.kit.com/forms/' + kitId + '/subscriptions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify({ email_address: kitEmail, first_name: String(f.name || '').slice(0, 60) }),
+          });
+          if (!kr.ok) await logEvent(db, clientId, 'error', `Kit subscribe returned HTTP ${kr.status} for ${kitEmail} (the lead itself was saved)`);
+          else await logEvent(db, clientId, 'kit_subscribed', `\u{1F4E7} ${kitEmail} added to the Kit list from ${slug}`);
+        } catch (e) {
+          await logEvent(db, clientId, 'error', `Kit subscribe failed for ${kitEmail}: ${String(e && e.message || e).slice(0, 100)} (the lead itself was saved)`);
+        }
+      })());
+    }
+  }
   // 📨 FORWARD EVERY LEAD TO THE CLIENT INSTANTLY — the lead is the product; it
   // should reach the nurse's inbox in seconds, not sit in the portal unseen.
   if (clientId) {
@@ -4381,7 +4407,7 @@ app.post('/api/settings', async (c) => {
     'intake1_subject', 'intake1_body', 'intake2_subject', 'intake2_body',
     'booking_link', 'booking_subject', 'booking_body',
     'notify_email', 'sites_repo', 'review_link',
-    'ads_mcc_id', 'ads_dev_token_status',
+    'ads_mcc_id', 'ads_dev_token_status', 'kit_form_id',
   ];
   for (const k of allowed) if (k in body) await setSetting(c.env.DB, k, body[k]);
   return c.json({ ok: true });
