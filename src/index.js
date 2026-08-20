@@ -1380,6 +1380,42 @@ app.get('/api/gsc-test/:key', async (c) => {
   } catch (e) { return c.json({ ok: false, configured: true, error: String(e.message).slice(0, 300) }); }
 });
 
+// Keyed: prove the Kit wiring works WITHOUT anyone ever having to read the API
+// key. Returns only booleans, counts and the account name — never the secret.
+// ?email=someone@example.com does a real end-to-end subscribe against the
+// configured form so a live test needs no dashboard login.
+app.get('/api/kit-test/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const key = c.env.KIT_API_KEY;
+  const settings = await getSettings(c.env.DB);
+  const slug = (c.req.query('slug') || '').trim();
+  const formId = String((slug && settings['kit_form_' + slug]) || settings.kit_form_id || '').replace(/\D/g, '');
+  const out = { key_set: !!key, form_id: formId || null };
+  if (!key) { out.hint = 'Add KIT_API_KEY as an encrypted Secret on the worker in Cloudflare.'; return c.json(out); }
+  const hdrs = { 'Content-Type': 'application/json', Accept: 'application/json', 'X-Kit-Api-Key': key };
+  try {
+    const me = await fetch('https://api.kit.com/v4/account', { headers: hdrs });
+    out.key_valid = me.ok;
+    out.account_status = me.status;
+    if (me.ok) {
+      const j = await me.json().catch(() => ({}));
+      out.account = (j && j.account && (j.account.name || j.account.primary_email_address)) || null;
+    }
+  } catch (e) { out.key_valid = false; out.error = String(e.message).slice(0, 200); }
+  const testEmail = String(c.req.query('email') || '').trim();
+  if (out.key_valid && formId && testEmail && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(testEmail)) {
+    try {
+      const r1 = await fetch('https://api.kit.com/v4/subscribers', { method: 'POST', headers: hdrs, body: JSON.stringify({ email_address: testEmail }) });
+      out.create_status = r1.status;
+      const r2 = await fetch('https://api.kit.com/v4/forms/' + formId + '/subscribers', { method: 'POST', headers: hdrs, body: JSON.stringify({ email_address: testEmail }) });
+      out.attach_status = r2.status;
+      out.subscribed = r1.ok && r2.ok;
+      if (!r2.ok) out.attach_body = (await r2.text().catch(() => '')).slice(0, 200);
+    } catch (e) { out.subscribe_error = String(e.message).slice(0, 200); }
+  }
+  return c.json(out);
+});
+
 // Keyed: enroll ANY domain in Search Console on demand (testing + Tiffany's own site).
 // Tries Cloudflare auto-verify first; for domains with DNS elsewhere (e.g. Squarespace)
 // it returns the TXT record to add manually, and re-calling after DNS propagates
@@ -2618,24 +2654,50 @@ app.post('/lead/:slug', async (c) => {
   await logEvent(db, clientId, 'lead_received', `🔥 New lead on ${slug} (via ${source}): ${f.name || 'no name'} ${f.phone || f.email || ''}`);
   // 📧 KIT (ConvertKit) — if a Kit form id is configured, subscribe the email
   // address to it as well, so the site's join box feeds her list without the
-  // page ever having to talk to Kit directly. The form id is not a secret and
-  // Kit's public subscribe endpoint needs no API key, so nothing sensitive
-  // lives on the page or passes through the browser. Best effort: a Kit outage
-  // must never cost her the lead, which is already saved above.
+  // page ever having to talk to Kit directly.
+  //
+  // NOTE (2026-08-20): this used to POST the PUBLIC browser endpoint
+  // app.kit.com/forms/<id>/subscriptions. That endpoint sits behind Kit's bot
+  // guard: a server-to-server call from a Cloudflare IP comes back HTTP 200
+  // with {"status":"quarantined"} and the address never reaches the list. The
+  // 200 made it look like it worked. We now use the AUTHENTICATED v4 API,
+  // which is the supported server-side path and is not guarded.
+  //
+  // Two calls, because v4 splits them: create the subscriber, then attach them
+  // to the form so her per-form reporting and form-triggered automations fire.
+  // Best effort throughout: a Kit outage must never cost her the lead, which is
+  // already saved above.
   const kitEmail = String(f.email || '').trim();
   if (kitEmail && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(kitEmail)) {
     const settingsK = await getSettings(db);
     const kitId = String(settingsK['kit_form_' + slug] || settingsK.kit_form_id || '').replace(/\D/g, '');
-    if (kitId) {
+    const kitKey = c.env.KIT_API_KEY;
+    if (kitId && !kitKey) {
+      await logEvent(db, clientId, 'error', `Kit form ${kitId} is configured but the KIT_API_KEY secret is missing on the worker, so ${kitEmail} was NOT added to the list (the lead itself was saved).`);
+    } else if (kitId && kitKey) {
       c.executionCtx.waitUntil((async () => {
+        const hdrs = { 'Content-Type': 'application/json', Accept: 'application/json', 'X-Kit-Api-Key': kitKey };
         try {
-          const kr = await fetch('https://app.kit.com/forms/' + kitId + '/subscriptions', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-            body: JSON.stringify({ email_address: kitEmail, first_name: String(f.name || '').slice(0, 60) }),
+          const r1 = await fetch('https://api.kit.com/v4/subscribers', {
+            method: 'POST', headers: hdrs,
+            body: JSON.stringify({ email_address: kitEmail, first_name: String(f.name || '').slice(0, 60) || undefined }),
           });
-          if (!kr.ok) await logEvent(db, clientId, 'error', `Kit subscribe returned HTTP ${kr.status} for ${kitEmail} (the lead itself was saved)`);
-          else await logEvent(db, clientId, 'kit_subscribed', `\u{1F4E7} ${kitEmail} added to the Kit list from ${slug}`);
+          // 200 = already existed, 201 = created, 202 = queued. All fine.
+          if (!r1.ok) {
+            const b1 = await r1.text().catch(() => '');
+            await logEvent(db, clientId, 'error', `Kit create-subscriber returned HTTP ${r1.status} for ${kitEmail}: ${b1.slice(0, 140)} (the lead itself was saved)`);
+            return;
+          }
+          const r2 = await fetch('https://api.kit.com/v4/forms/' + kitId + '/subscribers', {
+            method: 'POST', headers: hdrs,
+            body: JSON.stringify({ email_address: kitEmail, referrer: `${BASE_URL}/preview/${slug}/` }),
+          });
+          if (!r2.ok) {
+            const b2 = await r2.text().catch(() => '');
+            await logEvent(db, clientId, 'error', `Kit add-to-form ${kitId} returned HTTP ${r2.status} for ${kitEmail}: ${b2.slice(0, 140)} (subscriber was created, the lead was saved)`);
+            return;
+          }
+          await logEvent(db, clientId, 'kit_subscribed', `\u{1F4E7} ${kitEmail} added to the Kit list from ${slug} (form ${kitId})`);
         } catch (e) {
           await logEvent(db, clientId, 'error', `Kit subscribe failed for ${kitEmail}: ${String(e && e.message || e).slice(0, 100)} (the lead itself was saved)`);
         }
@@ -4410,6 +4472,15 @@ app.post('/api/settings', async (c) => {
     'ads_mcc_id', 'ads_dev_token_status', 'kit_form_id',
   ];
   for (const k of allowed) if (k in body) await setSetting(c.env.DB, k, body[k]);
+  // Per-site Kit form ids: every client eventually has their own Kit account and
+  // their own inline form, so `kit_form_<slug>` has to be settable without this
+  // allow-list growing a line per client. The shape is tightly bounded (slug
+  // chars only, digits-only value) so this stays a narrow door, not a wildcard.
+  for (const k of Object.keys(body)) {
+    if (/^kit_form_[a-z0-9-]{1,60}$/.test(k)) {
+      await setSetting(c.env.DB, k, String(body[k] || '').replace(/\D/g, '').slice(0, 20));
+    }
+  }
   return c.json({ ok: true });
 });
 
