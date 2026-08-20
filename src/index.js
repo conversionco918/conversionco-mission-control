@@ -67,6 +67,15 @@ async function ensureSchema(db) {
     created_at TEXT NOT NULL DEFAULT (datetime('now')))`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE leads ADD COLUMN source TEXT DEFAULT ''`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE leads ADD COLUMN status TEXT DEFAULT ''`).run(); } catch {}
+  // 🎯 CLOSED-LOOP ADS (8/20) — without these columns Google can never learn
+  // which clicks became customers, so it optimises for form fills instead of
+  // revenue. gclid is the join key back to the click that was paid for.
+  for (const col of ['gclid', 'wbraid', 'gbraid', 'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'landing_page', 'device', 'referrer', 'kind', 'status_at']) {
+    try { await db.prepare(`ALTER TABLE leads ADD COLUMN ${col} TEXT DEFAULT ''`).run(); } catch {}
+  }
+  try { await db.prepare(`ALTER TABLE leads ADD COLUMN value REAL DEFAULT 0`).run(); } catch {}
+  try { await db.prepare(`CREATE INDEX IF NOT EXISTS idx_leads_gclid ON leads(gclid)`).run(); } catch {}
+  try { await db.prepare(`CREATE INDEX IF NOT EXISTS idx_leads_client_created ON leads(client_id, created_at)`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN competitors TEXT DEFAULT ''`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN vertical TEXT DEFAULT ''`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE site_files ADD COLUMN gh_sha TEXT DEFAULT ''`).run(); } catch {}
@@ -2649,8 +2658,21 @@ app.post('/lead/:slug', async (c) => {
     else if (ref) source = 'website';
   }
   if (!source) source = 'direct';
-  await db.prepare(`INSERT INTO leads (client_id, slug, name, email, phone, message, source) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-    .bind(clientId, slug, String(f.name || '').slice(0, 120), String(f.email || '').slice(0, 160), String(f.phone || '').slice(0, 40), String(f.message || '').slice(0, 1500), source).run();
+  // 🎯 Attribution rides along from the page (window.ccAttribution()). Without
+  // gclid stored here the lead can never be reported back to Google, and every
+  // downstream number — cost per lead, cost per booking, ROI — is a guess.
+  let at = {};
+  try { at = (typeof f.attr === 'object' && f.attr) ? f.attr : JSON.parse(f.attr || '{}'); } catch {}
+  const A = (k, n) => String(at[k] == null ? '' : at[k]).slice(0, n);
+  if (!source && (A('gclid', 200) || A('wbraid', 200) || A('gbraid', 200))) source = 'google-ads';
+  await db.prepare(`INSERT INTO leads (client_id, slug, name, email, phone, message, source, kind,
+      gclid, wbraid, gbraid, utm_source, utm_medium, utm_campaign, utm_term, utm_content, landing_page, device, referrer)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'form', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(clientId, slug, String(f.name || '').slice(0, 120), String(f.email || '').slice(0, 160),
+      String(f.phone || '').slice(0, 40), String(f.message || '').slice(0, 1500), source,
+      A('gclid', 200), A('wbraid', 200), A('gbraid', 200),
+      A('utm_source', 60), A('utm_medium', 60), A('utm_campaign', 80), A('utm_term', 80), A('utm_content', 80),
+      A('landing_page', 120), A('device', 20), A('referrer', 160)).run();
   await logEvent(db, clientId, 'lead_received', `🔥 New lead on ${slug} (via ${source}): ${f.name || 'no name'} ${f.phone || f.email || ''}`);
   // 📧 KIT (ConvertKit) — if a Kit form id is configured, subscribe the email
   // address to it as well, so the site's join box feeds her list without the
@@ -2795,6 +2817,30 @@ app.get('/t/:id/t.js', async (c) => {
   js += "if(window.__ccTrack)return;window.__ccTrack=1;";
   js += "var qa=/[?&]qa=1/.test(location.search);";
   js += "window.dataLayer=window.dataLayer||[];";
+  // ── FIRST-TOUCH CLICK ATTRIBUTION ──────────────────────────────────────
+  // Google stamps every ad click with gclid (or wbraid/gbraid on iOS). If the
+  // page does not keep it, the lead can never be tied back to the click that
+  // was paid for, and Smart Bidding stays blind. FIRST touch wins: someone who
+  // arrives on an ad, leaves, and returns direct a week later was still bought
+  // by that ad. Kept 90 days, matching Google's own conversion window.
+  js += "var A=null;try{";
+  js += "var Q=new URLSearchParams(location.search);var now=Date.now();";
+  js += "var K='cc_attr';var cur=null;try{cur=JSON.parse(localStorage.getItem(K)||'null');}catch(e){}";
+  js += "if(cur&&cur.t&&(now-cur.t)>7776000000)cur=null;";                       // 90 days
+  js += "var click=Q.get('gclid')||Q.get('wbraid')||Q.get('gbraid')||'';";
+  js += "var hasUtm=Q.get('utm_source')||Q.get('utm_campaign')||'';";
+  js += "if(click||hasUtm||!cur){";
+  js += "var fresh={t:now,gclid:Q.get('gclid')||'',wbraid:Q.get('wbraid')||'',gbraid:Q.get('gbraid')||'',";
+  js += "utm_source:Q.get('utm_source')||'',utm_medium:Q.get('utm_medium')||'',utm_campaign:Q.get('utm_campaign')||'',";
+  js += "utm_term:Q.get('utm_term')||'',utm_content:Q.get('utm_content')||'',";
+  js += "landing_page:(location.pathname||'/').slice(0,120),";
+  js += "device:(/Mobi|Android|iPhone/i.test(navigator.userAgent)?'mobile':/iPad|Tablet/i.test(navigator.userAgent)?'tablet':'desktop'),";
+  js += "referrer:(document.referrer||'').slice(0,160)};";
+  // only overwrite an existing first touch when THIS visit is itself a paid/tagged click
+  js += "if(!cur||click||hasUtm){if(!cur||click||hasUtm){cur=fresh;}}";
+  js += "try{localStorage.setItem(K,JSON.stringify(cur));}catch(e){}";
+  js += "}A=cur;}catch(e){}";
+  js += "window.ccAttribution=function(){return A||{};};";
   // our own beacon — always on, even with no Google ids yet
   js += "var p=encodeURIComponent(location.pathname||'/');(new Image()).src='" + BASE_URL + "/t/" + id + "/p.gif?p='+p+'&r='+Date.now();";
 
@@ -2825,7 +2871,8 @@ app.get('/t/:id/t.js', async (c) => {
   js += "if(window.gtag)window.gtag('event',n,d);";                                        // GA4 (+Ads via config)
   js += "window.dataLayer.push(Object.assign({event:n},d));";                              // GTM-consumable
   js += "if(window.clarity)window.clarity('set','cc_event',n);";                           // Clarity segment
-  js += "(new Image()).src='" + BASE_URL + "/t/" + id + "/p.gif?p=ev-'+encodeURIComponent(n)+'&r='+Date.now();"; // our own count
+  js += "var aq='';try{if(A){aq='&g='+encodeURIComponent(A.gclid||A.wbraid||A.gbraid||'')+'&us='+encodeURIComponent(A.utm_source||'')+'&uc='+encodeURIComponent(A.utm_campaign||'')+'&lp='+encodeURIComponent(A.landing_page||'')+'&dv='+encodeURIComponent(A.device||'');}}catch(e){}";
+  js += "(new Image()).src='" + BASE_URL + "/t/" + id + "/p.gif?p=ev-'+encodeURIComponent(n)+aq+'&r='+Date.now();"; // our own count + attribution
   js += "}catch(e){}};";
   js += "window.ccTrackEvent=fire;";                                                       // manual hook if ever needed
 
@@ -2891,6 +2938,30 @@ app.get('/t/:id/p.gif', async (c) => {
   const day = new Date().toISOString().slice(0, 10);
   c.executionCtx.waitUntil(c.env.DB.prepare(`INSERT INTO hits (slug, day, path, n) VALUES (?, ?, ?, 1)
     ON CONFLICT(slug, day, path) DO UPDATE SET n = n + 1`).bind(`ext-${id}`, day, p).run());
+
+  // 📞 CALL TRACKING — for a mobile IV service most high-intent people tap the
+  // phone number instead of filling a form. Those leads used to be invisible:
+  // no row anywhere, so cost-per-lead was overstated and Google never learned
+  // that the click worked. A tel: tap now becomes a real lead row of kind
+  // 'call', carrying the same click attribution as a form lead, so it flows
+  // into the ROI view and the offline conversion upload like anything else.
+  // Rate-limited per IP so one person mashing the button is one lead.
+  if (p === 'ev-call_click') {
+    const ipC = c.req.header('CF-Connecting-IP') || 'noip';
+    c.executionCtx.waitUntil((async () => {
+      try {
+        if (!(await rlOk(c.env.DB, `callclick:${id}:${ipC}`, 1, 1800))) return;   // one per 30 min
+        const g = String(c.req.query('g') || '').slice(0, 200);
+        await c.env.DB.prepare(
+          `INSERT INTO leads (client_id, slug, name, email, phone, message, source, kind, gclid, utm_source, utm_campaign, landing_page, device)
+           VALUES (?, ?, '', '', '', ?, ?, 'call', ?, ?, ?, ?, ?)`
+        ).bind(id, '', 'Tapped the phone number on the site', g ? 'google-ads' : 'website',
+          g, String(c.req.query('us') || '').slice(0, 60), String(c.req.query('uc') || '').slice(0, 80),
+          String(c.req.query('lp') || '').slice(0, 120), String(c.req.query('dv') || '').slice(0, 20)).run();
+        await logEvent(c.env.DB, id, 'call_click', `\u{1F4DE} Someone tapped the phone number${g ? ' (from a Google Ads click)' : ''}`);
+      } catch {}
+    })());
+  }
   return c.body(GIF, 200, gifHeaders);
 });
 
@@ -4182,6 +4253,396 @@ async function emailListFor(db, id) {
   }
   return [...seen.values()].reverse(); // newest first for the UI
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// 🎯 CLOSED-LOOP ADS (8/20) — the point of all of this
+// ------------------------------------------------------------------------
+// Google's bidding is only as smart as the feedback it gets. Out of the box it
+// learns "a form was submitted". It has no idea whether that person booked, or
+// what they were worth. So it happily buys more of whatever produces cheap
+// form fills. These routes close the loop: mark which leads actually became
+// customers, hand that back to Google, and measure the account on bookings and
+// revenue instead of on clicks.
+// ══════════════════════════════════════════════════════════════════════════
+
+// Mark a lead booked / not booked, with what the visit was worth.
+// This one button is what turns cost-per-lead into cost-per-customer.
+// ── SEARCH TERMS → NEGATIVE KEYWORDS ──────────────────────────────────────
+// The negative library is guesswork made in advance. The real waste is in what
+// people ACTUALLY typed, and it is different in every account. This is the
+// highest-value recurring hour in any Google Ads account, so it should take
+// thirty seconds instead: paste the search-terms export, get back the junk
+// ranked by money burned, and a negative list ready to import.
+//
+// Google's export has a preamble row, then a header row, then data, and its
+// column names shift between UI versions — so we sniff the header instead of
+// assuming positions.
+function parseCsvLine(line) {
+  const out = []; let cur = ''; let q = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (q) {
+      if (ch === '"') { if (line[i + 1] === '"') { cur += '"'; i++; } else q = false; }
+      else cur += ch;
+    } else if (ch === '"') q = true;
+    else if (ch === ',') { out.push(cur); cur = ''; }
+    else cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
+function csvNum(v) {
+  const n = parseFloat(String(v == null ? '' : v).replace(/[^0-9.\-]/g, ''));
+  return isFinite(n) ? n : 0;
+}
+function parseSearchTerms(csv) {
+  const lines = String(csv || '').split(/\r?\n/).filter((l) => l.trim());
+  let hdr = -1;
+  for (let i = 0; i < Math.min(lines.length, 12); i++) {
+    const low = lines[i].toLowerCase();
+    if (low.includes('search term') && (low.includes('cost') || low.includes('clicks') || low.includes('impr'))) { hdr = i; break; }
+  }
+  if (hdr === -1) return { error: 'Could not find a header row with "Search term" in that paste. Export from Google Ads with the Search terms report and paste the whole thing, header included.' };
+  const cols = parseCsvLine(lines[hdr]).map((x) => x.trim().toLowerCase());
+  const find = (...names) => { for (const n of names) { const i = cols.findIndex((c) => c === n || c.startsWith(n)); if (i > -1) return i; } return -1; };
+  const iTerm = find('search term', 'search terms');
+  const iCost = find('cost', 'spend');
+  const iClicks = find('clicks');
+  const iImpr = find('impr', 'impressions');
+  const iConv = find('conversions', 'conv.');
+  const iCamp = find('campaign');
+  if (iTerm === -1) return { error: 'No "Search term" column found.' };
+  const rows = [];
+  for (let i = hdr + 1; i < lines.length; i++) {
+    const cells = parseCsvLine(lines[i]);
+    const term = String(cells[iTerm] || '').trim().toLowerCase();
+    if (!term || /^total/i.test(term) || term === '--') continue;
+    rows.push({
+      term,
+      cost: iCost > -1 ? csvNum(cells[iCost]) : 0,
+      clicks: iClicks > -1 ? csvNum(cells[iClicks]) : 0,
+      impr: iImpr > -1 ? csvNum(cells[iImpr]) : 0,
+      conv: iConv > -1 ? csvNum(cells[iConv]) : 0,
+      campaign: iCamp > -1 ? String(cells[iCamp] || '').slice(0, 60) : '',
+    });
+  }
+  return { rows };
+}
+// Classify a term as waste, and say WHY in words she can act on. A reason she
+// disagrees with is a reason she can override — an unexplained verdict is not.
+function classifyTerm(t, facts) {
+  const term = ' ' + t.term + ' ';
+  for (const [cat, words] of Object.entries(NEG_LIB)) {
+    for (const w of words) {
+      if (term.includes(' ' + w + ' ') || t.term === w || t.term.startsWith(w + ' ') || t.term.endsWith(' ' + w)) {
+        return { waste: true, why: `matches the ${cat.replace(/_/g, ' ')} exclusion list ("${w}")`, cat };
+      }
+    }
+  }
+  if (/\b(free|cheap|cheapest|discount|coupon|groupon)\b/.test(term)) return { waste: true, why: 'price-shopper language — rarely books at full ticket', cat: 'bargain' };
+  if (/\b(near me)\b/.test(term) === false && /\b(what is|why does|how does|meaning|definition|side effects|dangers|reddit|wiki)\b/.test(term)) return { waste: true, why: 'research intent, not booking intent', cat: 'research' };
+  // Spending real money with nothing to show is its own category, whatever the words say.
+  if (t.conv === 0 && t.clicks >= 3 && t.cost >= (facts.cpl || 40)) {
+    return { waste: true, why: `${t.clicks} clicks and $${t.cost.toFixed(2)} spent with zero conversions`, cat: 'no-return' };
+  }
+  return { waste: false };
+}
+
+// ── SPEND + PERFORMANCE INGEST ────────────────────────────────────────────
+// Mission Control knew nothing about cost, clicks or CPC, so every question
+// about how the account is doing meant opening Google Ads. Google Ads API
+// write access is still pending, but she can export a report today — so accept
+// the paste now and swap in the API later behind the same stored shape.
+// Accepts either a campaign report or a day-by-day report; sniffs which.
+function parseAdsReport(csv) {
+  const lines = String(csv || '').split(/\r?\n/).filter((l) => l.trim());
+  let hdr = -1;
+  for (let i = 0; i < Math.min(lines.length, 12); i++) {
+    const low = lines[i].toLowerCase();
+    if ((low.includes('cost') || low.includes('spend')) && (low.includes('campaign') || low.includes('day') || low.includes('date') || low.includes('clicks'))) { hdr = i; break; }
+  }
+  if (hdr === -1) return { error: 'Could not find a header row with a Cost column. Export from Google Ads (Campaigns or a day report) and paste the whole thing including headers.' };
+  const cols = parseCsvLine(lines[hdr]).map((x) => x.trim().toLowerCase());
+  const find = (...names) => { for (const n of names) { const i = cols.findIndex((c) => c === n || c.startsWith(n)); if (i > -1) return i; } return -1; };
+  const iDay = find('day', 'date');
+  const iCamp = find('campaign');
+  const iCost = find('cost', 'spend');
+  const iClicks = find('clicks');
+  const iImpr = find('impr', 'impressions');
+  const iConv = find('conversions', 'conv.');
+  const rows = [];
+  for (let i = hdr + 1; i < lines.length; i++) {
+    const cells = parseCsvLine(lines[i]);
+    const label = String(cells[iCamp > -1 ? iCamp : (iDay > -1 ? iDay : 0)] || '').trim();
+    if (!label || /^total/i.test(label)) continue;
+    rows.push({
+      day: iDay > -1 ? String(cells[iDay] || '').trim().slice(0, 10) : '',
+      campaign: iCamp > -1 ? String(cells[iCamp] || '').trim().slice(0, 80) : '',
+      cost: iCost > -1 ? csvNum(cells[iCost]) : 0,
+      clicks: iClicks > -1 ? csvNum(cells[iClicks]) : 0,
+      impr: iImpr > -1 ? csvNum(cells[iImpr]) : 0,
+      conv: iConv > -1 ? csvNum(cells[iConv]) : 0,
+    });
+  }
+  return { rows, byDay: iDay > -1 };
+}
+
+app.post('/api/clients/:id/ads-performance', async (c) => {
+  const id = Number(c.req.param('id'));
+  const body = await c.req.json().catch(() => ({}));
+  const parsed = parseAdsReport(body.csv || '');
+  if (parsed.error) return c.json({ ok: false, error: parsed.error }, 400);
+  const rows = parsed.rows;
+  const sum = (k) => rows.reduce((a, r) => a + (r[k] || 0), 0);
+  const cost = sum('cost'), clicks = sum('clicks'), impr = sum('impr'), conv = sum('conv');
+  const days = [...new Set(rows.map((r) => r.day).filter(Boolean))].sort();
+  const snap = {
+    at: new Date().toISOString(),
+    rows: rows.length,
+    cost: Math.round(cost * 100) / 100,
+    clicks, impressions: impr, conversions: conv,
+    cpc: clicks ? Math.round((cost / clicks) * 100) / 100 : 0,
+    ctr: impr ? Math.round((clicks / impr) * 10000) / 100 : 0,
+    cpa: conv ? Math.round((cost / conv) * 100) / 100 : 0,
+    first_day: days[0] || '', last_day: days[days.length - 1] || '', day_count: days.length,
+    by_day: parsed.byDay ? days.map((d) => {
+      const rs = rows.filter((r) => r.day === d);
+      return { day: d, cost: Math.round(rs.reduce((a, r) => a + r.cost, 0) * 100) / 100, clicks: rs.reduce((a, r) => a + r.clicks, 0), conv: rs.reduce((a, r) => a + r.conv, 0) };
+    }) : [],
+    by_campaign: [...new Set(rows.map((r) => r.campaign).filter(Boolean))].map((cn) => {
+      const rs = rows.filter((r) => r.campaign === cn);
+      return { campaign: cn, cost: Math.round(rs.reduce((a, r) => a + r.cost, 0) * 100) / 100, clicks: rs.reduce((a, r) => a + r.clicks, 0), conv: rs.reduce((a, r) => a + r.conv, 0) };
+    }).sort((a, b) => b.cost - a.cost).slice(0, 20),
+  };
+  await setSetting(c.env.DB, 'ads_perf_' + id, JSON.stringify(snap).slice(0, 90000));
+  await logEvent(c.env.DB, id, 'ads_performance',
+    `\u{1F4CA} Ads performance updated: $${snap.cost} spend, ${snap.clicks} clicks, $${snap.cpc} CPC${snap.day_count ? ` over ${snap.day_count} days` : ''}`);
+  return c.json({ ok: true, ...snap });
+});
+
+// ── THE ROI VIEW — the number that renews the retainer ────────────────────
+// Spend comes from the pasted report; leads, calls, bookings and revenue come
+// from our own database. Every figure says where it came from, and anything we
+// genuinely cannot know says so instead of showing a confident zero.
+async function adsRoi(env, id) {
+  const settings = await getSettings(env.DB);
+  let perf = {}, econ = {}, terms = {};
+  try { perf = JSON.parse(settings['ads_perf_' + id] || '{}'); } catch {}
+  try { econ = JSON.parse(settings['ads_econ_' + id] || '{}'); } catch {}
+  try { terms = JSON.parse(settings['ads_terms_' + id] || '{}'); } catch {}
+  const rows = (await env.DB.prepare(
+    `SELECT * FROM leads WHERE client_id = ? AND created_at >= datetime('now','-30 day')`).bind(id).all()).results || [];
+  const paid = rows.filter((r) => r.gclid || r.wbraid || r.gbraid || /google-ads|cpc|paid/i.test(r.source || ''));
+  const booked = rows.filter((r) => r.status === 'booked');
+  const bookedPaid = paid.filter((r) => r.status === 'booked');
+  const revenue = booked.reduce((a, r) => a + (Number(r.value) || 0), 0);
+  const revenuePaid = bookedPaid.reduce((a, r) => a + (Number(r.value) || 0), 0);
+  const spend = Number(perf.cost || 0);
+  const calls = rows.filter((r) => r.kind === 'call').length;
+  const forms = rows.filter((r) => r.kind !== 'call').length;
+  const unmarked = rows.filter((r) => !r.status).length;
+  return {
+    window: 'last 30 days',
+    spend, spend_source: perf.at ? `pasted report, updated ${String(perf.at).slice(0, 10)}` : 'not entered yet',
+    leads: rows.length, forms, calls,
+    paid_leads: paid.length,
+    booked: booked.length, booked_from_ads: bookedPaid.length,
+    unmarked,
+    revenue: Math.round(revenue), revenue_from_ads: Math.round(revenuePaid),
+    cost_per_lead: paid.length && spend ? Math.round((spend / paid.length) * 100) / 100 : null,
+    cost_per_booking: bookedPaid.length && spend ? Math.round((spend / bookedPaid.length) * 100) / 100 : null,
+    roas: spend ? Math.round((revenuePaid / spend) * 100) / 100 : null,
+    uploadable: paid.filter((r) => r.status === 'booked' && (r.gclid || r.wbraid || r.gbraid)).length,
+    waste_pct: terms.waste_pct == null ? null : terms.waste_pct,
+    ticket: Number(econ.ticket || 0) || null,
+    honest_note: unmarked
+      ? `${unmarked} of ${rows.length} leads are not marked booked or not — until they are, cost per booking is based only on what has been marked.`
+      : (spend ? null : 'No spend entered yet, so cost figures cannot be calculated.'),
+  };
+}
+app.get('/api/clients/:id/ads-roi', async (c) => c.json(await adsRoi(c.env, Number(c.req.param('id')))));
+
+// ── LANDING PAGE PERFORMANCE ──────────────────────────────────────────────
+// She builds her own landing pages, so which one converts is the highest
+// leverage variable she controls. Ranked by leads, with booked counts so a
+// page that pulls cheap unqualified leads cannot masquerade as the winner.
+// ── ONE QUEUE: WHAT NEEDS HER, ACROSS EVERY ADS CLIENT ────────────────────
+// As the roster grows, "open each card and look" stops scaling. This answers
+// the only question that matters each morning: what needs me today, worst
+// first, with the action already written. Nothing here is a metric for its own
+// sake — every row is something she can act on in a few minutes.
+app.get('/api/ads-attention', async (c) => {
+  const db = c.env.DB;
+  const settings = await getSettings(db);
+  const ids = Object.keys(settings).filter((k) => /^ads_\d+$/.test(k)).map((k) => Number(k.slice(4)));
+  const out = [];
+  for (const id of ids) {
+    const client = await db.prepare('SELECT id, business_name, name FROM clients WHERE id = ?').bind(id).first();
+    if (!client) continue;                                       // orphaned key, skip
+    const who = client.business_name || client.name || ('Client ' + id);
+    let rep = {}, perf = {}, terms = {};
+    try { rep = JSON.parse(settings['ads_' + id] || '{}'); } catch {}
+    try { perf = JSON.parse(settings['ads_perf_' + id] || '{}'); } catch {}
+    try { terms = JSON.parse(settings['ads_terms_' + id] || '{}'); } catch {}
+    const add = (sev, what, action) => out.push({ client_id: id, client: who, severity: sev, what, action });
+
+    // Recent alarms from the daily pacing guard surface here too.
+    const alarms = (await db.prepare(
+      `SELECT detail FROM events WHERE client_id = ? AND type = 'ads_alarm' AND created_at >= datetime('now','-3 day') ORDER BY id DESC LIMIT 4`)
+      .bind(id).all()).results || [];
+    for (const a of alarms) add(1, String(a.detail || '').replace(/^\u{1F6A8}\s*/u, ''), 'Open the ads card');
+
+    const unmarked = Number((await db.prepare(
+      `SELECT COUNT(*) n FROM leads WHERE client_id = ? AND (status IS NULL OR status = '') AND created_at >= datetime('now','-30 day')`).bind(id).first())?.n || 0);
+    if (unmarked >= 5) add(2, `${unmarked} leads waiting to be marked booked or not`, 'Mark them on the client card — 10 seconds each');
+
+    const uploadable = Number((await db.prepare(
+      `SELECT COUNT(*) n FROM leads WHERE client_id = ? AND status = 'booked' AND (gclid != '' OR wbraid != '' OR gbraid != '')
+         AND (status_at >= datetime('now','-45 day') OR created_at >= datetime('now','-45 day'))`).bind(id).first())?.n || 0);
+    if (uploadable >= 3) add(2, `${uploadable} booked leads ready to report back to Google`, 'Download the conversions CSV and upload it in Google Ads → Goals → Conversions → Uploads');
+
+    if (!perf.at) add(3, 'No spend figures entered yet', 'Paste the Google Ads report so cost per lead can be calculated');
+    else if (Date.now() - new Date(perf.at).getTime() > 12096e5) add(3, `Spend figures are ${Math.round((Date.now() - new Date(perf.at).getTime()) / 864e5)} days old`, 'Paste a fresh Google Ads report');
+
+    if (!terms.at) add(3, 'Search terms have never been reviewed', 'Paste the search-terms report — this is where wasted spend hides');
+    else if (Date.now() - new Date(terms.at).getTime() > 12096e5) add(3, 'Search terms not reviewed in 2 weeks', 'Paste a fresh search-terms report');
+    else if (terms.waste_pct >= 20) add(2, `${terms.waste_pct}% of spend went to search terms that will not book ($${terms.waste_cost})`, 'Download the negative keyword list and import it');
+  }
+  out.sort((a, b) => a.severity - b.severity);
+  return c.json({ count: out.length, urgent: out.filter((x) => x.severity === 1).length, items: out.slice(0, 40) });
+});
+
+app.get('/api/clients/:id/lp-performance', async (c) => {
+  const id = Number(c.req.param('id'));
+  const rows = (await c.env.DB.prepare(
+    `SELECT landing_page, status, value, gclid FROM leads
+      WHERE client_id = ? AND created_at >= datetime('now','-90 day')`).bind(id).all()).results || [];
+  const map = new Map();
+  for (const r of rows) {
+    const k = String(r.landing_page || '(not captured)');
+    const e = map.get(k) || { landing_page: k, leads: 0, booked: 0, revenue: 0, from_ads: 0 };
+    e.leads++;
+    if (r.status === 'booked') { e.booked++; e.revenue += Number(r.value) || 0; }
+    if (r.gclid) e.from_ads++;
+    map.set(k, e);
+  }
+  const pages = [...map.values()].map((e) => ({ ...e, revenue: Math.round(e.revenue), book_rate: e.leads ? Math.round((e.booked / e.leads) * 100) : 0 }))
+    .sort((a, b) => b.leads - a.leads);
+  return c.json({ window: 'last 90 days', pages });
+});
+
+app.post('/api/clients/:id/search-terms', async (c) => {
+  const id = Number(c.req.param('id'));
+  const body = await c.req.json().catch(() => ({}));
+  const parsed = parseSearchTerms(body.csv || '');
+  if (parsed.error) return c.json({ ok: false, error: parsed.error }, 400);
+  const settings = await getSettings(c.env.DB);
+  let econ = {}; try { econ = JSON.parse(settings['ads_econ_' + id] || '{}'); } catch {}
+  const facts = { cpl: Number(econ.target_cpl || 0) || 40 };
+
+  const waste = []; const winners = [];
+  let totalCost = 0, wasteCost = 0, totalConv = 0;
+  for (const t of parsed.rows) {
+    totalCost += t.cost; totalConv += t.conv;
+    const v = classifyTerm(t, facts);
+    if (v.waste) { wasteCost += t.cost; waste.push({ ...t, why: v.why, cat: v.cat }); }
+    else if (t.conv > 0) winners.push(t);
+  }
+  waste.sort((a, b) => b.cost - a.cost);
+  winners.sort((a, b) => b.conv - a.conv);
+
+  const snapshot = {
+    at: new Date().toISOString(), terms: parsed.rows.length,
+    total_cost: Math.round(totalCost * 100) / 100,
+    waste_cost: Math.round(wasteCost * 100) / 100,
+    waste_pct: totalCost ? Math.round((wasteCost / totalCost) * 100) : 0,
+    total_conv: totalConv,
+    negatives: waste.slice(0, 200).map((w) => w.term),
+    waste: waste.slice(0, 60), winners: winners.slice(0, 25),
+  };
+  await setSetting(c.env.DB, 'ads_terms_' + id, JSON.stringify(snapshot).slice(0, 90000));
+  if (waste.length) {
+    await logEvent(c.env.DB, id, 'ads_search_terms',
+      `\u{1F50E} Search terms reviewed: ${waste.length} wasteful terms found, $${snapshot.waste_cost} of $${snapshot.total_cost} spend (${snapshot.waste_pct}%). Negative list ready to import.`);
+  }
+  return c.json({ ok: true, ...snapshot });
+});
+
+// Negative keywords in Google Ads Editor import shape.
+app.get('/api/clients/:id/negatives.csv', async (c) => {
+  const id = Number(c.req.param('id'));
+  const settings = await getSettings(c.env.DB);
+  let snap = {}; try { snap = JSON.parse(settings['ads_terms_' + id] || '{}'); } catch {}
+  const negs = Array.isArray(snap.negatives) ? snap.negatives : [];
+  const cell = (v) => { const t = String(v == null ? '' : v); return /[",\n]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t; };
+  const out = ['Action,Campaign,Keyword,Criterion Type'];
+  let camp = '';
+  try { camp = JSON.parse(settings['ads_' + id] || '{}').campaign_name || ''; } catch {}
+  // Exact-match negatives: a phrase negative on a real search term can silently
+  // block traffic she wants. Exact only kills the query she actually saw.
+  for (const n of negs) out.push(['Add', camp, n, 'Negative Exact'].map(cell).join(','));
+  return new Response(out.join('\n'), {
+    headers: { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="negative-keywords-${id}.csv"` },
+  });
+});
+
+app.post('/api/clients/:id/lead-status', async (c) => {
+  const id = Number(c.req.param('id'));
+  const body = await c.req.json().catch(() => ({}));
+  const leadId = Number(body.lead_id || 0);
+  const status = String(body.status || '').toLowerCase();
+  if (!leadId) return c.json({ ok: false, error: 'lead_id required' }, 400);
+  if (!['booked', 'no', 'pending', ''].includes(status)) return c.json({ ok: false, error: 'status must be booked, no or pending' }, 400);
+  const lead = await c.env.DB.prepare('SELECT * FROM leads WHERE id = ? AND client_id = ?').bind(leadId, id).first();
+  if (!lead) return c.json({ ok: false, error: 'lead not found for this client' }, 404);
+  // Value defaults to the average ticket she already entered in Economics, so
+  // marking a lead booked never requires typing a number to be useful.
+  let value = body.value == null ? null : Number(body.value);
+  if (status === 'booked' && (value == null || !isFinite(value) || value <= 0)) {
+    try {
+      const econ = JSON.parse((await getSettings(c.env.DB))['ads_econ_' + id] || '{}');
+      value = Number(econ.ticket || 0) || null;
+    } catch { value = null; }
+  }
+  await c.env.DB.prepare(`UPDATE leads SET status = ?, value = ?, status_at = datetime('now') WHERE id = ?`)
+    .bind(status, status === 'booked' ? (value || 0) : 0, leadId).run();
+  await logEvent(c.env.DB, id, 'lead_status',
+    status === 'booked'
+      ? `\u{1F4B0} Lead marked BOOKED${value ? ' at $' + Math.round(value) : ''}${lead.gclid ? ' — came from a Google Ads click, so it can be reported back to Google' : ''}`
+      : `Lead marked "${status || 'pending'}"`);
+  return c.json({ ok: true, lead_id: leadId, status, value: value || 0, has_gclid: !!lead.gclid });
+});
+
+// Google's Offline Conversion Import format, ready to upload at
+// Google Ads → Goals → Conversions → Uploads. This is the step that makes
+// Smart Bidding chase customers instead of form fills. Only booked leads that
+// actually carry a click id can be uploaded — everything else is untraceable.
+app.get('/api/clients/:id/ads-conversions.csv', async (c) => {
+  const id = Number(c.req.param('id'));
+  const name = String(c.req.query('name') || 'Booked Visit');
+  const rows = (await c.env.DB.prepare(
+    `SELECT * FROM leads WHERE client_id = ? AND status = 'booked'
+       AND (gclid != '' OR wbraid != '' OR gbraid != '')
+     ORDER BY id DESC LIMIT 5000`).bind(id).all()).results || [];
+  const cell = (v) => { const t = String(v == null ? '' : v); return /[",\n]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t; };
+  // Google wants "yyyy-MM-dd HH:mm:ss+|-HH:mm". We stamp UTC and declare it.
+  const stamp = (d) => String(d || '').replace('T', ' ').slice(0, 19) + '+00:00';
+  const out = ['Parameters:TimeZone=+0000'];
+  out.push('Google Click ID,Conversion Name,Conversion Time,Conversion Value,Conversion Currency');
+  let skipped = 0;
+  for (const r of rows) {
+    const click = r.gclid || r.wbraid || r.gbraid;
+    if (!click) { skipped++; continue; }
+    out.push([click, name, stamp(r.status_at || r.created_at), (Number(r.value) || 0).toFixed(2), 'USD'].map(cell).join(','));
+  }
+  return new Response(out.join('\n'), {
+    headers: {
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': `attachment; filename="google-ads-conversions-${id}.csv"`,
+      'X-Rows': String(out.length - 2), 'X-Skipped': String(skipped),
+    },
+  });
+});
 
 app.get('/api/clients/:id/email-list', async (c) => {
   const id = Number(c.req.param('id'));
@@ -7645,6 +8106,64 @@ async function adsWeeklyRescan(env) {
 // broken, because nothing looks wrong until the invoice arrives. For every
 // client whose campaign is live, this asks Google Analytics whether ANY key
 // event fired in the last 7 days. Zero is the alarm.
+// ── BUDGET PACING + ANOMALY GUARD ─────────────────────────────────────────
+// The existing watchdogs catch broken tracking. They do not catch the
+// expensive surprises: a budget burning twice as fast as it should, a CPC that
+// doubled overnight, or leads simply stopping. Those cost real money quietly,
+// and the whole point of running this for her is that she should not have to
+// remember to look. Runs daily; every alarm names the number and the action.
+async function adsPacing(env) {
+  const db = env.DB;
+  const settings = await getSettings(db);
+  const ids = Object.keys(settings).filter((k) => /^ads_\d+$/.test(k)).map((k) => Number(k.slice(4)));
+  let fired = 0;
+  for (const id of ids) {
+    let rep = {}, perf = {}, econ = {};
+    try { rep = JSON.parse(settings['ads_' + id] || '{}'); } catch {}
+    try { perf = JSON.parse(settings['ads_perf_' + id] || '{}'); } catch {}
+    try { econ = JSON.parse(settings['ads_econ_' + id] || '{}'); } catch {}
+    if (rep.status !== 'live' && !rep.live_at) continue;      // only live accounts
+
+    const alarms = [];
+
+    // 1. PACING — only meaningful if we know both the budget and the spend.
+    const daily = Number(econ.daily_budget || rep.daily_budget || 0);
+    if (daily > 0 && perf.day_count > 0 && perf.cost > 0) {
+      const actual = perf.cost / perf.day_count;
+      const ratio = actual / daily;
+      if (ratio >= 1.25) alarms.push(`Spending $${actual.toFixed(2)}/day against a $${daily.toFixed(2)} budget — ${Math.round((ratio - 1) * 100)}% over pace. Check for a budget change or a new campaign.`);
+      else if (ratio <= 0.55) alarms.push(`Only spending $${actual.toFixed(2)}/day of a $${daily.toFixed(2)} budget. Usually means bids are too low or the keywords are too narrow — the ads are barely showing.`);
+    }
+
+    // 2. CPC SPIKE — compare this paste to the last one we kept.
+    let prev = {};
+    try { prev = JSON.parse(settings['ads_perf_prev_' + id] || '{}'); } catch {}
+    if (prev.cpc > 0 && perf.cpc > 0 && perf.at !== prev.at) {
+      const jump = perf.cpc / prev.cpc;
+      if (jump >= 1.5) alarms.push(`Cost per click jumped from $${prev.cpc} to $${perf.cpc} (+${Math.round((jump - 1) * 100)}%). Usually a competitor bidding up, or match types loosening.`);
+    }
+    if (perf.at && perf.at !== prev.at) await setSetting(db, 'ads_perf_prev_' + id, JSON.stringify({ at: perf.at, cpc: perf.cpc, cost: perf.cost }));
+
+    // 3. LEAD DROUGHT — the alarm that matters most, and needs no paste.
+    const recent = await db.prepare(
+      `SELECT COUNT(*) n FROM leads WHERE client_id = ? AND created_at >= datetime('now','-7 day')`).bind(id).first();
+    const prior = await db.prepare(
+      `SELECT COUNT(*) n FROM leads WHERE client_id = ? AND created_at >= datetime('now','-28 day') AND created_at < datetime('now','-7 day')`).bind(id).first();
+    const n7 = Number(recent?.n || 0);
+    const wkAvg = Number(prior?.n || 0) / 3;
+    if (wkAvg >= 2 && n7 === 0) alarms.push(`Zero leads in 7 days, against about ${wkAvg.toFixed(1)}/week before. Check the campaign is still running and the form still works.`);
+    else if (wkAvg >= 3 && n7 > 0 && n7 <= wkAvg * 0.4) alarms.push(`Leads dropped to ${n7} this week from about ${wkAvg.toFixed(1)}/week. Worth a look before it becomes a month.`);
+
+    // 4. UNMARKED LEADS — the loop only closes if she marks outcomes.
+    const un = await db.prepare(
+      `SELECT COUNT(*) n FROM leads WHERE client_id = ? AND (status IS NULL OR status = '') AND created_at >= datetime('now','-30 day')`).bind(id).first();
+    if (Number(un?.n || 0) >= 10) alarms.push(`${un.n} leads from the last 30 days are not marked booked or not. Marking them is what lets Google optimise for customers instead of form fills.`);
+
+    for (const a of alarms) { await logEvent(db, id, 'ads_alarm', `\u{1F6A8} ${a}`); fired++; }
+  }
+  return fired;
+}
+
 async function adsSilentFailure(env) {
   const db = env.DB;
   const settings = await getSettings(db);
@@ -7778,8 +8297,12 @@ app.get('/portal-ads/:id/:token', async (c) => {
   if (c.req.param('token') !== await portalToken(c.env, 'portal', id)) return c.json({ error: 'nope' }, 403);
   const settings = await getSettings(c.env.DB);
   let rep = {}; try { rep = JSON.parse(settings['ads_' + id] || '{}'); } catch {}
-  if (!rep.ga4_property) return c.json({ pending: 'no-property' });
-  if (!c.env.GOOGLE_CLIENT_ID || !c.env.GOOGLE_CLIENT_SECRET || !c.env.GOOGLE_REFRESH_TOKEN) return c.json({ pending: 'no-google-auth' });
+  // The ROI story comes from OUR database, so it works whether or not Google
+  // analytics is wired up. This is what a client actually wants to see, and
+  // what makes the retainer obviously worth paying: spend in, bookings out.
+  const roi = await adsRoi(c.env, id).catch(() => null);
+  if (!rep.ga4_property) return c.json({ pending: 'no-property', roi });
+  if (!c.env.GOOGLE_CLIENT_ID || !c.env.GOOGLE_CLIENT_SECRET || !c.env.GOOGLE_REFRESH_TOKEN) return c.json({ pending: 'no-google-auth', roi });
   try {
     const tr = await fetch('https://oauth2.googleapis.com/token', {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -7794,8 +8317,8 @@ app.get('/portal-ads/:id/:token', async (c) => {
     if (!rr.ok) return c.json({ pending: 'api-' + rr.status });
     const data = await rr.json();
     const m = (data.rows && data.rows[0] && data.rows[0].metricValues) || [];
-    return c.json({ ok: true, sessions: Number((m[0] || {}).value || 0), keyEvents: Number((m[1] || {}).value || 0), users: Number((m[2] || {}).value || 0) });
-  } catch (e) { return c.json({ pending: 'error' }); }
+    return c.json({ ok: true, sessions: Number((m[0] || {}).value || 0), keyEvents: Number((m[1] || {}).value || 0), users: Number((m[2] || {}).value || 0), roi });
+  } catch (e) { return c.json({ pending: 'error', roi }); }
 });
 
 export default {
@@ -7817,6 +8340,9 @@ export default {
       ));
       ctx.waitUntil(adsBillingSweep(env).catch((e) =>
         logEvent(env.DB, null, 'error', `Ads billing sweep failed: ${e.message}`)
+      ));
+      ctx.waitUntil(adsPacing(env).catch((e) =>
+        logEvent(env.DB, null, 'error', `Ads pacing check failed: ${e.message}`)
       ));
       if (new Date(event.scheduledTime || Date.now()).getUTCDay() === 0) {
         ctx.waitUntil(adsWeeklyRescan(env).catch((e) =>

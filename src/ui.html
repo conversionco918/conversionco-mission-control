@@ -862,9 +862,25 @@ function openDrawer(id) {
   api(`/api/clients/${id}/leads`).then((r) => {
     const box = document.getElementById('leadsBox');
     if (!box || !r.leads) return;
+    // 🎯 Marking a lead booked is the single highest-value click in this whole
+    // dashboard: it is what lets Google optimise for customers instead of form
+    // fills, and what turns cost-per-lead into cost-per-customer.
+    const markBtn = (l) => {
+      const on = 'background:#059669;color:#fff;border-color:#059669';
+      const off = 'background:#fee2e2;color:#991b1b;border-color:#fecaca';
+      return `<span style="white-space:nowrap">`
+        + `<button class="btn btn-ghost" style="font-size:10.5px;padding:3px 9px;${l.status === 'booked' ? on : ''}" onclick="markLead(${l.client_id},${l.id},'booked')">Booked${l.value ? ' $' + Math.round(l.value) : ''}</button> `
+        + `<button class="btn btn-ghost" style="font-size:10.5px;padding:3px 9px;${l.status === 'no' ? off : ''}" onclick="markLead(${l.client_id},${l.id},'no')">No</button>`
+        + `</span>`;
+    };
+    const attrChip = (l) => {
+      if (l.gclid || l.wbraid || l.gbraid) return `<span class="chip" style="background:#ecfdf5;color:#047857;font-size:10.5px;padding:2px 8px;">Google Ads click${l.utm_campaign ? ' · ' + esc(l.utm_campaign) : ''}</span>`;
+      if (l.kind === 'call') return `<span class="chip" style="background:#eff6ff;color:#1d4ed8;font-size:10.5px;padding:2px 8px;">phone tap</span>`;
+      return '';
+    };
     box.innerHTML = `<label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Leads from their website ${r.leads.length ? `(${r.leads.length} recent)` : ''}</label>` +
       (r.leads.length
-        ? `<div class="intake" style="padding:12px 14px;">${r.leads.map(l => `<div style="padding:7px 0;border-bottom:1px dashed #e2e8f0;font-size:13px;"><b>${esc(l.name || 'No name')}</b> · ${esc(l.phone || l.email || '')} ${l.source ? `<span class="chip" style="background:#eef2f7;color:#475569;font-size:10.5px;padding:2px 8px;">via ${esc(l.source)}</span>` : ''}<br><span style="color:#64748b;">${esc((l.message || '').slice(0, 120))}</span><br><span style="color:#94a3b8;font-size:11px;">${esc(l.created_at)}</span></div>`).join('')}</div>`
+        ? `<div class="intake" style="padding:12px 14px;">${r.leads.map(l => `<div style="padding:7px 0;border-bottom:1px dashed #e2e8f0;font-size:13px;"><b>${esc(l.name || (l.kind === 'call' ? 'Phone tap' : 'No name'))}</b> · ${esc(l.phone || l.email || '')} ${l.source ? `<span class="chip" style="background:#eef2f7;color:#475569;font-size:10.5px;padding:2px 8px;">via ${esc(l.source)}</span>` : ''} ${attrChip(l)}<br><span style="color:#64748b;">${esc((l.message || '').slice(0, 120))}</span><br><span style="color:#94a3b8;font-size:11px;">${esc(l.created_at)}</span> ${markBtn(l)}</div>`).join('')}</div>`
         : `<p style="font-size:12px;color:#94a3b8;">None yet — leads from their site's contact form appear here (and email you instantly).</p>`);
   });
   // 📧 EMAIL LIST — hers, in Mission Control, regardless of which email
@@ -1558,6 +1574,11 @@ async function lpInject(id){
       h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px"' + (rep.url ? '' : ' disabled') + ' title="Re-read their site and rebuild the keywords and headlines around whatever is on it now — new drip, new member benefit, new town." onclick="adsRescan(' + c.id + ', this)">&#128300; Re-read page</button>';
       h += SEP();
       h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsHeadCode(' + c.id + ')">&#129513; Head code</button>';
+      h += SEP();
+      h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsRoiView(' + c.id + ')">&#128200; ROI</button>';
+      h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsTermsView(' + c.id + ')">&#128269; Search terms</button>';
+      h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsPerfPaste(' + c.id + ')">&#128176; Spend</button>';
+      h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsUpload(' + c.id + ')">&#8593; Report conversions</button>';
       h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px"' + (rep.brief ? '' : ' disabled title="Run Set it all up first"') + ' onclick="adsSheet(' + c.id + ')">&#128203; Build sheet</button>';
       h += '<button class="btn btn-green" style="font-size:11.5px;padding:7px 12px"' + (rep.brief && rep.url ? '' : ' disabled title="Run Set it all up first"') + ' title="Download the campaign as two CSVs and import them into Google Ads Editor — the whole campaign builds itself, paused." onclick="adsCsv(' + c.id + ')">&#11015; Build it for me</button>';
       h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" title="Average ticket, close rate, target clients — the sheet back-solves the budget and tells you if the math works." onclick="adsEcon(' + c.id + ')">&#128181; Economics' + ((rep.econ && rep.econ.target_clients) ? ' &#10003;' : '') + '</button>';
@@ -1924,9 +1945,44 @@ async function lpInject(id){
       box.innerHTML = h;
     } catch (e) { box.textContent = ''; }
   };
+  // ══ ONE QUEUE: WHAT NEEDS HER TODAY, ACROSS EVERY ADS CLIENT ════════════
+  // Opening each card and looking stops scaling the moment there is more than
+  // one client. Worst first, action already written.
+  window.adsAttention = async function () {
+    var host = document.getElementById('adsAttention');
+    if (!host) {
+      var anchorEl = document.getElementById('adsWrap');
+      if (!anchorEl) return;
+      host = document.createElement('div');
+      host.id = 'adsAttention';
+      host.style.cssText = 'margin:0 0 18px';
+      anchorEl.parentNode.insertBefore(host, anchorEl);   // above the client table
+    }
+    try {
+      var d = await api('/api/ads-attention');
+      if (!d || !d.count) {
+        host.innerHTML = '<div style="background:#ecfdf5;color:#065f46;border-radius:10px;padding:12px 16px;font-size:13px"><b>Nothing needs you right now.</b> Every ads client is current.</div>';
+        return;
+      }
+      var col = function (sev) { return sev === 1 ? ['#fef2f2', '#b91c1c'] : sev === 2 ? ['#fffbeb', '#b45309'] : ['#f8fafc', '#475569']; };
+      var h = '<div style="border:1px solid #e2e8f0;border-radius:10px;overflow:hidden">';
+      h += '<div style="background:#0f172a;color:#fff;padding:10px 16px;font-size:13px;font-weight:600">Needs you &mdash; ' + d.count + ' item' + (d.count === 1 ? '' : 's')
+        + (d.urgent ? ' <span style="background:#b91c1c;border-radius:20px;padding:1px 9px;font-size:11px;margin-left:6px">' + d.urgent + ' urgent</span>' : '') + '</div>';
+      h += d.items.map(function (it) {
+        var c = col(it.severity);
+        return '<div style="display:flex;gap:14px;align-items:flex-start;padding:11px 16px;border-bottom:1px solid #f1f5f9;background:' + c[0] + '">'
+          + '<div style="flex:1;font-size:12.5px"><b style="color:' + c[1] + '">' + esc(it.client) + '</b> &middot; ' + esc(it.what)
+          + '<br><span style="color:#64748b;font-size:11.5px">' + esc(it.action) + '</span></div>'
+          + '<button class="btn btn-ghost" style="font-size:11px;padding:5px 10px;white-space:nowrap" onclick="openDrawer(' + it.client_id + ')">Open</button></div>';
+      }).join('');
+      h += '</div>';
+      host.innerHTML = h;
+    } catch (e) { host.innerHTML = ''; }
+  };
+
   var _rav = window.renderAdsView;
   if (typeof _rav === 'function') {
-    window.renderAdsView = function () { var r = _rav.apply(this, arguments); try { googleHealth(); } catch (e) {} try { adsRunbookStrips(); } catch (e) {} return r; };
+    window.renderAdsView = function () { var r = _rav.apply(this, arguments); try { googleHealth(); } catch (e) {} try { adsRunbookStrips(); } catch (e) {} try { adsAttention(); } catch (e) {} return r; };
   }
 
   // ══ LAUNCH RUNBOOK — one line that always says what to do next ═══════════
@@ -1944,6 +2000,150 @@ async function lpInject(id){
     setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
     return a.download;
   }
+
+  // ══ CLOSED-LOOP ADS ═════════════════════════════════════════════════════
+  window.markLead = async function (clientId, leadId, status) {
+    try {
+      const r = await fetch('/api/clients/' + clientId + '/lead-status', {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ lead_id: leadId, status }),
+      });
+      const j = await r.json();
+      if (!j.ok) { toast(j.error || 'Could not save that.'); return; }
+      toast(status === 'booked'
+        ? ('Marked booked' + (j.value ? ' at $' + Math.round(j.value) : '') + (j.has_gclid ? ' — reportable to Google' : ''))
+        : 'Marked not booked');
+      if (typeof openDrawer === 'function') openDrawer(clientId);   // re-render so the button state reflects reality
+    } catch (e) { toast('Could not save: ' + e.message); }
+  };
+
+  function money(n) { return n == null ? '—' : '$' + Number(n).toLocaleString(undefined, { maximumFractionDigits: 2 }); }
+  function statRow(label, val, note) {
+    return '<div style="display:flex;justify-content:space-between;gap:16px;padding:7px 0;border-bottom:1px dashed #e2e8f0;font-size:13px">'
+      + '<span style="color:#475569">' + label + '</span>'
+      + '<b style="color:#0f172a;text-align:right">' + val + (note ? '<br><span style="font-weight:400;color:#94a3b8;font-size:11px">' + note + '</span>' : '') + '</b></div>';
+  }
+
+  // The number that renews the retainer: spend in, bookings out.
+  window.adsRoiView = async function (id) {
+    try {
+      const r = await api('/api/clients/' + id + '/ads-roi');
+      let h = '<div style="font-size:12.5px;color:#64748b;margin-bottom:10px">' + esc(r.window) + '</div>';
+      h += statRow('Ad spend', money(r.spend), esc(r.spend_source));
+      h += statRow('Leads', r.leads + '', r.forms + ' forms · ' + r.calls + ' phone taps');
+      h += statRow('From ads', r.paid_leads + '', 'carried a Google click id');
+      h += statRow('Booked', r.booked + '', r.booked_from_ads + ' of them from ads');
+      h += statRow('Revenue booked', money(r.revenue), r.revenue_from_ads ? money(r.revenue_from_ads) + ' from ads' : '');
+      h += statRow('Cost per lead', r.cost_per_lead == null ? '—' : money(r.cost_per_lead), '');
+      h += statRow('Cost per booking', r.cost_per_booking == null ? '—' : money(r.cost_per_booking), 'the number that actually matters');
+      h += statRow('Return on ad spend', r.roas == null ? '—' : (r.roas + '×'), '');
+      if (r.waste_pct != null) h += statRow('Wasted spend', r.waste_pct + '%', 'from the last search-terms review');
+      if (r.uploadable) h += '<p style="margin-top:12px;font-size:12.5px;color:#065f46;background:#ecfdf5;padding:10px 12px;border-radius:8px">' + r.uploadable + ' booked leads are ready to report back to Google. Use &ldquo;Report conversions&rdquo;.</p>';
+      if (r.honest_note) h += '<p style="margin-top:12px;font-size:12px;color:#a16207;background:#fefce8;padding:10px 12px;border-radius:8px">' + esc(r.honest_note) + '</p>';
+      ccModal('Ads ROI', h);
+    } catch (e) { toast('Could not load ROI: ' + e.message); }
+  };
+
+  // Offline Conversion Import — the step that makes Google chase customers.
+  window.adsUpload = async function (id) {
+    try {
+      const r = await fetch('/api/clients/' + id + '/ads-conversions.csv', { credentials: 'same-origin' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const rows = Number(r.headers.get('X-Rows') || 0);
+      if (!rows) { toast('No booked leads with a Google click id yet — mark some leads booked first.'); return; }
+      const blob = await r.blob();
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'google-ads-conversions-' + id + '.csv';
+      document.body.appendChild(a); a.click();
+      setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+      ccModal('Report ' + rows + ' conversions to Google', '<p style="font-size:13px;line-height:1.6">The file downloaded. Now in Google Ads:</p>'
+        + '<ol style="font-size:13px;line-height:1.8;padding-left:20px"><li><b>Goals &rarr; Conversions &rarr; Uploads</b></li>'
+        + '<li>Click <b>+</b>, choose <b>Upload a file</b></li><li>Pick the file that just downloaded</li>'
+        + '<li>Preview, then <b>Apply</b></li></ol>'
+        + '<p style="font-size:12.5px;color:#64748b;margin-top:10px">This tells Google which clicks became real bookings, so it stops optimising for form fills and starts buying customers. Do it weekly.</p>');
+    } catch (e) { toast('Could not build the file: ' + e.message); }
+  };
+
+  // Where the wasted money actually is.
+  window.adsTermsView = async function (id) {
+    const box = '<textarea id="stCsv" style="width:100%;height:150px;font-family:ui-monospace,monospace;font-size:11.5px;padding:10px;border:1px solid #cbd5e1;border-radius:8px" placeholder="Paste the whole Search terms report here, headers and all"></textarea>'
+      + '<p style="font-size:12px;color:#64748b;margin-top:8px">Google Ads &rarr; Campaigns &rarr; <b>Insights &amp; reports &rarr; Search terms</b> &rarr; Download &rarr; CSV, then paste it here.</p>'
+      + '<div style="margin-top:10px"><button class="btn" style="font-size:12.5px" onclick="adsTermsGo(' + id + ')">Find the waste</button></div>'
+      + '<div id="stOut" style="margin-top:14px"></div>';
+    ccModal('Search terms &rarr; negative keywords', box);
+    try {
+      const prev = await api('/api/clients/' + id + '/ads-roi');
+      if (prev && prev.waste_pct != null) document.getElementById('stOut').innerHTML = '<p style="font-size:12.5px;color:#64748b">Last review found ' + prev.waste_pct + '% wasted spend.</p>';
+    } catch (e) {}
+  };
+  window.adsTermsGo = async function (id) {
+    const out = document.getElementById('stOut');
+    const csv = (document.getElementById('stCsv') || {}).value || '';
+    if (!csv.trim()) { out.innerHTML = '<p style="color:#b91c1c;font-size:12.5px">Paste the report first.</p>'; return; }
+    out.innerHTML = '<p style="font-size:12.5px;color:#64748b">Reading…</p>';
+    try {
+      const r = await fetch('/api/clients/' + id + '/search-terms', {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ csv }),
+      });
+      const j = await r.json();
+      if (!j.ok) { out.innerHTML = '<p style="color:#b91c1c;font-size:12.5px">' + esc(j.error || 'Could not read that.') + '</p>'; return; }
+      let h = '<div style="background:#fef2f2;border-radius:8px;padding:12px 14px;margin-bottom:12px">'
+        + '<b style="font-size:15px;color:#b91c1c">' + money(j.waste_cost) + ' wasted</b> <span style="color:#7f1d1d;font-size:12.5px">of ' + money(j.total_cost) + ' (' + j.waste_pct + '%) across ' + j.terms + ' search terms</span></div>';
+      if (j.waste.length) {
+        h += '<div style="max-height:260px;overflow:auto;border:1px solid #e2e8f0;border-radius:8px">';
+        h += j.waste.slice(0, 40).map(function (w) {
+          return '<div style="padding:8px 12px;border-bottom:1px dashed #e2e8f0;font-size:12.5px"><b>' + esc(w.term) + '</b> <span style="color:#b91c1c">' + money(w.cost) + '</span><br><span style="color:#94a3b8;font-size:11.5px">' + esc(w.why) + '</span></div>';
+        }).join('');
+        h += '</div>';
+        h += '<div style="margin-top:12px"><button class="btn" style="font-size:12.5px" onclick="adsNegCsv(' + id + ')">&#11015; Download ' + j.negatives.length + ' negative keywords</button></div>';
+        h += '<p style="font-size:12px;color:#64748b;margin-top:8px">Import in Google Ads Editor: Keywords &rarr; Negative &rarr; Make multiple changes &rarr; paste from the file. They are exact-match, so nothing you want gets blocked by accident.</p>';
+      } else {
+        h += '<p style="font-size:13px;color:#065f46">Nothing obviously wasteful in this batch. Good sign.</p>';
+      }
+      if (j.winners.length) {
+        h += '<p style="font-size:12.5px;font-weight:600;margin-top:16px;color:#065f46">Terms that converted &mdash; consider making these their own keywords:</p>';
+        h += '<div style="font-size:12.5px;color:#334155">' + j.winners.slice(0, 10).map(function (w) { return esc(w.term) + ' (' + w.conv + ')'; }).join(' &middot; ') + '</div>';
+      }
+      out.innerHTML = h;
+    } catch (e) { out.innerHTML = '<p style="color:#b91c1c;font-size:12.5px">' + esc(e.message) + '</p>'; }
+  };
+  window.adsNegCsv = async function (id) {
+    try {
+      const r = await fetch('/api/clients/' + id + '/negatives.csv', { credentials: 'same-origin' });
+      const blob = await r.blob();
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob); a.download = 'negative-keywords-' + id + '.csv';
+      document.body.appendChild(a); a.click();
+      setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+      toast('Negative keyword list downloaded.');
+    } catch (e) { toast('Could not build the list: ' + e.message); }
+  };
+
+  // Spend, until the Google Ads API approval lands.
+  window.adsPerfPaste = function (id) {
+    ccModal('Spend &amp; performance', '<textarea id="perfCsv" style="width:100%;height:140px;font-family:ui-monospace,monospace;font-size:11.5px;padding:10px;border:1px solid #cbd5e1;border-radius:8px" placeholder="Paste the Campaigns report (or a day-by-day report) here"></textarea>'
+      + '<p style="font-size:12px;color:#64748b;margin-top:8px">Google Ads &rarr; Campaigns &rarr; Download &rarr; CSV. Any report with a Cost column works.</p>'
+      + '<div style="margin-top:10px"><button class="btn" style="font-size:12.5px" onclick="adsPerfGo(' + id + ')">Save</button></div><div id="perfOut" style="margin-top:12px"></div>');
+  };
+  window.adsPerfGo = async function (id) {
+    const out = document.getElementById('perfOut');
+    const csv = (document.getElementById('perfCsv') || {}).value || '';
+    if (!csv.trim()) { out.innerHTML = '<p style="color:#b91c1c;font-size:12.5px">Paste the report first.</p>'; return; }
+    out.innerHTML = '<p style="font-size:12.5px;color:#64748b">Reading…</p>';
+    try {
+      const r = await fetch('/api/clients/' + id + '/ads-performance', {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ csv }),
+      });
+      const j = await r.json();
+      if (!j.ok) { out.innerHTML = '<p style="color:#b91c1c;font-size:12.5px">' + esc(j.error || 'Could not read that.') + '</p>'; return; }
+      out.innerHTML = statRow('Spend', money(j.cost), j.day_count ? j.day_count + ' days' : '')
+        + statRow('Clicks', j.clicks + '', 'CTR ' + j.ctr + '%')
+        + statRow('Cost per click', money(j.cpc), '')
+        + statRow('Conversions (Google)', j.conversions + '', j.cpa ? money(j.cpa) + ' each' : '')
+        + '<p style="font-size:12px;color:#64748b;margin-top:10px">Saved. The ROI view now has real cost figures.</p>';
+    } catch (e) { out.innerHTML = '<p style="color:#b91c1c;font-size:12.5px">' + esc(e.message) + '</p>'; }
+  };
 
   window.emailListCsv = async function (id) {
     try {
