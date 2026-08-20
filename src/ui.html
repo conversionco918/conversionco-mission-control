@@ -1544,7 +1544,7 @@ async function lpInject(id){
       h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px"' + (rep.brief ? '' : ' disabled title="Run Set it all up first"') + ' onclick="adsSheet(' + c.id + ')">&#128203; Build sheet</button>';
       h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" title="Average ticket, close rate, target clients — the sheet back-solves the budget and tells you if the math works." onclick="adsEcon(' + c.id + ')">&#128181; Economics' + ((rep.econ && rep.econ.target_clients) ? ' &#10003;' : '') + '</button>';
       h += SEP();
-      h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" title="Create the $249/mo Stripe billing link for ads management." onclick="adsBilling(' + c.id + ', this)">&#128179; ' + (rep.sub_status === 'active' ? 'Billing live &#10003;' : rep.sub_link ? 'Billing link' : '$249/mo billing') + '</button>';
+      h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" title="Create the Stripe billing link — $249/mo management, plus the $300 landing page if it is part of the deal." onclick="adsBilling(' + c.id + ', this)">&#128179; ' + (rep.sub_status === 'active' ? 'Billing live &#10003;' : rep.sub_link ? 'Billing link' : (rep.lp_fee ? '$' + rep.lp_fee + ' + $249/mo' : '$249/mo billing')) + '</button>';
       if (rep.track && !rep.live_at) h += '<button class="btn btn-green" style="font-size:11.5px;padding:7px 12px" title="Press this only after YOU have enabled the campaign in Google Ads." onclick="adsGoLive(' + c.id + ', this)">I enabled it</button>';
       h += SEP();
       if (link) h += '<button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="adsAccountPrompt(' + c.id + ')">Edit account link</button>';
@@ -2023,6 +2023,15 @@ async function lpInject(id){
       toast('Billing link copied 💳 — send it to the client, they enter their own card');
       return;
     }
+    // the $300 landing page normally arrives from Intake 1; ask once if it did not
+    if (!rep.lp_fee) {
+      if (confirm('Is the $300 landing page part of this deal?\n\nOK  = bill $300 today + $249/mo after, on one checkout.\nCancel = $249/mo only.')) {
+        try {
+          var fr = await api('/api/clients/' + id + '/ads-lp-fee', { method: 'POST', body: JSON.stringify({ fee: 300 }) });
+          if (fr && !fr.error) { rep.lp_fee = fr.lp_fee; STATE.settings['ads_' + id] = JSON.stringify(rep); }
+        } catch (e) {}
+      }
+    }
     var label = btn ? btn.innerHTML : '';
     btn.disabled = true; btn.textContent = 'Creating…';
     try {
@@ -2032,7 +2041,7 @@ async function lpInject(id){
         rep.sub_link = r.url; rep.sub_status = 'pending';
         STATE.settings['ads_' + id] = JSON.stringify(rep);
         if (navigator.clipboard) navigator.clipboard.writeText(r.url);
-        toast('$249/mo billing link created and copied 💳 — send it to the client');
+        toast((rep.lp_fee ? '$' + rep.lp_fee + ' + $249/mo' : '$249/mo') + ' billing link created and copied 💳 — send it to the client');
         try { renderAdsView(); } catch (e) {}
       }
     } catch (e) { toast('⚠ Could not create the billing link'); }

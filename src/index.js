@@ -285,6 +285,42 @@ app.post('/intake/:n', async (c) => {
     await logEvent(db, null, 'error', `Intake ${n} submission had no email: ${JSON.stringify(stored).slice(0, 500)}`);
   }
 
+  // 📣 ADS SELF-SERVE (8/19/2026): Intake 1 asks whether they also want the
+  // Google Ads landing page and/or ads management. Before this, that answer sat
+  // buried in the intake and someone had to notice it. Now ticking the box puts
+  // them on the Ads board already enrolled, with the fees recorded, the moment
+  // the form lands.
+  if (clientId) {
+    const addons = String(lower['add-ons'] || lower['addons'] || lower['add ons'] || lower['add-on'] || '').toLowerCase();
+    if (addons) {
+      const wantsAds = /google ads?\b|ads management/.test(addons);
+      const wantsLp = /landing page/.test(addons);
+      if (wantsAds || wantsLp) {
+        const settingsI = await getSettings(db);
+        let repI = {}; try { repI = JSON.parse(settingsI['ads_' + clientId] || '{}'); } catch {}
+        const cli = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(clientId).first();
+        const bizI = (cli && (cli.business_name || cli.name || cli.email)) || 'this client';
+        const parts = [];
+        if (wantsAds && !repI.track) {
+          repI.track = 'addon'; repI.monthly = 249;
+          repI.enrolled_at = repI.enrolled_at || new Date().toISOString();
+          repI.source = 'intake';
+          parts.push('Google Ads management $249/mo');
+        }
+        if (wantsLp && !repI.lp_fee) { repI.lp_fee = 300; parts.push('landing page $300 one-time'); }
+        if (parts.length) {
+          await setSetting(db, 'ads_' + clientId, JSON.stringify(repI));
+          await logEvent(db, clientId, 'ads_enrolled',
+            `\u{1F4E3} ${bizI} asked for ${parts.join(' + ')} in Intake ${n} — already on the Ads board. Next: build their landing page, then paste it and hit Set it all up.`);
+          await notifyOwner(c.env, settingsI, `\u{1F4E3} ${bizI} wants ads`,
+            `<p><b>${bizI}</b> ticked <b>${parts.join('</b> and <b>')}</b> in Intake ${n}.</p>` +
+            `<p>They are already enrolled on the Ads board. Their first ads step is yours: build the GoHighLevel landing page, paste it on the Ads tab, and press <b>Set it all up</b>.</p>` +
+            `<p><a href="${BASE_URL}">Open Mission Control</a></p>`);
+        }
+      }
+    }
+  }
+
   // 📦 PACKAGE SELF-SERVE (Tiffany 8/17): the client picks Standard or Premium
   // inside Intake 2, so the tier lands on their card automatically and the agreement
   // chain below can fire with the RIGHT package instead of pausing for her hands.
@@ -1415,11 +1451,12 @@ app.get('/form/1', (c) => c.html(form1Html));
 app.get('/form/2', (c) => c.html(form2Html));
 
 // ---------------- service agreement (sent before payment, e-signed) ----------------
-const AGREEMENT_VERSION = 'v2-2026-07-23-split';
-function agreementTerms(biz, pkgLabel, pkgPrice) {
-  return [
+const AGREEMENT_VERSION = 'v3-2026-08-19-notice-ads';
+function agreementTerms(biz, pkgLabel, pkgPrice, opts) {
+  const O = opts || {};
+  const terms = [
     ['1. What we are building', `ConversionCo will design, write, and build the ${pkgLabel} for ${biz}: a custom, mobile-first website with full search-engine setup as described in your proposal. Your one-time project fee is ${pkgPrice}, paid in two equal halves: 50% as a deposit before the build begins, and the remaining 50% when your finished website preview is delivered to you.`],
-    ['22. Website Care Plan — $99/month', `Your website stays live, protected, and fully looked after on the Website Care Plan. It covers your hosting, a complete backup of your entire website, and your own client portal where you can check your site's health, reports, and activity any time, along with security, daily uptime monitoring, and ongoing platform updates (Premium plans also include weekly published content). It is month-to-month, starts only when your site is ready and you confirm, and you may cancel any time — cancellation takes effect at the end of the current billing period.`],
+    ['2. Website Care Plan — $99/month', `Your website stays live, protected, and fully looked after on the Website Care Plan. It covers your hosting, a complete backup of your entire website, and your own client portal where you can check your site's health, reports, and activity any time, along with security, daily uptime monitoring, and ongoing platform updates (Premium plans also include weekly published content). It is month-to-month and starts only when your site is ready and you confirm. You may cancel at any time by giving us 30 days' written notice — email counts. Your plan, and your billing, continue through that 30-day notice period and then stop; there is no charge after it.`],
     ['3. Payment & refunds', `The build starts once your 50% deposit is received. Because our build process begins immediately and produces custom work, the deposit is non-refundable once your build has started — with one exception in your favor: if we fail to deliver a preview of your website within 14 days of your deposit, you may request a full refund of it. The remaining 50% is invoiced when your website preview is delivered, and is due within 7 days. Your website goes live on your domain once the balance is paid.`],
     ['4. Revisions', `Your project includes two full rounds of revisions before launch, plus reasonable adjustments during your first 30 days live. After that, changes are handled through your Care Plan (reasonable monthly volume) or quoted separately for larger redesigns. This keeps every project fair — for you and for our other clients.`],
     ['5. What you own', `Your domain name is yours — registered for your business, and transferable to your direct control on request at any time. Your content is yours — your logo, photos, story, and business information. And once your project fee is paid in full, the finished website code (the HTML, CSS, JavaScript, and images that make up your site) is yours as well.`],
@@ -1431,6 +1468,14 @@ function agreementTerms(biz, pkgLabel, pkgPrice) {
     ['11. Non-payment', `If a Care Plan payment is more than 15 days late, we may pause the website until the account is current — we will always reach out first.`],
     ['12. The basics', `ConversionCo is an independent contractor. This is the entire agreement between us, governed by Oklahoma law; changes must be in writing (email counts). If any part is unenforceable, the rest stands.`],
   ];
+  // Ads clauses only appear for clients who actually took the ads add-on, so a
+  // website-only agreement never carries terms that do not apply to them.
+  if (O.ads || O.landingPage) {
+    if (O.landingPage) terms.push(['13. Landing page — $300 one-time', `Your Google Ads landing page is a separate page built specifically to convert ad traffic, for a one-time fee of $300. It includes the page itself, the tracking that measures calls, texts, forms and bookings, and one round of revisions. It is billed once, at the start.`]);
+    if (O.ads) terms.push(['14. Google Ads management — $249/month', `We build and manage your Google Ads campaign: the account structure, keywords, negative keywords, ad copy, conversion tracking, and ongoing optimisation, with your results visible in your client portal. Your advertising budget is separate and is paid by you directly to Google — we never hold or bill your ad spend. Management is month-to-month and you may cancel at any time by giving us 30 days' written notice (email counts); management and billing continue through that notice period and then stop. On cancellation the Google Ads account remains yours, and we hand over access rather than keep it.`]);
+    if (O.ads) terms.push(['15. What advertising can and cannot promise', `We will build and run your campaign to a documented standard and report honestly on what it produces. What we cannot do is guarantee a number of leads, customers, or a specific cost per lead — nobody can, because the auction, your competitors, and demand in your area all change week to week. Any figure we discuss in planning is an estimate of what would have to be true, not a promise of what will happen. You control your daily budget and can pause your campaign at any time.`]);
+  }
+  return terms;
 }
 app.get('/agreement/:id/:token', async (c) => {
   const id = Number(c.req.param('id'));
@@ -1442,7 +1487,9 @@ app.get('/agreement/:id/:token', async (c) => {
   const biz = client.business_name || client.name || 'your business';
   const pkgLabel = client.tier === 'premium' ? 'Premium Website + SEO Engine' : 'Standard Website Package';
   const pkgPrice = client.tier === 'premium' ? '$999' : '$649';
-  const terms = agreementTerms(biz, pkgLabel, pkgPrice);
+  const settingsA = await getSettings(db);
+  let repA = {}; try { repA = JSON.parse(settingsA['ads_' + id] || '{}'); } catch {}
+  const terms = agreementTerms(biz, pkgLabel, pkgPrice, { ads: !!repA.track, landingPage: !!repA.lp_fee });
   const tok = c.req.param('token');
   return c.html(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex"><title>Service Agreement — ${biz} × ConversionCo</title>
@@ -6112,8 +6159,14 @@ function fillTpl(list, map) {
 // number and a monitoring baseline. It is never shown to a client and it is
 // never phrased as a promise — ad performance is not guaranteeable and this
 // system does not pretend otherwise.
-function adsEconomics(econ) {
+function adsEconomics(econ, facts) {
   const e = econ || {};
+  // If she has not entered an average ticket, use what their own menu charges.
+  // A real median price beats a guess, and she can always overwrite it.
+  if (!Number(e.ticket) && facts && Array.isArray(facts.offerings)) {
+    const p = facts.offerings.map((o) => Number(o.price) || 0).filter((x) => x > 0).sort((a, b) => a - b);
+    if (p.length) { e.ticket = p[Math.floor(p.length / 2)]; e.ticket_from_page = true; }
+  }
   const ticket = Number(e.ticket) || 0;           // average revenue per new client
   const margin = Number(e.margin) || 0.6;          // gross margin
   const close = Number(e.close_rate) || 0.25;      // lead → paying client
@@ -6495,7 +6548,7 @@ function adsPlan(client, rep, settings) {
   if (F.addon) dPool.push('Add anything to any drip for $' + F.addon + ', on the same visit, decided with your nurse.');
   const descriptions = dPool.concat(P.descriptions).filter((d) => d.length <= 90 && adsPolicyOk(d)).slice(0, 4);
   const lint = adsLint(headlines, descriptions);
-  const econ = adsEconomics(rep && rep.econ);
+  const econ = adsEconomics(rep && rep.econ, F);
 
   const plan = {
     v: 3, built: new Date().toISOString(), biz, city: city || cityFull, vertical: P.label,
@@ -6880,8 +6933,8 @@ function adsRunbook(client, rep, settings, id) {
       why: 'Yours to build. The build sheet has every setting, keyword, negative and headline.',
       todo: 'Open Build sheet, then build it in Google Ads and leave it paused. Then tick this.',
       tick: true },
-    { k: 'billing', label: 'Ads management billing', done: rep.sub_status === 'active',
-      why: '$249/mo does not invoice itself.',
+    { k: 'billing', label: rep.lp_fee ? ('Billing — $' + rep.lp_fee + ' landing page + $249/mo') : 'Ads management billing', done: rep.sub_status === 'active',
+      why: 'Neither the landing page fee nor the $249/mo invoices itself.',
       todo: rep.sub_link ? 'Link is created — send it to the client.' : 'Press $249/mo billing to create the link.' },
     { k: 'live', label: 'Campaign enabled', done: !!rep.live_at,
       why: 'The moment spend starts, the daily silent-failure check starts watching this client.',
@@ -7017,6 +7070,17 @@ async function adsCheckout(env, client, rep) {
   body.set('line_items[0][price_data][product_data][name]', ('Google Ads management — ' + biz).slice(0, 250));
   body.set('line_items[0][price_data][product_data][description]',
     'Monthly management of your Google Ads account: campaign build and upkeep, keyword and negative maintenance, conversion tracking, and reporting in your client portal. Ad spend is paid separately by you, directly to Google.');
+  // the one-time landing page fee rides the same checkout, so the client enters
+  // their card once and gets $300 today plus $249 every month after
+  const setup = Number((rep && rep.lp_fee) || 0);
+  if (setup > 0) {
+    body.set('line_items[1][quantity]', '1');
+    body.set('line_items[1][price_data][currency]', 'usd');
+    body.set('line_items[1][price_data][unit_amount]', String(Math.round(setup * 100)));
+    body.set('line_items[1][price_data][product_data][name]', ('Google Ads landing page — ' + biz).slice(0, 250));
+    body.set('line_items[1][price_data][product_data][description]',
+      'One-time build of the landing page your ads send traffic to, including the tracking that measures calls, texts, forms and bookings, and one round of revisions.');
+  }
   body.set('subscription_data[metadata][client_id]', String(client.id));
   body.set('subscription_data[metadata][plan]', 'ads249');
   body.set('metadata[client_id]', String(client.id));
@@ -7044,11 +7108,33 @@ app.post('/api/clients/:id/ads-subscription', async (c) => {
     const sess = await adsCheckout(c.env, client, rep);
     rep.sub_session_id = sess.id; rep.sub_link = sess.url; rep.sub_status = 'pending';
     rep.sub_customer = sess.customer; rep.sub_amount = ADS_MONTHLY_CENTS / 100;
+    rep.sub_setup = Number(rep.lp_fee || 0);
     await setSetting(db, 'ads_' + id, JSON.stringify(rep));
     await logEvent(db, id, 'ads_billing_link',
-      `\u{1F4B3} Ads management billing link created for ${client.business_name || client.name || client.email} — $249/mo. Send it to them; they enter their own card on Stripe.`);
+      `\u{1F4B3} Ads billing link created for ${client.business_name || client.name || client.email} — ` +
+      (rep.lp_fee ? `$${rep.lp_fee} landing page today + $249/mo after. ` : '$249/mo. ') +
+      'Send it to them; they enter their own card on Stripe.');
     return c.json({ ok: true, url: sess.url });
   } catch (e) { return c.json({ error: 'Stripe: ' + String(e.message).slice(0, 160) }, 502); }
+});
+
+// Landing-page fee toggle — normally set from Intake 1, editable here.
+app.post('/api/clients/:id/ads-lp-fee', async (c) => {
+  const id = Number(c.req.param('id')) || 0;
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'no such client' }, 404);
+  let body = {}; try { body = await c.req.json(); } catch {}
+  const settings = await getSettings(db);
+  let rep = {}; try { rep = JSON.parse(settings['ads_' + id] || '{}'); } catch {}
+  const fee = Number(body.fee);
+  if (Number.isFinite(fee) && fee > 0) rep.lp_fee = Math.round(fee); else delete rep.lp_fee;
+  if (rep.sub_status !== 'active') { delete rep.sub_link; delete rep.sub_session_id; } // relink so the fee is right
+  await setSetting(db, 'ads_' + id, JSON.stringify(rep));
+  await logEvent(db, id, 'ads_lp_fee', rep.lp_fee
+    ? `\u{1F4B3} Landing page fee set to $${rep.lp_fee} for ${client.business_name || client.name || client.email} — it rides the same checkout as the $249/mo.`
+    : 'Landing page fee removed — billing is $249/mo only.');
+  return c.json({ ok: true, lp_fee: rep.lp_fee || 0 });
 });
 
 // Fold the ads subscription into the same daily sweep that checks tag health,
@@ -7104,7 +7190,7 @@ app.post('/api/clients/:id/ads-economics', async (c) => {
     cpc: num(body.cpc, (rep.econ && rep.econ.cpc) || 0),
     lp_cvr: pct(body.lp_cvr, (rep.econ && rep.econ.lp_cvr) || 0.08),
   };
-  const model = adsEconomics(rep.econ);
+  const model = adsEconomics(rep.econ, rep.facts);
   rep.brief = adsPlan(client, rep, settings);   // the sheet rebuilds around the new numbers
   await setSetting(db, 'ads_' + id, JSON.stringify(rep));
   await logEvent(db, id, 'ads_economics',
@@ -7112,6 +7198,89 @@ app.post('/api/clients/:id/ads-economics', async (c) => {
     `${model.leads_needed || '?'} leads needed, max $${model.max_cpl || '?'}/lead, implied budget $${model.monthly_budget || '?'}/mo. Planning model only.`);
   return c.json({ ok: true, econ: rep.econ, model, brief: rep.brief });
 });
+
+// 👀 TAG WATCHER (8/19/2026, hourly) — after she pastes the tracking code into
+// GoHighLevel, somebody has to press Re-check. Nobody should have to. This
+// re-verifies any connected page whose tag is still missing and tells her the
+// moment it goes green, so the pasting step ends by itself.
+async function adsTagWatcher(env) {
+  const db = env.DB;
+  const settings = await getSettings(db);
+  let flipped = 0;
+  for (const k of Object.keys(settings).filter((x) => /^ads_\d+$/.test(x))) {
+    let rep = {}; try { rep = JSON.parse(settings[k] || '{}'); } catch {}
+    if (!rep.url) continue;
+    const already = rep.checks && rep.checks.tracker && rep.checks.tracker.ok;
+    if (already) continue;
+    const id = Number(k.slice(4));
+    const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+    if (!client) continue;
+    try {
+      const report = await adsVerify(env, id, rep.url);
+      const nowOk = report.checks && report.checks.tracker && report.checks.tracker.ok;
+      // adopt any IDs that appeared on the page at the same time
+      const detGa4 = (report.checks && report.checks.ga4 && report.checks.ga4.id) || '';
+      const detClar = (report.checks && report.checks.clarity && report.checks.clarity.id) || '';
+      if (detGa4 && !rep.ga4_measurement) rep.ga4_measurement = String(detGa4).toUpperCase();
+      if (detClar && !rep.clarity_id) rep.clarity_id = String(detClar);
+      rep = { ...rep, ...report };
+      await setSetting(db, k, JSON.stringify(rep));
+      if (nowOk) {
+        flipped++;
+        const biz = client.business_name || client.name || client.email;
+        await logEvent(db, id, 'ads_tag_live',
+          `\u{1F440} Tracking code is live on ${rep.url} — spotted on its own, no Re-check needed. Calls, texts, forms and bookings are now being counted.`);
+        await notifyOwner(env, settings, `\u{2705} Tracking is live for ${biz}`,
+          `<p>The tracking code you pasted into GoHighLevel is now live on <a href="${rep.url}">${rep.url}</a>.</p>` +
+          `<p>Calls, texts, forms and bookings are being counted from this moment, and their portal card will start filling in.</p>` +
+          `<p><a href="${BASE_URL}">Open Mission Control</a></p>`);
+      }
+    } catch {}
+  }
+  return flipped;
+}
+
+// 🔁 WEEKLY RE-READ (Sundays) — clients add drips and change memberships without
+// telling anyone. This re-reads every connected site once a week and only speaks
+// up when the menu actually changed, so the keywords never quietly go stale.
+async function adsWeeklyRescan(env) {
+  const db = env.DB;
+  const settings = await getSettings(db);
+  const changed = [];
+  for (const k of Object.keys(settings).filter((x) => /^ads_\d+$/.test(x))) {
+    let rep = {}; try { rep = JSON.parse(settings[k] || '{}'); } catch {}
+    if (!rep.url || !rep.track) continue;
+    const id = Number(k.slice(4));
+    const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+    if (!client) continue;
+    try {
+      const before = ((rep.facts && rep.facts.offerings) || []).map((o) => o.name).sort().join('|');
+      const facts = await adsScan(env, id, rep.url);
+      if (!facts || facts.error) continue;
+      const after = facts.offerings.map((o) => o.name).sort().join('|');
+      rep.facts = facts;
+      rep.brief = adsPlan(client, rep, settings);
+      await setSetting(db, k, JSON.stringify(rep));
+      if (before && before !== after) {
+        const beforeSet = new Set(before.split('|'));
+        const added = facts.offerings.map((o) => o.name).filter((x) => !beforeSet.has(x));
+        const afterSet = new Set(after.split('|'));
+        const gone = before.split('|').filter((x) => x && !afterSet.has(x));
+        changed.push({ biz: client.business_name || client.name || client.email, added, gone });
+        await logEvent(db, id, 'ads_rescan',
+          `\u{1F501} Weekly re-read: their menu changed${added.length ? ' — new: ' + added.join(', ') : ''}${gone.length ? ' — gone: ' + gone.join(', ') : ''}. Keywords and headlines rebuilt around it.`);
+      }
+    } catch {}
+  }
+  if (changed.length) {
+    await notifyOwner(env, settings, `\u{1F501} ${changed.length} client menu(s) changed this week`,
+      changed.map((c) => `<p><b>${c.biz}</b>` +
+        (c.added.length ? `<br>New: ${c.added.join(', ')}` : '') +
+        (c.gone.length ? `<br>Gone: ${c.gone.join(', ')}` : '') + '</p>').join('') +
+      '<p>Their keywords and headlines have already been rebuilt around the new menu. Open the Build sheet to see it, then update the live campaign when you next touch it.</p>');
+  }
+  return changed.length;
+}
 
 // 🚨 SILENT-FAILURE ALARM (8/19/2026, daily noon cron) — the most expensive
 // failure in ad management is a campaign that spends while the funnel is
@@ -7291,6 +7460,11 @@ export default {
       ctx.waitUntil(adsBillingSweep(env).catch((e) =>
         logEvent(env.DB, null, 'error', `Ads billing sweep failed: ${e.message}`)
       ));
+      if (new Date(event.scheduledTime || Date.now()).getUTCDay() === 0) {
+        ctx.waitUntil(adsWeeklyRescan(env).catch((e) =>
+          logEvent(env.DB, null, 'error', `Weekly ads re-read failed: ${e.message}`)
+        ));
+      }
       ctx.waitUntil(gscRankSnapshot(env).catch((e) =>
         logEvent(env.DB, null, 'error', `Rankings snapshot failed: ${e.message}`)
       ));
@@ -7355,5 +7529,8 @@ export default {
       logEvent(env.DB, null, 'error', `Revision round one email failed: ${e.message}`)
     ));
     ctx.waitUntil(pollGoogleMeet(env, settings).catch(() => { /* self-throttled error logging inside */ }));
+    ctx.waitUntil(adsTagWatcher(env).catch((e) =>
+      logEvent(env.DB, null, 'error', `Ads tag watcher failed: ${e.message}`)
+    ));
   },
 };
