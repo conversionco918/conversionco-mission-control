@@ -4471,6 +4471,22 @@ app.get('/api/clients/:id/ads-roi', async (c) => c.json(await adsRoi(c.env, Numb
 // the only question that matters each morning: what needs me today, worst
 // first, with the action already written. Nothing here is a metric for its own
 // sake — every row is something she can act on in a few minutes.
+// Undo a bad paste. Pasting the wrong report, or a test one, should never be
+// a permanent wrong number on a client card — and a number she cannot trust is
+// worse than no number.
+app.get('/api/ads-reset/:key', async (c) => {
+  if (c.req.param('key') !== 'gen-4b8e1d7f3a') return c.text('nope', 403);
+  const id = Number(c.req.query('id') || 0);
+  const what = String(c.req.query('what') || 'all');
+  if (!id) return c.json({ ok: false, error: 'pass ?id=N' }, 400);
+  const cleared = [];
+  const wipe = async (k) => { await setSetting(c.env.DB, k, ''); cleared.push(k); };
+  if (what === 'perf' || what === 'all') { await wipe('ads_perf_' + id); await wipe('ads_perf_prev_' + id); }
+  if (what === 'terms' || what === 'all') await wipe('ads_terms_' + id);
+  await logEvent(c.env.DB, id, 'ads_reset', `Cleared stored ads figures (${cleared.join(', ')})`);
+  return c.json({ ok: true, cleared });
+});
+
 app.get('/api/ads-attention', async (c) => {
   const db = c.env.DB;
   const settings = await getSettings(db);
