@@ -867,6 +867,23 @@ function openDrawer(id) {
         ? `<div class="intake" style="padding:12px 14px;">${r.leads.map(l => `<div style="padding:7px 0;border-bottom:1px dashed #e2e8f0;font-size:13px;"><b>${esc(l.name || 'No name')}</b> · ${esc(l.phone || l.email || '')} ${l.source ? `<span class="chip" style="background:#eef2f7;color:#475569;font-size:10.5px;padding:2px 8px;">via ${esc(l.source)}</span>` : ''}<br><span style="color:#64748b;">${esc((l.message || '').slice(0, 120))}</span><br><span style="color:#94a3b8;font-size:11px;">${esc(l.created_at)}</span></div>`).join('')}</div>`
         : `<p style="font-size:12px;color:#94a3b8;">None yet — leads from their site's contact form appear here (and email you instantly).</p>`);
   });
+  // 📧 EMAIL LIST — hers, in Mission Control, regardless of which email
+  // platform (if any) the client uses. The ESP is a fan-out, not the record.
+  api(`/api/clients/${id}/email-list`).then((r) => {
+    const box = document.getElementById('leadsBox');
+    if (!box || !r || r.count === undefined) return;
+    const prov = r.provider && r.provider !== 'none'
+      ? `<span class="chip" style="background:#eef2f7;color:#475569;font-size:10.5px;padding:2px 8px;">also pushing to ${esc(r.provider)}${r.esp_id ? ' ' + esc(String(r.esp_id).slice(0, 12)) : ''}</span>`
+      : `<span class="chip" style="background:#fef9c3;color:#a16207;font-size:10.5px;padding:2px 8px;">no email platform connected</span>`;
+    const wrap = document.createElement('div');
+    wrap.style.marginTop = '14px';
+    wrap.innerHTML = `<label style="font-size:12.5px;font-weight:600;color:#334155;display:block;margin-bottom:6px;">Email list <b style="color:#0f172a">${r.count}</b> ${r.count === 1 ? 'address' : 'addresses'} ${prov}</label>` +
+      (r.count
+        ? `<div class="intake" style="padding:12px 14px;font-size:12.5px;">${r.subscribers.slice(0, 6).map(x => `<div style="padding:5px 0;border-bottom:1px dashed #e2e8f0;">${esc(x.email)}${x.name ? ' · ' + esc(x.name) : ''} <span style="color:#94a3b8;font-size:11px;">${esc(String(x.joined || '').slice(0, 10))}</span></div>`).join('')}${r.count > 6 ? `<div style="padding-top:8px;color:#94a3b8;font-size:11.5px;">and ${r.count - 6} more</div>` : ''}<div style="margin-top:10px"><button class="btn btn-ghost" style="font-size:11.5px;padding:7px 12px" onclick="emailListCsv(${id})">&#11015; Download CSV</button></div></div>`
+        : `<p style="font-size:12px;color:#94a3b8;">None yet. Every address from their site's join box lands here \u2014 this list is yours no matter what email platform they use.</p>`);
+    box.parentNode.insertBefore(wrap, box.nextSibling);
+  }).catch(() => {});
+
   api(`/api/clients/${id}/score`).then((sc) => {
     const el = document.getElementById('seoScore');
     if (!el || !sc || sc.error) return;
@@ -1927,6 +1944,20 @@ async function lpInject(id){
     setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
     return a.download;
   }
+
+  window.emailListCsv = async function (id) {
+    try {
+      const r = await fetch('/api/clients/' + id + '/email-list.csv', { credentials: 'same-origin' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const blob = await r.blob();
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'email-list-' + id + '.csv';
+      document.body.appendChild(a); a.click();
+      setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+      toast('Email list downloaded \u2014 import it into any platform.');
+    } catch (e) { toast('Could not build the CSV: ' + e.message); }
+  };
 
   window.adsCsv = async function (id) {
     try {

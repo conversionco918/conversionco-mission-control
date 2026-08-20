@@ -4156,6 +4156,62 @@ app.get('/api/clients/:id/leads', async (c) => {
   const rows = (await c.env.DB.prepare('SELECT * FROM leads WHERE client_id = ? ORDER BY id DESC LIMIT 12').bind(id).all()).results || [];
   return c.json({ leads: rows });
 });
+// 📧 THE EMAIL LIST — Mission Control owns it, the ESP is optional.
+// Every website signup is already a row in `leads`. That is the list of
+// record: it needs no third-party account, it works from day one of a build,
+// and it survives a client switching email platforms. The client's own ESP
+// (Kit, Mailchimp, GoHighLevel, whatever) is a fan-out fired from the
+// visitor's browser, never the source of truth. These two routes make that
+// ownership real — she can see and export the list without logging into
+// anyone else's product.
+//
+// Deduped by lowercased email, keeping the FIRST time we saw the address
+// (that is the true join date) and the most recent non-empty name.
+async function emailListFor(db, id) {
+  const rows = (await db.prepare(
+    `SELECT email, name, source, slug, created_at FROM leads
+      WHERE client_id = ? AND email IS NOT NULL AND TRIM(email) != ''
+      ORDER BY id ASC`).bind(id).all()).results || [];
+  const seen = new Map();
+  for (const r of rows) {
+    const key = String(r.email || '').trim().toLowerCase();
+    if (!key || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(key)) continue;
+    const prev = seen.get(key);
+    if (!prev) seen.set(key, { email: key, name: String(r.name || '').trim(), source: r.source || '', slug: r.slug || '', joined: r.created_at, times: 1 });
+    else { prev.times += 1; if (!prev.name && r.name) prev.name = String(r.name).trim(); }
+  }
+  return [...seen.values()].reverse(); // newest first for the UI
+}
+
+app.get('/api/clients/:id/email-list', async (c) => {
+  const id = Number(c.req.param('id'));
+  const list = await emailListFor(c.env.DB, id);
+  const settings = await getSettings(c.env.DB);
+  const slug = String((await slugForClient(c.env.DB, id)) || '');
+  const provider = settings['esp_provider_' + slug] || settings.esp_provider || (settings['kit_form_' + slug] || settings.kit_form_id ? 'kit' : 'none');
+  const espId = settings['esp_form_' + slug] || settings['kit_form_' + slug] || settings.kit_form_id || '';
+  return c.json({ count: list.length, provider, esp_id: espId ? String(espId) : '', subscribers: list });
+});
+
+// CSV so she can hand the list to ANY platform, or keep it. Deliberately the
+// column order every ESP importer expects first: email, then name.
+app.get('/api/clients/:id/email-list.csv', async (c) => {
+  const id = Number(c.req.param('id'));
+  const list = await emailListFor(c.env.DB, id);
+  const cell = (v) => {
+    const t = String(v == null ? '' : v);
+    return /[",\n]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t;
+  };
+  const lines = ['email,name,source,site,joined,submissions'];
+  for (const r of list) lines.push([r.email, r.name, r.source, r.slug, r.joined, r.times].map(cell).join(','));
+  return new Response(lines.join('\n'), {
+    headers: {
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': `attachment; filename="email-list-${id}.csv"`,
+    },
+  });
+});
+
 app.get('/api/clients/:id/links', async (c) => {
   const id = Number(c.req.param('id'));
   const settingsL = await getSettings(c.env.DB);
@@ -4479,6 +4535,16 @@ app.post('/api/settings', async (c) => {
   for (const k of Object.keys(body)) {
     if (/^kit_form_[a-z0-9-]{1,60}$/.test(k)) {
       await setSetting(c.env.DB, k, String(body[k] || '').replace(/\D/g, '').slice(0, 20));
+    }
+    // Provider-agnostic email settings. `kit_form_*` above stays as the legacy
+    // alias so nothing already wired breaks, but new builds use these: the
+    // client's list platform is a choice, not a dependency.
+    if (/^esp_provider_[a-z0-9-]{1,60}$/.test(k) || k === 'esp_provider') {
+      const v = String(body[k] || '').toLowerCase();
+      if (['kit', 'mailchimp', 'webhook', 'none', ''].includes(v)) await setSetting(c.env.DB, k, v);
+    }
+    if (/^esp_form_[a-z0-9-]{1,60}$/.test(k) || k === 'esp_form') {
+      await setSetting(c.env.DB, k, String(body[k] || '').slice(0, 300));
     }
   }
   return c.json({ ok: true });
