@@ -1875,6 +1875,22 @@ app.get('/portal/:id/:token', async (c) => {
     return `<div class="ladder"><div class="goal"></div>${pos ? `<div class="lfill" style="width:0%" data-w="${w}"></div>` : ''}${gh}</div><div class="lscale"><span>#100</span><span>Page 1 🏁</span></div>`;
   };
   const moveTxt = (pos, prev) => (!prev || prev === pos) ? '' : (pos < prev ? ` <span class="up">▲ up from #${prev}</span>` : ` <span class="mut">was #${prev}</span>`);
+  // 🤖 AI channel — people who arrived here from an assistant's answer, and how
+  // many became leads. Measured on their own site; zero until it happens.
+  let aiRef = 0, aiLeadsN = 0, aiRead = 0;
+  try {
+    if (slug) {
+      const av = (await db.prepare(
+        `SELECT kind, SUM(n) AS n FROM ai_visits WHERE slug = ? AND day > date('now','-90 days') GROUP BY kind`
+      ).bind(slug).all()).results || [];
+      for (const r of av) { if (r.kind === 'referral') aiRef = Number(r.n); if (r.kind === 'answer') aiRead = Number(r.n); }
+    }
+    const lr = (await db.prepare(
+      `SELECT referrer, utm_source FROM leads WHERE client_id = ? AND created_at > datetime('now','-90 days')`
+    ).bind(id).all()).results || [];
+    aiLeadsN = lr.filter((l) => aiReferral(l.referrer, l.utm_source)).length;
+  } catch { /* the portal must render even if this table is empty */ }
+  const aiTok = await portalToken(c.env, 'ai', id);
   let gsc = null; try { gsc = JSON.parse(settings[`gsc_data_${id}`] || 'null'); } catch {}
   const hasGsc = gsc && Array.isArray(gsc.queries) && gsc.queries.length > 0;
   let hist = []; try { hist = JSON.parse(settings[`scorehist_${id}`] || '[]'); } catch {}
@@ -2005,6 +2021,10 @@ app.get('/portal/:id/:token', async (c) => {
   if (leadsN > 0) tiles.push(`<div class="tile"><div class="v" data-cnt="${leadsN}">${leadsN}</div><div class="l">People who reached out</div></div>`);
   if (bookedN > 0) tiles.push(`<div class="tile"><div class="v" data-cnt="${bookedN}">${bookedN}</div><div class="l">Bookings from your website</div>${avgPrice ? `<div class="d up">~$${(bookedN * avgPrice).toLocaleString()} at your prices</div>` : ''}</div>`);
   if (score) tiles.push(`<div class="tile"><div class="v" data-cnt="${score.total}">${score.total}<small>/100</small></div><div class="l">Website score</div></div>`);
+  // 🤖 Found by AI — only shown once there is something real to show. A tile
+  // reading "0" on a channel the client has never heard of reads as a failure
+  // rather than as "we started measuring this last week".
+  if (aiRef > 0) tiles.push(`<div class="tile"><div class="v" data-cnt="${aiRef}">${aiRef}</div><div class="l">Arrived from an AI answer</div>${aiLeadsN > 0 ? `<div class="d up">${aiLeadsN} became ${aiLeadsN === 1 ? 'a lead' : 'leads'}</div>` : ''}</div>`);
   if (!score && up && up.total >= 3 && upPct !== null) tiles.push(`<div class="tile"><div class="v" data-cnt="${upPct}">${upPct}%</div><div class="l">Uptime, checked daily</div></div>`);
   const FRIENDLY2 = { auto_published: 'Website updated & republished', revision_done: 'A requested change was completed',
     theme_changed: 'Fresh look applied to your site', logo_uploaded: 'Your logo was added', photo_uploaded: 'New photo added to your site',
@@ -2104,6 +2124,13 @@ app.get('/portal/:id/:token', async (c) => {
   </div><p class="note" style="margin-top:9px;text-align:center">This is what the world sees right now — tap to open it full size.</p></div>` : ''}
 
   ${tiles.length ? `<div class="card"><span class="eyebrow">At a Glance</span><h2>Your numbers right now</h2><div class="tiles">${tiles.join('')}</div></div>` : ''}
+
+  <div class="card"><span class="eyebrow">AI Search</span><h2>Being found when people ask an AI</h2>
+    <p class="note" style="margin:0 0 10px">More people every month look for a local service by asking an assistant instead of searching. Unlike ads, there is nothing to buy here — an assistant either finds enough to name you, or it names someone else.</p>
+    ${(aiRead || aiRef) ? `<p style="margin:0 0 10px">In the last 90 days an assistant read your website <b>${aiRead}</b> ${aiRead === 1 ? 'time' : 'times'} to answer someone's question${aiRef ? `, and <b>${aiRef}</b> ${aiRef === 1 ? 'person' : 'people'} came to you from one of those answers` : ''}.${aiLeadsN ? ` <b>${aiLeadsN}</b> of them reached out.` : ''}</p>`
+      : `<p style="margin:0 0 10px">We started measuring this recently. Numbers build over weeks — an empty result here early on is normal, not a problem.</p>`}
+    <a class="btn" href="/portal-ai/${id}/${aiTok}" target="_blank">See your full AI report →</a>
+  </div>
 
   <div class="card c-goog"><span class="eyebrow">Google</span><h2>Where you stand on Google</h2>
     ${hasGsc ? `<p class="note" style="margin:0 0 6px">Straight from Google's own records — your exact position for searches people typed in the last 28 days · updated ${String(gsc.checked_at).slice(0, 10)}.</p>
@@ -4383,6 +4410,48 @@ function aeoAudit(rows, biz, opts = {}) {
     has_entity_id: !!(bizNode && bizNode['@id']), schema_types: [...types] };
 }
 
+// Pull a site's pages for auditing. Two sources, and the choice is forced:
+//   • we host it  → read the served rows out of storage (exact, free, and the
+//     only option, because a worker cannot fetch a hostname it serves)
+//   • we don't    → fetch it over the internet like anyone else would
+// Without the second branch the engine silently reported 0 pages for every
+// client whose site we did not build — which is most prospects and at least one
+// paying client.
+async function aeoPages(env, settings, client, slug) {
+  if (slug) {
+    const rows = (await env.DB.prepare(
+      `SELECT path, content FROM site_files WHERE slug = ? AND (path LIKE '%.html' OR path IN ('llms.txt','sitemap.xml'))`
+    ).bind(slug).all()).results || [];
+    if (rows.length) return { rows, source: 'hosted' };
+  }
+  let domain = ''; try { domain = new URL(client.live_url).hostname.replace(/^www\./, ''); } catch {}
+  if (!domain) return { rows: [], source: 'none' };
+  if (selfServed(settings, `https://${domain}/`)) return { rows: [], source: 'none' };
+
+  const base = `https://${domain}`;
+  const grab = async (u) => {
+    try { const r = await fetch(u, { headers: { 'User-Agent': 'ConversionCo-AEO-Audit' } });
+      return r.ok ? await r.text() : ''; } catch { return ''; }
+  };
+  const rows = [];
+  const sm = await grab(`${base}/sitemap.xml`);
+  if (sm) rows.push({ path: 'sitemap.xml', content: sm });
+  const llms = await grab(`${base}/llms.txt`);
+  if (llms) rows.push({ path: 'llms.txt', content: llms });
+  // Subrequest budget is finite. Cap the sweep and REPORT the cap rather than
+  // truncating quietly and calling it a full audit.
+  const locs = [...sm.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/gi)].map((m) => m[1]);
+  const urls = (locs.length ? locs : [base]).slice(0, 20);
+  for (const u of urls) {
+    const html = await grab(u);
+    if (!html) continue;
+    let p = (u.replace(/\/$/, '').split('/').pop() || 'index.html');
+    if (!/\.html?$/i.test(p)) p = (p === domain || !p) ? 'index.html' : p + '.html';
+    rows.push({ path: p, content: html });
+  }
+  return { rows, source: 'fetched', scanned: urls.length, capped: locs.length > 20 };
+}
+
 app.get('/api/clients/:id/aeo', async (c) => {
   const id = Number(c.req.param('id'));
   const db = c.env.DB;
@@ -4425,12 +4494,12 @@ app.get('/api/clients/:id/aeo', async (c) => {
   };
 
   // ── 3. readiness — content side here, crawler access from the browser
-  const fileRows = slug ? ((await db.prepare(
-    `SELECT path, content FROM site_files WHERE slug = ? AND (path LIKE '%.html' OR path IN ('llms.txt','sitemap.xml'))`
-  ).bind(slug).all()).results || []) : [];
+  const settingsA = await getSettings(db);
+  const pgA = await aeoPages(c.env, settingsA, client, slug);
   // business_name only — falling back to the contact's first name would check
   // every page for "Tiffany" and report a nonsense finding.
-  const audit = aeoAudit(fileRows, client.business_name || '');
+  const audit = aeoAudit(pgA.rows, client.business_name || '');
+  audit.source = pgA.source; audit.capped = !!pgA.capped;
 
   // the browser fetches robots.txt for us — Cloudflare's managed block is injected
   // at the edge and is not in the stored file, and we cannot fetch our own domain
@@ -4680,9 +4749,11 @@ app.post('/api/clients/:id/sitemap-rebuild', async (c) => {
 // specific. Same list every time so results are comparable week to week.
 const AEO_ENGINES = ['ChatGPT', 'Claude', 'Perplexity', 'Gemini', 'Google AI Overviews', 'Copilot'];
 
-async function aeoQuestions(db, client) {
+async function aeoQuestions(env, client) {
+  const db = env.DB;
   const slug = await slugForClient(db, client.id);
-  const rows = slug ? ((await db.prepare(`SELECT path, content FROM site_files WHERE slug = ? AND path LIKE '%.html'`).bind(slug).all()).results || []) : [];
+  const settingsQ = await getSettings(db);
+  const rows = (await aeoPages(env, settingsQ, client, slug)).rows.filter((r) => /\.html?$/i.test(String(r.path)));
   const titleOf = (h) => ((String(h).match(/<title>([^<]*)<\/title>/i) || [])[1] || '');
   // cities come from the location pages the site already has
   // Order cities by how central they actually are, NOT alphabetically. The first
@@ -4691,13 +4762,23 @@ async function aeoQuestions(db, client) {
   // Rank by how often the site itself mentions each city, which is the site's own
   // statement of where its business is.
   const allText = rows.map((r) => String(r.content || '')).join(' ');
-  const cities = rows.map((r) => String(r.path)).filter((p) => /^(iv-therapy-|city-)/i.test(p))
+  // Not every site names location pages the way ours do. Fall back to the city
+  // the site's own schema declares — without this, any client whose site we did
+  // not build got one useless question and nothing else.
+  const fromSchema = [...allText.matchAll(/"addressLocality"\s*:\s*"([^"]{2,40})"/gi)].map((m) => m[1].trim());
+  const cities = rows.map((r) => String(r.path)).filter((p) => /^(iv-therapy-|city-|location|serving)/i.test(p))
     .map((p) => p.replace(/^(iv-therapy-|city-)/i, '').replace(/\.html$/i, '').split('-').map((w) => w[0].toUpperCase() + w.slice(1)).join(' '))
     .map((name) => ({ name, n: (allText.match(new RegExp('\\b' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'gi')) || []).length }))
     .sort((a, b) => b.n - a.n)
-    .map((x) => x.name);
+    .map((x) => x.name)
+    .concat(fromSchema)
+    .filter((v, i, arr) => v && arr.findIndex((x) => x.toLowerCase() === v.toLowerCase()) === i);
   const home = rows.find((r) => r.path === 'index.html');
-  const what = /iv|infusion|drip|hydrat/i.test(titleOf(home && home.content) + (client.vertical || '')) ? 'mobile IV therapy' : (client.vertical || 'this service');
+  const blob = `${titleOf(home && home.content)} ${client.vertical || ''} ${client.business_name || ''}`;
+  const what = /iv |infusion|drip|hydrat/i.test(blob) ? 'mobile IV therapy'
+    : /med ?spa|aesthetic|botox|filler/i.test(blob) ? 'med spa treatments'
+    : /wellness|health/i.test(blob) ? 'wellness services'
+    : (client.vertical || 'this service');
   const main = cities[0] || '';
   const biz = client.business_name || client.name || '';
 
@@ -4750,10 +4831,9 @@ app.get('/portal-ai/:id/:token', async (c) => {
   const bookedL = aiLeads.filter((l) => l.status === 'booked');
   const revenue = bookedL.reduce((a, l) => a + Number(l.value || 0), 0);
 
-  const fileRows = slug ? ((await db.prepare(
-    `SELECT path, content FROM site_files WHERE slug = ? AND (path LIKE '%.html' OR path IN ('llms.txt','sitemap.xml'))`
-  ).bind(slug).all()).results || []) : [];
-  const audit = aeoAudit(fileRows, client.business_name || '');
+  const settingsP = await getSettings(db);
+  const pgP = await aeoPages(c.env, settingsP, client, slug);
+  const audit = aeoAudit(pgP.rows, client.business_name || '');
   const pct = Math.round(100 * audit.score / audit.max);
 
   const esc2 = (x) => String(x == null ? '' : x).replace(/[<>&"]/g, (m) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[m]));
@@ -4853,7 +4933,7 @@ app.get('/api/clients/:id/aeo-questions', async (c) => {
   const id = Number(c.req.param('id'));
   const client = await c.env.DB.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
   if (!client) return c.json({ error: 'client not found' }, 404);
-  const q = await aeoQuestions(c.env.DB, client);
+  const q = await aeoQuestions(c.env, client);
   const rows = (await c.env.DB.prepare(
     `SELECT engine, question, named, note, checked_at FROM ai_checks WHERE client_id = ? ORDER BY id DESC LIMIT 300`
   ).bind(id).all()).results || [];
@@ -4984,6 +5064,7 @@ app.post('/api/clients/:id/llms-txt', async (c) => {
 // Cross-client AEO roll-up — the view Tiffany demos from.
 app.get('/api/aeo-overview', async (c) => {
   const db = c.env.DB;
+  const settingsO = await getSettings(db);
   const days = Math.min(365, Math.max(7, Number(c.req.query('days') || 28)));
   const clients = (await db.prepare(`SELECT * FROM clients WHERE stage != 'archived' AND (live_url != '' OR preview_url != '')`).all()).results || [];
   const out = [];
@@ -4995,10 +5076,7 @@ app.get('/api/aeo-overview', async (c) => {
     ).bind(slug, `-${days} days`).all()).results || [];
     const t = { answer: 0, referral: 0, train: 0 };
     for (const r of rows) if (t[r.kind] !== undefined) t[r.kind] = Number(r.n);
-    const fileRows = (await db.prepare(
-      `SELECT path, content FROM site_files WHERE slug = ? AND (path LIKE '%.html' OR path IN ('llms.txt','sitemap.xml'))`
-    ).bind(slug).all()).results || [];
-    const a = aeoAudit(fileRows, cl.business_name || '');
+    const a = aeoAudit((await aeoPages(c.env, settingsO, cl, slug)).rows, cl.business_name || '');
     let domain = ''; try { domain = new URL(cl.live_url).hostname.replace(/^www\./, ''); } catch {}
     out.push({ id: cl.id, name: cl.business_name || cl.name || cl.email, domain, slug, traffic: t, content_score: a.score, content_max: a.max, top_fix: a.fixes[0] || null });
   }
