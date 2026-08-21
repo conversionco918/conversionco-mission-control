@@ -74,6 +74,10 @@ async function ensureSchema(db) {
     try { await db.prepare(`ALTER TABLE leads ADD COLUMN ${col} TEXT DEFAULT ''`).run(); } catch {}
   }
   try { await db.prepare(`ALTER TABLE leads ADD COLUMN value REAL DEFAULT 0`).run(); } catch {}
+  // golive-domain has always written launched_at, but the column never existed —
+  // so the UPDATE threw and the whole launch returned a 500 AFTER it had already
+  // succeeded. (Found 8/20 on the anywhereinfusions.com launch.)
+  try { await db.prepare(`ALTER TABLE clients ADD COLUMN launched_at TEXT DEFAULT ''`).run(); } catch {}
   try { await db.prepare(`CREATE INDEX IF NOT EXISTS idx_leads_gclid ON leads(gclid)`).run(); } catch {}
   try { await db.prepare(`CREATE INDEX IF NOT EXISTS idx_leads_client_created ON leads(client_id, created_at)`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN competitors TEXT DEFAULT ''`).run(); } catch {}
@@ -3937,6 +3941,71 @@ app.post('/api/clients/:id/billing-bypass', async (c) => {
 // 🌐 GO-LIVE AUTOPILOT: attach a client's domain to direct hosting — zone check,
 // Workers custom domains for apex + www (DNS + SSL automatic), live-host serving
 // mapping, optional hello@ email forward, card flipped live + instant GSC.
+// ══ LAUNCH GATE — check the REAL domain, not the preview ═══════════════════
+// The pre-launch audit on 8/20 passed cleanly and the site still launched with
+// every image broken. Why: the audit read the PREVIEW url, where the paths were
+// correct. The bug only existed on the live domain. A launch check that reads
+// anything other than the live domain is not a launch check.
+//
+// Fetches real pages over the public internet and asserts:
+//   • every page returns 200
+//   • no page contains a "/preview/" path (preview-only URLs 404 when live)
+//   • the images each page references actually load
+//   • www redirects to the apex (one address, undivided SEO credit)
+app.get('/api/clients/:id/launch-check', async (c) => {
+  const id = Number(c.req.param('id'));
+  const client = await c.env.DB.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ ok: false, error: 'client not found' }, 404);
+  let domain = String(c.req.query('domain') || '');
+  if (!domain) { try { domain = new URL(client.live_url).hostname; } catch {} }
+  domain = domain.replace(/^https?:\/\//, '').replace(/\/.*$/, '').replace(/^www\./, '');
+  if (!domain) return c.json({ ok: false, error: 'no live domain on this client yet' }, 400);
+
+  const slug = await slugForClient(c.env.DB, id);
+  const rows = slug ? ((await c.env.DB.prepare(
+    `SELECT path FROM site_files WHERE slug = ? AND path LIKE '%.html'`).bind(slug).all()).results || []) : [];
+  // Cap the sweep: Workers have a subrequest budget, and each page costs 2.
+  const pages = ['index.html', ...rows.map((r) => r.path).filter((p) => p !== 'index.html')].slice(0, 24);
+
+  const problems = [], checked = [];
+  let imagesOk = 0, imagesChecked = 0;
+  const base = `https://${domain}`;
+  for (const p of pages) {
+    const url = `${base}/${p === 'index.html' ? '' : p}`;
+    let res;
+    try { res = await fetch(url, { headers: { 'User-Agent': 'ConversionCo-LaunchCheck' } }); }
+    catch (e) { problems.push(`${p}: could not be fetched (${String(e.message).slice(0, 60)})`); continue; }
+    if (res.status !== 200) { problems.push(`${p}: HTTP ${res.status}`); continue; }
+    const html = await res.text();
+    checked.push(p);
+    if (html.includes('/preview/')) problems.push(`${p}: still contains preview-only paths — these 404 on the live domain`);
+    // verify the first image on the page actually loads
+    const m = html.match(/src="([^"]+\.(?:png|jpg|jpeg|webp|svg))"/i);
+    if (m) {
+      const src = m[1].startsWith('http') ? m[1] : `${base}/${m[1].replace(/^\//, '')}`;
+      imagesChecked++;
+      try {
+        const ir = await fetch(src, { method: 'HEAD' });
+        if (ir.status === 200) imagesOk++; else problems.push(`${p}: image ${m[1]} returns ${ir.status}`);
+      } catch { problems.push(`${p}: image ${m[1]} could not be fetched`); }
+    }
+  }
+
+  // www must land on the apex, not serve a second copy of the site
+  let wwwRedirects = null;
+  try {
+    const w = await fetch(`https://www.${domain}/`, { redirect: 'manual' });
+    wwwRedirects = w.status >= 300 && w.status < 400;
+    if (!wwwRedirects) problems.push(`www.${domain} does not redirect to the apex — Google may treat it as a second site`);
+  } catch { problems.push(`www.${domain} could not be reached`); }
+
+  const pass = problems.length === 0;
+  await logEvent(c.env.DB, id, pass ? 'launch_check_pass' : 'launch_check_fail',
+    pass ? `✅ Launch check passed on ${domain}: ${checked.length} pages, ${imagesOk}/${imagesChecked} images loading, www redirects.`
+         : `⚠️ Launch check found ${problems.length} problem(s) on ${domain}: ${problems.slice(0, 3).join(' · ')}`);
+  return c.json({ ok: pass, domain, pages_checked: checked.length, images_ok: imagesOk, images_checked: imagesChecked, www_redirects: wwwRedirects, problems });
+});
+
 app.post('/api/clients/:id/golive-domain', async (c) => {
   const id = Number(c.req.param('id'));
   const db = c.env.DB;
@@ -3963,13 +4032,50 @@ app.post('/api/clients/:id/golive-domain', async (c) => {
     return c.json({ ok: false, steps, error: `${domain} is not in the Cloudflare account yet (or the API token cannot list zones). One-time setup: add the domain as a zone in Cloudflare + point its nameservers there, and give the token Zone:Read + Workers Custom Domains:Edit + Email Routing:Edit.` });
   }
   steps.push(`zone found (status: ${zone.status})`);
+
   // 2. attach apex + www to this worker (creates DNS records + SSL automatically)
+  //
+  // THE CONFLICT (Cloudflare error 100117): a Workers custom domain cannot be
+  // attached to a hostname that still has its own A/AAAA/CNAME record. During a
+  // migration those records are exactly what we WANT present up to this moment —
+  // they keep the old site serving with zero downtime while nameservers move.
+  // So the launch has to clear them itself, right here, at the last possible
+  // second. Doing it by hand cost an hour on the anywhereinfusions.com launch.
+  //
+  // Only address records for the two hostnames being launched are removed.
+  // TXT (SPF/DMARC/DKIM), MX and everything else are never touched — deleting an
+  // email record during a website launch would be a silent, serious failure.
+  const clearConflicts = async (host) => {
+    const cleared = [];
+    for (const type of ['A', 'AAAA', 'CNAME']) {
+      const list = await cf(`/zones/${zone.id}/dns_records?type=${type}&name=${encodeURIComponent(host)}`);
+      for (const rec of (list && list.result) || []) {
+        const del = await cf(`/zones/${zone.id}/dns_records/${rec.id}`, 'DELETE');
+        if (del && del.success) cleared.push(`${type} ${host} -> ${String(rec.content).slice(0, 40)}`);
+      }
+    }
+    return cleared;
+  };
+
+  const attach = async (host) => cf(`/accounts/${c.env.CF_ACCOUNT_ID}/workers/domains`, 'PUT', {
+    environment: 'production', hostname: host, service: 'conversionco-mission-control', zone_id: zone.id });
+
   for (const host of [domain, `www.${domain}`]) {
-    const att = await cf(`/accounts/${c.env.CF_ACCOUNT_ID}/workers/domains`, 'PUT', {
-      environment: 'production', hostname: host, service: 'conversionco-mission-control', zone_id: zone.id });
-    steps.push(`${host}: ${att.success ? 'attached ✓' : 'FAILED — ' + JSON.stringify(att.errors || att.messages || []).slice(0, 160)}`);
+    let att = await attach(host);
+    if (!att.success) {
+      const why = JSON.stringify(att.errors || []);
+      // 100117 = "already has externally managed DNS records". Clear and retry once.
+      if (/100117|externally managed DNS/i.test(why)) {
+        const cleared = await clearConflicts(host);
+        if (cleared.length) {
+          steps.push(`${host}: cleared the old record(s) blocking handover — ${cleared.join(', ')}`);
+          att = await attach(host);
+        }
+      }
+    }
+    steps.push(`${host}: ${att.success ? 'attached ✓' : 'FAILED — ' + JSON.stringify(att.errors || att.messages || []).slice(0, 200)}`);
     if (!att.success && host === domain) {
-      return c.json({ ok: false, steps, error: 'Could not attach the domain — the token likely needs Workers Custom Domains edit permission.' });
+      return c.json({ ok: false, steps, error: 'Could not attach the domain. If this says the token lacks permission, it needs Workers Custom Domains edit; any other message is the real reason.' });
     }
   }
   // 3. map the hostnames to the site so the worker serves it
@@ -3985,8 +4091,20 @@ app.post('/api/clients/:id/golive-domain', async (c) => {
     steps.push(`hello@${domain}: ${er && er.success ? `forwards to ${client.email} ✓` : 'not set (enable Email Routing on the zone once, then re-run)'}`);
   }
   // 5. flip the card live + instant GSC enrollment (quiet — no launch email here)
-  await touchClient(db, id, { live_url: `https://${domain}`, stage: 'live', launched_at: new Date().toISOString() });
-  await logEvent(db, id, 'launched', `🌐 ${domain} attached to direct hosting — DNS, SSL, serving, and Google enrollment all automatic`);
+  //
+  // Everything above this point IS the launch. From here down is bookkeeping, and
+  // bookkeeping must never be able to report a successful launch as a failure —
+  // on 8/20 a bad column name in this exact call threw a 500 on a site that was
+  // already serving perfectly.
+  try {
+    await touchClient(db, id, { live_url: `https://${domain}`, stage: 'live', launched_at: new Date().toISOString() });
+    steps.push('client card flipped to live ✓');
+  } catch (e) {
+    steps.push(`card update failed (site IS live) — ${String(e && e.message || e).slice(0, 120)}`);
+  }
+  try {
+    await logEvent(db, id, 'launched', `🌐 ${domain} attached to direct hosting — DNS, SSL, serving, and Google enrollment all automatic`);
+  } catch { /* never block a launch on a log line */ }
   c.executionCtx.waitUntil((async () => {
     try { const s2 = await getSettings(db); await gscEnsureClient(c.env, s2, { ...client, live_url: `https://${domain}`, stage: 'live' }); } catch {}
   })());
@@ -5208,8 +5326,17 @@ async function importSite(env, settings, slug, clientId, treeFiles, opts = {}) {
       await logEvent(db, Number(clientId), 'demo_ready', `💡 Prospect demo is live: ${previewUrl}`);
       return { files: count, preview_url: previewUrl };
     }
-    await touchClient(db, Number(clientId), { stage: 'preview_ready', preview_url: previewUrl });
-    await logEvent(db, Number(clientId), 'preview_ready', previewUrl);
+    // NEVER DOWNGRADE A LAUNCHED SITE. Re-publishing a live client (a copy edit,
+    // an image fix) used to knock its stage back to preview_ready, which made the
+    // card lie about a site that is serving on its own domain. Found 8/20 when
+    // the anywhereinfusions.com card kept reverting after each publish.
+    const liveAlready = clP && (clP.stage === 'live' || clP.stage === 'hosting');
+    if (liveAlready) {
+      await touchClient(db, Number(clientId), { preview_url: previewUrl });
+    } else {
+      await touchClient(db, Number(clientId), { stage: 'preview_ready', preview_url: previewUrl });
+      await logEvent(db, Number(clientId), 'preview_ready', previewUrl);
+    }
     // APPROVAL GATE (Tiffany 7/24): nothing reaches the client until she approves.
     // The final invoice + the reveal email are sent by /api/clients/:id/approve-preview.
     // Re-publishes of an already-approved site (revisions etc.) don't re-hold.
