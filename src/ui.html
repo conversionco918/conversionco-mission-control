@@ -288,6 +288,18 @@
   </div>
 
   <div id="adsWrap" style="display:none"></div>
+  <!-- 🤖 AEO workbench: scan any site (read-only) + every client on one line -->
+  <div style="background:#faf5ff;border:1px solid #e9d5ff;border-radius:12px;padding:16px;margin:16px 0;">
+    <p style="font-size:13px;font-weight:700;color:#6b21a8;margin:0 0 4px;">🤖 AI visibility</p>
+    <p style="font-size:11.5px;color:#475569;margin:0 0 10px;">Score any website — a prospect's, a competitor's, anyone's. It only reads public pages and writes nothing.</p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+      <input id="aeoScanDomain" type="text" placeholder="theirbusiness.com" style="flex:1;min-width:180px;font-size:12.5px;padding:7px 10px;border:1px solid #cbd5e1;border-radius:7px;">
+      <button class="btn btn-ghost" onclick="aeoScan(this)">🔍 Scan</button>
+      <button class="btn btn-ghost" onclick="aeoOverview(this)">📋 All clients</button>
+    </div>
+    <div id="aeoScanOut" style="margin-top:10px;"></div>
+    <div id="aeoOverviewOut" style="margin-top:10px;"></div>
+  </div>
 
   <div class="cols" id="tableWrap">
     <div>
@@ -740,6 +752,17 @@ async function aeoSaveFix(id, btn) {
   btn.disabled = true; btn.textContent = 'Saving…';
   const save = await api(`/api/clients/${id}/aeo-profile`, { method:'POST', body: JSON.stringify({ profiles, hours }) });
   if (save.error) { btn.disabled = false; btn.textContent = '🔗 Save & fix schema'; if (out) out.innerHTML = `<span style="color:#b91c1c;">${esc(save.error)}</span>`; return; }
+  // Look before you write. Every tool that changes a live website shows what it
+  // WOULD do and waits for a yes — after a header meant for preview pages went
+  // out on two live client sites, "are you sure" is not enough on its own.
+  btn.textContent = 'Checking…';
+  const dry = await api(`/api/clients/${id}/aeo-fix`, { method:'POST', body: JSON.stringify({ preview: true }) });
+  if (dry.error) { btn.disabled = false; btn.textContent = '🔗 Save & fix schema'; if (out) out.innerHTML = `<span style="color:#b91c1c;">${esc(dry.error)}</span>`; return; }
+  if (!confirm(`About to change this client's LIVE website.\n\n${dry.note}\n\nNo pages are added or removed and nothing is deleted — this only adds business details that assistants read.\n\nGo ahead?`)) {
+    btn.disabled = false; btn.textContent = '🔗 Save & fix schema';
+    if (out) out.innerHTML = `<span style="color:#64748b;">Nothing was changed. ${esc(dry.note)}</span>`;
+    return;
+  }
   btn.textContent = 'Writing schema…';
   const fix = await api(`/api/clients/${id}/aeo-fix`, { method:'POST', body:'{}' });
   btn.disabled = false; btn.textContent = '🔗 Save & fix schema';
@@ -776,6 +799,58 @@ async function aeoChecks(id, btn) {
     </table></div>
     <p style="font-size:10.5px;color:#94a3b8;margin-top:8px;">${q.total_checks} check(s) recorded. Alt-click a box to clear it${q.total_checks ? ` · <a href="#" onclick="aeoClearAll(${id});return false;" style="color:#94a3b8;">clear all</a>` : ''}. Gemini and Google AI Overviews publish no ranking and have no way to query one — check those by hand too, and treat any tool that claims a number for them with suspicion.</p>`;
 }
+// 🔍 Scan any website — a prospect's, a competitor's, anyone's. Read-only.
+// Walking into a pitch already knowing what their site scores, and why an
+// assistant names their competitor instead of them, is the whole sales pitch.
+async function aeoScan(btn) {
+  const input = document.getElementById('aeoScanDomain');
+  const out = document.getElementById('aeoScanOut');
+  const domain = (input && input.value || '').trim();
+  if (!domain) return toast('Type a website address first');
+  btn.disabled = true; btn.textContent = 'Reading…';
+  out.innerHTML = '<p style="color:#475569;font-size:12px;">Reading their site — this only looks, it changes nothing.</p>';
+  const r = await api(`/api/aeo-scan?domain=${encodeURIComponent(domain)}`);
+  btn.disabled = false; btn.textContent = '🔍 Scan';
+  if (r.error) { out.innerHTML = `<p style="color:#b91c1c;font-size:12px;">${esc(r.error)}</p>`; return; }
+  const pct = Math.round(100 * r.score / r.max);
+  const g = pct >= 85 ? ['#059669','Strong'] : pct >= 60 ? ['#1d4ed8','Solid'] : pct >= 35 ? ['#b45309','Weak'] : ['#b91c1c','Not ready'];
+  out.innerHTML = `
+    <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:8px;">
+      <span style="font-size:26px;font-weight:800;color:${g[0]};">${pct}</span>
+      <span style="font-size:11px;font-weight:700;color:${g[0]};letter-spacing:.05em;">${g[1]}</span>
+      <span style="font-size:11.5px;color:#64748b;">${esc(r.business)} · ${r.pages_read} pages read${r.capped ? ' (first 20)' : ''}</span>
+    </div>
+    ${r.fixes.length ? `<p style="font-size:11px;font-weight:700;color:#334155;margin:8px 0 4px;">What is holding them back</p>
+      <ol style="margin:0 0 0 18px;font-size:11.5px;color:#475569;">${r.fixes.slice(0,6).map(f=>`<li style="margin-bottom:4px;"><b>+${f.pts}</b> ${esc(f.what)}</li>`).join('')}</ol>` : ''}
+    ${r.wins.length ? `<p style="font-size:11px;font-weight:700;color:#334155;margin:10px 0 4px;">What they already have</p>
+      <ul style="margin:0 0 0 18px;font-size:11.5px;color:#059669;">${r.wins.slice(0,6).map(w=>`<li>${esc(w)}</li>`).join('')}</ul>` : ''}
+    <p style="font-size:10.5px;color:#94a3b8;margin-top:8px;">Read-only — nothing was written to their site or ours.</p>`;
+}
+// Every client on one line, worst readiness first — where to spend the week.
+async function aeoOverview(btn) {
+  const out = document.getElementById('aeoOverviewOut');
+  btn.disabled = true; btn.textContent = 'Loading…';
+  const r = await api('/api/aeo-overview');
+  btn.disabled = false; btn.textContent = '📋 All clients';
+  if (r.error) { out.innerHTML = `<p style="color:#b91c1c;font-size:12px;">${esc(r.error)}</p>`; return; }
+  if (!r.clients.length) { out.innerHTML = '<p style="font-size:12px;color:#94a3b8;">No client sites to compare yet.</p>'; return; }
+  out.innerHTML = `<table style="width:100%;border-collapse:collapse;font-size:11.5px;margin-top:8px;">
+    <tr><th style="text-align:left;padding:4px 6px 4px 0;color:#64748b;">Client</th>
+      <th style="text-align:right;color:#64748b;">Ready</th>
+      <th style="text-align:right;color:#64748b;">AI read</th>
+      <th style="text-align:right;color:#64748b;">Came</th>
+      <th style="text-align:left;padding-left:10px;color:#64748b;">Biggest gap</th></tr>
+    ${r.clients.map(c=>{
+      const pct = Math.round(100*c.content_score/c.content_max);
+      const col = pct>=85?'#059669':pct>=60?'#1d4ed8':pct>=35?'#b45309':'#b91c1c';
+      return `<tr style="border-top:1px solid #f1f5f9;">
+        <td style="padding:5px 6px 5px 0;"><a href="#" onclick="openDrawer(${c.id});return false;" style="color:#0369a1;">${esc(c.name)}</a></td>
+        <td style="text-align:right;font-weight:700;color:${col};">${pct}</td>
+        <td style="text-align:right;color:#64748b;">${c.traffic.answer}</td>
+        <td style="text-align:right;color:${c.traffic.referral?'#059669':'#94a3b8'};font-weight:${c.traffic.referral?'700':'400'};">${c.traffic.referral}</td>
+        <td style="padding-left:10px;color:#64748b;">${c.top_fix ? esc(c.top_fix.what.slice(0,58)) : '—'}</td></tr>`;
+    }).join('')}</table>`;
+}
 async function aeoClearAll(id) {
   if (!confirm('Clear every recorded spot-check for this client?\n\nThis only removes your logged observations — nothing on the website changes.')) return;
   const r = await api(`/api/clients/${id}/aeo-check-clear`, { method:'POST', body: JSON.stringify({ all: true }) });
@@ -802,7 +877,17 @@ async function aeoClientPage(id, btn) {
   window.open(r.url, '_blank');
 }
 async function aeoSitemap(id, btn) {
-  btn.disabled = true; btn.textContent = 'Rebuilding…';
+  btn.disabled = true; btn.textContent = 'Checking…';
+  const out0 = document.getElementById('aeoFixOut');
+  const dry = await api(`/api/clients/${id}/sitemap-rebuild`, { method:'POST', body: JSON.stringify({ preview: true }) });
+  if (dry.error) { btn.disabled = false; btn.textContent = '🗺 Rebuild sitemap'; if (out0) out0.innerHTML = `<span style="color:#b91c1c;">${esc(dry.error)}</span>`; return; }
+  const drop = (dry.dropped || []).length ? `\n\nLeft out:\n• ${dry.dropped.join('\n• ')}` : '';
+  if (!confirm(`Rebuild the sitemap on this client's LIVE website?\n\nWould list ${dry.listed} of ${dry.scanned} pages.${drop}\n\nNo page is deleted — a page left out simply is not advertised to search engines.`)) {
+    btn.disabled = false; btn.textContent = '🗺 Rebuild sitemap';
+    if (out0) out0.innerHTML = `<span style="color:#64748b;">Nothing was changed.</span>`;
+    return;
+  }
+  btn.textContent = 'Rebuilding…';
   const r = await api(`/api/clients/${id}/sitemap-rebuild`, { method:'POST', body:'{}' });
   btn.disabled = false; btn.textContent = '🗺 Rebuild sitemap';
   const out = document.getElementById('aeoFixOut');
@@ -813,7 +898,17 @@ async function aeoSitemap(id, btn) {
   setTimeout(() => aeoView(id, null), 900);
 }
 async function aeoLlms(id, btn) {
-  btn.disabled = true; btn.textContent = 'Writing…';
+  btn.disabled = true; btn.textContent = 'Checking…';
+  const o0 = document.getElementById('aeoLlmsOut');
+  const dry = await api(`/api/clients/${id}/llms-txt`, { method:'POST', body: JSON.stringify({ preview: true }) });
+  if (dry.error) { btn.disabled = false; btn.textContent = '📄 Generate llms.txt'; if (o0) o0.innerHTML = `<span style="color:#b91c1c;">${esc(dry.error)}</span>`; return; }
+  if (o0) o0.innerHTML = `<p style="color:#334155;font-weight:600;">This is what would be published — nothing has changed yet.</p><pre style="white-space:pre-wrap;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:8px;font-size:10.5px;max-height:200px;overflow:auto;">${esc(dry.preview_text)}</pre>`;
+  if (!confirm(`Publish llms.txt to this client's LIVE website?\n\n${dry.pages} pages described, ${dry.bytes} characters.\n\nThis ADDS one new file. No existing page is touched.`)) {
+    btn.disabled = false; btn.textContent = '📄 Generate llms.txt';
+    if (o0) o0.innerHTML += `<p style="color:#64748b;">Nothing was published.</p>`;
+    return;
+  }
+  btn.textContent = 'Writing…';
   const r = await api(`/api/clients/${id}/llms-txt`, { method:'POST', body:'{}' });
   btn.disabled = false; btn.textContent = '📄 Generate llms.txt';
   const out = document.getElementById('aeoLlmsOut');

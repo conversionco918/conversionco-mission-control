@@ -4616,9 +4616,16 @@ function buildEntityGraph(client, domain, profiles, hours, pagePath, pageHtml, u
   };
 }
 
+// Every tool here that writes to a client's website accepts {preview:true} and
+// answers "what WOULD change" without touching anything. This exists because a
+// header aimed at preview pages landed on two live client sites earlier today:
+// the safe move has to be the easy one, and you should be able to look before
+// you write, every time.
 app.post('/api/clients/:id/aeo-fix', async (c) => {
   const id = Number(c.req.param('id'));
   const db = c.env.DB;
+  let body0 = {}; try { body0 = await c.req.json(); } catch {}
+  const dry = !!body0.preview;
   const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
   if (!client) return c.json({ error: 'client not found' }, 404);
   const slug = await slugForClient(db, id);
@@ -4676,7 +4683,7 @@ app.post('/api/clients/:id/aeo-fix', async (c) => {
     const existing = new RegExp(`<script[^>]+id=["']${CC_ENTITY_TAG}["'][^>]*>[\\s\\S]*?<\\/script>\\s*`, 'i');
     const next = existing.test(html) ? html.replace(existing, tag) : html.replace(/<\/head>/i, `${tag}</head>`);
     if (next === String(r.content || '')) { skipped++; continue; }
-    await db.prepare(`UPDATE site_files SET content = ?, updated_at = datetime('now') WHERE slug = ? AND path = ?`)
+    if (!dry) await db.prepare(`UPDATE site_files SET content = ?, updated_at = datetime('now') WHERE slug = ? AND path = ?`)
       .bind(next, slug, r.path).run();
     done++;
   }
@@ -4709,11 +4716,13 @@ app.post('/api/clients/:id/aeo-fix', async (c) => {
       const has = /<link[^>]+rel=["']canonical["'][^>]*>/i;
       const out = has.test(html2) ? html2.replace(has, link) : html2.replace(/<\/head>/i, `${link}</head>`);
       if (out === html2) continue;
-      await db.prepare(`UPDATE site_files SET content = ?, updated_at = datetime('now') WHERE slug = ? AND path = ?`).bind(out, slug, p).run();
+      if (!dry) await db.prepare(`UPDATE site_files SET content = ?, updated_at = datetime('now') WHERE slug = ? AND path = ?`).bind(out, slug, p).run();
       canonicals++;
     }
   }
   const sameAsCount = Object.values(profiles).filter((v) => /^https?:\/\//i.test(String(v || ''))).length;
+  if (dry) return c.json({ ok: true, preview: true, pages: done, skipped, stamped, same_as: sameAsCount, hours: hours.length, canonicals,
+    note: `Nothing was changed. This would update ${done} page(s)${canonicals ? `, add ${canonicals} canonical link(s)` : ''}${stamped ? `, and merge ${stamped} existing schema block(s)` : ''}.` });
   await logEvent(db, id, 'aeo_fix', `🤖 Entity graph written to ${done} page(s) — ${sameAsCount} off-site profile(s) linked${hours.length ? ', opening hours published' : ''}${canonicals ? `, ${canonicals} duplicate page(s) pointed at the real address` : ''}`);
   return c.json({ ok: true, pages: done, skipped, stamped, same_as: sameAsCount, hours: hours.length, canonicals,
     note: 'Live on the served copy now. Publish the site to put it in the repo permanently.' });
@@ -4726,6 +4735,8 @@ app.post('/api/clients/:id/aeo-fix', async (c) => {
 app.post('/api/clients/:id/sitemap-rebuild', async (c) => {
   const id = Number(c.req.param('id'));
   const db = c.env.DB;
+  let smBody = {}; try { smBody = await c.req.json(); } catch {}
+  const dry = !!smBody.preview;
   const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
   if (!client) return c.json({ error: 'client not found' }, 404);
   const slug = await slugForClient(db, id);
@@ -4761,6 +4772,8 @@ app.post('/api/clients/:id/sitemap-rebuild', async (c) => {
   const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n`
     + pages.map((p) => `  <url><loc>${loc(p.path)}</loc>${p.at ? `<lastmod>${p.at}</lastmod>` : ''}</url>`).join('\n')
     + `\n</urlset>\n`;
+  if (dry) return c.json({ ok: true, preview: true, listed: pages.length, scanned: before, dropped,
+    note: `Nothing was changed. This would list ${pages.length} page(s)${dropped.length ? ` and leave out ${dropped.length}` : ''}.` });
   await db.prepare(
     `INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
      VALUES (?, 'sitemap.xml', ?, 'application/xml; charset=utf-8', 0, datetime('now'))
@@ -4899,6 +4912,8 @@ app.get('/portal-ai/:id/:token', async (c) => {
   const pgP = await aeoPages(c.env, settingsP, client, slug);
   const audit = aeoAudit(pgP.rows, client.business_name || '');
   const pct = Math.round(100 * audit.score / audit.max);
+  const settingsH = await getSettings(db);
+  let hist = []; try { hist = JSON.parse(settingsH[`aeohist_${id}`] || '[]'); } catch {}
   // No website to read yet. Showing a score here would be a made-up number about
   // a site that does not exist — say so instead.
   const noSite = pgP.rows.length === 0;
@@ -4974,7 +4989,12 @@ footer{margin-top:52px;border-top:1px solid var(--line);padding-top:20px;font-si
   ${noSite ? `<p class="empty">Your website is still being built, so there is nothing to measure yet. This section fills in the day it goes live.</p>` : `
   <div class="score">
     <div class="dial"><b>${pct}</b></div>
-    <div><p style="margin:0;font-weight:600;color:${grade[0]};font-family:Archivo,sans-serif">${grade[1]}</p>
+    <div><p style="margin:0;font-weight:600;color:${grade[0]};font-family:Archivo,sans-serif">${grade[1]}${(() => {
+      if (hist.length < 2) return '';
+      const first = hist[0].s, last = hist[hist.length - 1].s, d = last - first;
+      if (d === 0) return ` <span style="font-weight:400;color:var(--muted);font-size:14px">· holding steady since ${hist[0].d}</span>`;
+      return ` <span style="font-weight:400;color:${d > 0 ? 'var(--good)' : 'var(--muted)'};font-size:14px">· ${d > 0 ? 'up' : 'down'} ${Math.abs(d)} points since ${hist[0].d}</span>`;
+    })()}</p>
     <p style="margin:4px 0 0;font-size:14.5px;color:var(--muted)">${audit.score} of ${audit.max} points on the things that decide whether an assistant can confidently name you: whether it can read your site, whether it can tell who and where you are, and whether your pages say anything it can quote.</p></div>
   </div>
   ${audit.wins.length ? `<p style="font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);font-family:Archivo,sans-serif;font-weight:600;margin:22px 0 6px">Already in place</p>
@@ -5051,6 +5071,8 @@ app.post('/api/clients/:id/aeo-profile', async (c) => {
 app.post('/api/clients/:id/llms-txt', async (c) => {
   const id = Number(c.req.param('id'));
   const db = c.env.DB;
+  let llBody = {}; try { llBody = await c.req.json(); } catch {}
+  const dry = !!llBody.preview;
   const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
   if (!client) return c.json({ error: 'client not found' }, 404);
   const slug = await slugForClient(db, id);
@@ -5120,6 +5142,8 @@ app.post('/api/clients/:id/llms-txt', async (c) => {
   L.push('');
   const body = L.join('\n');
 
+  if (dry) return c.json({ ok: true, preview: true, bytes: body.length, pages: pages.length, preview_text: body.slice(0, 1200),
+    note: 'Nothing was changed. This is what would be published.' });
   await db.prepare(
     `INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
      VALUES (?, 'llms.txt', ?, 'text/plain; charset=utf-8', 0, datetime('now'))
@@ -5127,6 +5151,45 @@ app.post('/api/clients/:id/llms-txt', async (c) => {
   ).bind(slug, body).run();
   await logEvent(db, id, 'aeo_llms', `🤖 llms.txt published for ${biz} — ${pages.length} pages described for answer engines`);
   return c.json({ ok: true, bytes: body.length, pages: pages.length, url: domain ? `https://${domain}/llms.txt` : '', preview: body.slice(0, 1200) });
+});
+
+// ══ SCAN ANY DOMAIN ════════════════════════════════════════════════════════
+// Read-only, works on a site we have never touched. Two uses:
+//   • a prospect — walk in already knowing what their site scores and why
+//   • a competitor — see exactly why an assistant names them and not your client
+// It writes nothing anywhere. The only thing it does is fetch public pages, the
+// same as any browser.
+app.get('/api/aeo-scan', async (c) => {
+  const raw = String(c.req.query('domain') || '').trim();
+  const domain = raw.toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '').replace(/^www\./, '');
+  if (!domain || !domain.includes('.')) return c.json({ error: 'pass ?domain=example.com' }, 400);
+  const settings = await getSettings(c.env.DB);
+  // Never scan a hostname this worker serves — it would 522 against itself and
+  // report a healthy site as unreachable.
+  if (selfServed(settings, `https://${domain}/`)) {
+    return c.json({ error: `${domain} is one of our own hosted sites — open that client's AEO panel instead, which reads it directly.` }, 400);
+  }
+  const fake = { id: 0, live_url: `https://${domain}`, business_name: '' };
+  const pg = await aeoPages(c.env, settings, fake, null);
+  if (!pg.rows.length) return c.json({ ok: false, domain, error: 'Could not read that site — it may be down, blocking us, or not exist.' });
+
+  // Their business name, taken from their own schema rather than guessed.
+  let biz = '';
+  for (const r of pg.rows) {
+    const m = String(r.content).match(/"@type"\s*:\s*"(?:[A-Za-z]*Business|Organization|MedicalClinic)"[\s\S]{0,400}?"name"\s*:\s*"([^"]{2,60})"/);
+    if (m) { biz = m[1]; break; }
+  }
+  if (!biz) {
+    const t = String((pg.rows.find((r) => r.path === 'index.html') || {}).content || '').match(/<title>([^<|·—-]{2,60})/);
+    biz = t ? t[1].trim() : domain;
+  }
+  const audit = aeoAudit(pg.rows, biz);
+  const robots = await fetch(`https://${domain}/robots.txt`).then((r) => (r.ok ? r.text() : '')).catch(() => '');
+  return c.json({ ok: true, domain, business: biz,
+    pages_read: pg.rows.filter((r) => /\.html?$/i.test(r.path)).length,
+    capped: !!pg.capped, score: audit.score, max: audit.max,
+    wins: audit.wins, fixes: audit.fixes, robots_txt: robots.slice(0, 4000),
+    note: 'Read-only. Nothing was written anywhere.' });
 });
 
 // Cross-client AEO roll-up — the view Tiffany demos from.
@@ -7064,6 +7127,22 @@ async function dailyUptime(env) {
     if (!up) st.fails = (st.fails || 0) + 1;
     st.last = up ? 'up' : 'down'; st.how = how; st.at = new Date().toISOString();
     await setSetting(db, key, JSON.stringify(st));
+    // 🤖 AEO journey — one number a day, so a client can see the line move.
+    // A score with no history is a claim; a score with a trend is evidence.
+    // Reads only; writes a settings key, never a site file.
+    try {
+      const slugA = await slugForClient(db, client.id, client);
+      const pgA = await aeoPages(env, settings, client, slugA);
+      if (pgA.rows.length) {
+        const a = aeoAudit(pgA.rows, client.business_name || '');
+        let ah = []; try { ah = JSON.parse(settings[`aeohist_${client.id}`] || '[]'); } catch {}
+        const today = new Date().toISOString().slice(0, 10);
+        const pct = Math.round(100 * a.score / a.max);
+        if (!ah.length || ah[ah.length - 1].d !== today) ah.push({ d: today, s: pct });
+        else ah[ah.length - 1].s = pct;
+        await setSetting(db, `aeohist_${client.id}`, JSON.stringify(ah.slice(-90)));
+      }
+    } catch { /* history is best-effort and must never break the daily pass */ }
     // score journey: record today's score so the portal can draw the climb
     try {
       const sc = await computeScore(db, client, settings, await slugForClient(db, client.id, client));
