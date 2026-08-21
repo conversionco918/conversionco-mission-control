@@ -9,11 +9,17 @@ const LAUNCH_LABELS = {
   citations: 'Place core citations (Yelp, Apple Maps, Bing, Healthgrades)', reviews5: 'Collect the first 5 Google reviews',
 };
 
-export async function computeScore(db, client, settings) {
-  // resolve slug
-  const metas = (await db.prepare(`SELECT slug, content FROM site_files WHERE path='site-meta.json'`).all()).results || [];
-  let slug = null;
-  for (const m of metas) { try { if (JSON.parse(m.content).client_id === client.id) { slug = m.slug; break; } } catch {} }
+export async function computeScore(db, client, settings, resolvedSlug) {
+  // The caller resolves the slug, because "which site is this client's" is not a
+  // question with an incidental answer: several slugs can name the same client
+  // (an old mirror, a template frozen from their site), and picking the first row
+  // returned scored a client's portal against the TEMPLATE. Kept as a fallback
+  // only so an old caller cannot crash.
+  let slug = resolvedSlug || null;
+  if (!slug) {
+    const metas = (await db.prepare(`SELECT slug, content FROM site_files WHERE path='site-meta.json'`).all()).results || [];
+    for (const m of metas) { try { if (JSON.parse(m.content).client_id === client.id) { slug = m.slug; break; } } catch {} }
+  }
   if (!slug) return null;
 
   const rows = (await db.prepare(

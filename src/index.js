@@ -792,7 +792,7 @@ app.get('/debug/:key', async (c) => {
       const rows = (await c.env.DB.prepare('SELECT * FROM clients').all()).results || [];
       const settings2 = await getSettings(c.env.DB);
       const out = {};
-      for (const cl of rows) { try { const sc = await computeScore(c.env.DB, cl, settings2); if (sc) out[cl.id] = sc; } catch {} }
+      for (const cl of rows) { try { const sc = await computeScore(c.env.DB, cl, settings2, await slugForClient(c.env.DB, cl.id, cl)); if (sc) out[cl.id] = sc; } catch {} }
       return out;
     })(),
     visits: await (async () => {
@@ -1800,10 +1800,38 @@ async function portalToken(env, kind, id) {
   const t = await hmac(env.SESSION_SECRET, `${kind}:${id}`);
   return t.replace(/[+/=]/g, '').slice(0, 16);
 }
-async function slugForClient(db, id) {
+// Which site belongs to this client.
+//
+// This used to return the FIRST row whose site-meta.json named the client, with
+// no ordering — and three slugs claim client 25: their real site, an old mirror,
+// and template-999-premium (which was frozen FROM their site and inherited the
+// id). So the answer depended on row order, and the client portal showed an SEO
+// score of 16 computed against the TEMPLATE while the dashboard showed 66 for
+// the real site. Same client, same minute, two different numbers.
+//
+// Everything downstream — scoring, publishing, launch checks, the AEO engine —
+// asks this question, so it has to be decided, not incidental.
+async function slugForClient(db, id, clientRow) {
   const metas = (await db.prepare(`SELECT slug, content FROM site_files WHERE path='site-meta.json'`).all()).results || [];
-  for (const m of metas) { try { if (JSON.parse(m.content).client_id === id) return m.slug; } catch {} }
-  return null;
+  const mine = [];
+  for (const m of metas) { try { if (JSON.parse(m.content).client_id === id) mine.push(String(m.slug)); } catch {} }
+  if (!mine.length) return null;
+  if (mine.length === 1) return mine[0];
+
+  const client = clientRow || await db.prepare('SELECT live_url, preview_url FROM clients WHERE id = ?').bind(id).first();
+  // 1. the slug their live domain is actually mapped to — the only unarguable answer
+  const settings = await getSettings(db);
+  let host = ''; try { host = new URL(client && client.live_url).hostname.toLowerCase(); } catch {}
+  const liveSlug = host ? (settings[`livehost_${host}`] || settings[`livehost_${host.replace(/^www\./, '')}`]) : '';
+  if (liveSlug && mine.includes(liveSlug)) return liveSlug;
+  // 2. the slug named in their preview url
+  const pm = String((client && client.preview_url) || '').match(/\/preview\/([^/]+)/);
+  if (pm && mine.includes(pm[1])) return pm[1];
+  // 3. never a template or a parked copy when a real one exists
+  const junk = /^(template-|lp-\d|zz-)|-v\d+$|-old$|-copy$|-backup$/i;
+  const real = mine.filter((s2) => !junk.test(s2));
+  if (real.length) return real.sort()[0];
+  return mine.sort()[0];
 }
 const PORTAL_STAGES = [
   ['intake1_sent', 'Getting to know you'], ['intake1_done', 'Blueprint received'],
@@ -1817,7 +1845,7 @@ app.get('/portal/:id/:token', async (c) => {
   const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
   if (!client) return c.text('not found', 404);
   const settings = await getSettings(db);
-  const score = await computeScore(db, client, settings);
+  const score = await computeScore(db, client, settings, await slugForClient(db, id, client));
   let up = null; try { up = JSON.parse(settings[`uptime_${id}`] || 'null'); } catch {}
   let billing = {}; try { billing = JSON.parse(client.billing || '{}'); } catch {}
   // APPROVAL GATE: while the preview is held (built but Tiffany hasn't approved),
@@ -3329,7 +3357,7 @@ app.get('/portfolio.json', async (c) => {
     // approval gate: held previews stay out of the public portfolio too
     let bP = {}; try { bP = JSON.parse(cl.billing || '{}'); } catch {}
     if (cl.stage === 'preview_ready' && bP.preview_hold && !bP.preview_approved) continue;
-    const score = await computeScore(db, cl, settings).catch(() => null);
+    const score = await computeScore(db, cl, settings, await slugForClient(db, cl.id, cl)).catch(() => null);
     let up = null; try { up = JSON.parse(settings[`uptime_${cl.id}`] || 'null'); } catch {}
     out.push({ business: cl.business_name || cl.name, url: cl.live_url || cl.preview_url,
       tier: cl.tier || 'standard', score: score?.total ?? null, pages: score?.pages?.total ?? null,
@@ -7038,7 +7066,7 @@ async function dailyUptime(env) {
     await setSetting(db, key, JSON.stringify(st));
     // score journey: record today's score so the portal can draw the climb
     try {
-      const sc = await computeScore(db, client, settings);
+      const sc = await computeScore(db, client, settings, await slugForClient(db, client.id, client));
       if (sc) {
         let hist = []; try { hist = JSON.parse(settings[`scorehist_${client.id}`] || '[]'); } catch {}
         const today = new Date().toISOString().slice(0, 10);
