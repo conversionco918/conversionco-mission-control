@@ -4500,15 +4500,52 @@ app.post('/api/clients/:id/aeo-fix', async (c) => {
   let hours = []; try { hours = JSON.parse(client.hours || '[]'); } catch {}
 
   const rows = (await db.prepare(`SELECT path, content, updated_at FROM site_files WHERE slug = ? AND path LIKE '%.html'`).bind(slug).all()).results || [];
-  let done = 0, skipped = 0;
+  const bizId = `https://${domain}/#business`;
+
+  // ⚠️ THE TRAP THIS FUNCTION FELL INTO ONCE.
+  // Injecting a business node when the page ALREADY has one produces two
+  // business entities on the same page — and if the original has no @id, a
+  // parser has no way to know they are the same company. That is precisely the
+  // confusion this whole feature exists to remove, so the injector was briefly
+  // making entity resolution WORSE, not better.
+  //
+  // The fix is not to skip the injection — it is to give the page's existing
+  // business node the same @id. JSON-LD merges nodes that share an @id, so the
+  // two become one entity carrying the union of both sets of facts.
+  // This is the one place we touch existing markup, and it only ever ADDS an
+  // @id to a block that already parsed cleanly. Anything that fails to parse is
+  // left exactly as it is.
+  const stampId = (html) => {
+    let out = html;
+    for (const m of html.matchAll(/(<script[^>]+application\/ld\+json[^>]*>)([\s\S]*?)(<\/script>)/gi)) {
+      const [full, open, payload, close] = m;
+      if (/id=["']cc-entity["']/i.test(open)) continue;           // our own block
+      let j; try { j = JSON.parse(payload); } catch { continue; } // unparseable: leave alone
+      let changed = false;
+      const visit = (n) => {
+        if (!n || typeof n !== 'object') return;
+        if (Array.isArray(n)) return n.forEach(visit);
+        const t = [].concat(n['@type'] || []).join(' ');
+        if (/Business|Organization|Clinic|Physician/i.test(t) && !n['@id']) { n['@id'] = bizId; changed = true; }
+        for (const v of Object.values(n)) if (v && typeof v === 'object') visit(v);
+      };
+      visit(Array.isArray(j) ? j : [j, ...(j['@graph'] || [])]);
+      if (changed) out = out.replace(full, open + JSON.stringify(j) + close);
+    }
+    return out;
+  };
+
+  let done = 0, skipped = 0, stamped = 0;
   for (const r of rows) {
-    const html = String(r.content || '');
+    let html = String(r.content || '');
     if (!/<\/head>/i.test(html)) { skipped++; continue; }
+    const merged = stampId(html);
+    if (merged !== html) { html = merged; stamped++; }
     const graph = buildEntityGraph(client, domain, profiles, hours, String(r.path), html, String(r.updated_at || ''));
     const tag = `<script type="application/ld+json" id="${CC_ENTITY_TAG}">${JSON.stringify(graph)}</script>`;
     const existing = new RegExp(`<script[^>]+id=["']${CC_ENTITY_TAG}["'][^>]*>[\\s\\S]*?<\\/script>\\s*`, 'i');
     const next = existing.test(html) ? html.replace(existing, tag) : html.replace(/<\/head>/i, `${tag}</head>`);
-    if (next === html) { skipped++; continue; }
+    if (next === String(r.content || '')) { skipped++; continue; }
     await db.prepare(`UPDATE site_files SET content = ?, updated_at = datetime('now') WHERE slug = ? AND path = ?`)
       .bind(next, slug, r.path).run();
     done++;
@@ -4548,7 +4585,7 @@ app.post('/api/clients/:id/aeo-fix', async (c) => {
   }
   const sameAsCount = Object.values(profiles).filter((v) => /^https?:\/\//i.test(String(v || ''))).length;
   await logEvent(db, id, 'aeo_fix', `🤖 Entity graph written to ${done} page(s) — ${sameAsCount} off-site profile(s) linked${hours.length ? ', opening hours published' : ''}${canonicals ? `, ${canonicals} duplicate page(s) pointed at the real address` : ''}`);
-  return c.json({ ok: true, pages: done, skipped, same_as: sameAsCount, hours: hours.length, canonicals,
+  return c.json({ ok: true, pages: done, skipped, stamped, same_as: sameAsCount, hours: hours.length, canonicals,
     note: 'Live on the served copy now. Publish the site to put it in the repo permanently.' });
 });
 
