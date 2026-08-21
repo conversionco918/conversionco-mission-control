@@ -208,14 +208,13 @@ app.use('*', async (c, next) => {
     }
   } catch { /* counting must never break serving */ }
   const body = row.is_base64 ? Uint8Array.from(atob(row.content), (ch) => ch.charCodeAt(0)) : row.content;
-  // A preview is a COMPLETE SECOND COPY of the client's website on a domain we
-  // own. A canonical tag is only a hint, and AI crawlers honour it inconsistently
-  // — so the copy has to refuse indexing outright, or a client can end up cited
-  // at a workers.dev URL that looks like nothing to a customer.
+  // ⛔ NEVER send X-Robots-Tag from THIS handler. This is the client's real
+  // website on their real domain. A noindex here deindexes a paying client's
+  // entire site — it was added here once by mistake, aimed at the preview route,
+  // and shipped. The preview route is the one below at /preview/:slug/*.
   return new Response(body, { headers: {
     'Content-Type': row.content_type,
     'Cache-Control': 'public, max-age=300',
-    'X-Robots-Tag': 'noindex, nofollow, noarchive',
   } });
 });
 
@@ -605,7 +604,15 @@ app.get('/preview/:slug/*', async (c) => {
     }
   } catch { /* counting must never break serving */ }
   const body = row.is_base64 ? Uint8Array.from(atob(row.content), (ch) => ch.charCodeAt(0)) : row.content;
-  return new Response(body, { headers: { 'Content-Type': row.content_type, 'Cache-Control': 'no-cache' } });
+  // A preview is a COMPLETE SECOND COPY of a client's website on a domain we
+  // own. A canonical tag is only a hint and AI crawlers honour it inconsistently,
+  // so the copy refuses indexing outright — otherwise a client can end up cited
+  // at a workers.dev address that means nothing to their customers.
+  return new Response(body, { headers: {
+    'Content-Type': row.content_type,
+    'Cache-Control': 'no-cache',
+    'X-Robots-Tag': 'noindex, nofollow, noarchive',
+  } });
 });
 
 // Keyed: wipe visit counts for a slug (test pollution cleanup) — true data only
