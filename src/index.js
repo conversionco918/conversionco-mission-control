@@ -4219,8 +4219,14 @@ function aeoAudit(rows, biz) {
   else fixes.push({ pts: 10, what: 'Home page has little readable text in the raw HTML', why: 'AI crawlers do not run JavaScript. Whatever is not in the HTML does not exist to them.' });
 
   // ── entity consistency (10) — one name, one number, everywhere
-  const phones = new Set((all.match(/(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g) || [])
-    .map((p) => p.replace(/\D/g, '').replace(/^1/, '')));
+  // Only trust the two places a phone number is unambiguous: a tel: link and the
+  // schema telephone field. A loose digit regex over the whole page also matches
+  // Google Maps CIDs, licence numbers and prices — it reported a phantom "second
+  // phone number" on a site that only ever had one.
+  const phones = new Set();
+  for (const m of all.matchAll(/href=["']tel:\+?1?([0-9][0-9\-.() ]{8,})["']/gi)) phones.add(m[1].replace(/\D/g, '').replace(/^1/, ''));
+  for (const m of all.matchAll(/"telephone"\s*:\s*"\+?1?([^"]+)"/gi)) phones.add(m[1].replace(/\D/g, '').replace(/^1/, ''));
+  phones.delete('');
   const nameHits = biz ? htmls.filter(([, c]) => c.toLowerCase().includes(String(biz).toLowerCase())).length : 0;
   if (phones.size === 1 && (!biz || nameHits >= htmls.length * 0.8)) { score += 10; wins.push('Business name and phone number are identical on every page'); }
   else {
@@ -4278,7 +4284,9 @@ app.get('/api/clients/:id/aeo', async (c) => {
   const fileRows = slug ? ((await db.prepare(
     `SELECT path, content FROM site_files WHERE slug = ? AND (path LIKE '%.html' OR path = 'llms.txt')`
   ).bind(slug).all()).results || []) : [];
-  const audit = aeoAudit(fileRows, client.business_name || client.name || '');
+  // business_name only — falling back to the contact's first name would check
+  // every page for "Tiffany" and report a nonsense finding.
+  const audit = aeoAudit(fileRows, client.business_name || '');
 
   // the browser fetches robots.txt for us — Cloudflare's managed block is injected
   // at the edge and is not in the stored file, and we cannot fetch our own domain
@@ -4303,7 +4311,7 @@ app.post('/api/clients/:id/llms-txt', async (c) => {
   const slug = await slugForClient(db, id);
   if (!slug) return c.json({ error: 'no built site for this client yet' }, 400);
   let domain = ''; try { domain = new URL(client.live_url).hostname.replace(/^www\./, ''); } catch {}
-  const biz = client.business_name || client.name || '';
+  const biz = client.business_name || client.name || '';  // llms.txt still needs a label
 
   const rows = (await db.prepare(`SELECT path, content FROM site_files WHERE slug = ? AND path LIKE '%.html'`).bind(slug).all()).results || [];
   const titleOf = (h) => ((h.match(/<title>([^<]*)<\/title>/i) || [])[1] || '').replace(/\s*[|·—-]\s*[^|·—-]*$/, '').trim();
@@ -4378,7 +4386,7 @@ app.get('/api/aeo-overview', async (c) => {
     const fileRows = (await db.prepare(
       `SELECT path, content FROM site_files WHERE slug = ? AND (path LIKE '%.html' OR path = 'llms.txt')`
     ).bind(slug).all()).results || [];
-    const a = aeoAudit(fileRows, cl.business_name || cl.name || '');
+    const a = aeoAudit(fileRows, cl.business_name || '');
     let domain = ''; try { domain = new URL(cl.live_url).hostname.replace(/^www\./, ''); } catch {}
     out.push({ id: cl.id, name: cl.business_name || cl.name || cl.email, domain, slug, traffic: t, content_score: a.score, content_max: a.max, top_fix: a.fixes[0] || null });
   }
