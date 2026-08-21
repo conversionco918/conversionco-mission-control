@@ -212,9 +212,16 @@ app.use('*', async (c, next) => {
   // website on their real domain. A noindex here deindexes a paying client's
   // entire site — it was added here once by mistake, aimed at the preview route,
   // and shipped. The preview route is the one below at /preview/:slug/*.
+  // The dashboard reads robots.txt from the client's real domain to score which
+  // answer engines can see them. That is a cross-origin read, so it needs an
+  // explicit allow — without it the browser blocks it and the check cannot run.
+  // (Cloudflare may still serve its own managed robots.txt ahead of this, which
+  // is why the caller must treat a failed read as UNKNOWN, never as a zero.)
+  const extra = /robots\.txt$/i.test(path) ? { 'Access-Control-Allow-Origin': '*' } : {};
   return new Response(body, { headers: {
     'Content-Type': row.content_type,
     'Cache-Control': 'public, max-age=300',
+    ...extra,
   } });
 });
 
