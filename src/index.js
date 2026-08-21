@@ -4782,7 +4782,11 @@ async function aeoQuestions(env, client) {
     };
     walk(j);
   }
-  const cities = rows.map((r) => String(r.path)).filter((p) => /^(iv-therapy-|city-|location|serving)/i.test(p))
+  // "locations.html" is a page listing the cities, not a city. Matching a bare
+  // "location" prefix turned it into the question "mobile IV therapy in Locations".
+  const NOT_A_CITY = /^(locations?|service-areas?|areas?|serving|cities)\.html$/i;
+  const cities = rows.map((r) => String(r.path))
+    .filter((p) => /^(iv-therapy-|city-|location-|serving-|area-)/i.test(p) && !NOT_A_CITY.test(p))
     .map((p) => p.replace(/^(iv-therapy-|city-)/i, '').replace(/\.html$/i, '').split('-').map((w) => w[0].toUpperCase() + w.slice(1)).join(' '))
     .map((name) => ({ name, n: (allText.match(new RegExp('\\b' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'gi')) || []).length }))
     .sort((a, b) => b.n - a.n)
