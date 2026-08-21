@@ -4506,9 +4506,42 @@ app.post('/api/clients/:id/aeo-fix', async (c) => {
       .bind(next, slug, r.path).run();
     done++;
   }
+  // Two addresses serving the same page split the credit. Point the twin that
+  // nothing links to at the one that does — a canonical, not a deletion, so
+  // nothing 404s and any existing link still works.
+  let canonicals = 0;
+  const byTitle = new Map();
+  for (const r of rows) {
+    const t = ((String(r.content).match(/<title>([^<]*)<\/title>/i) || [])[1] || '').trim().toLowerCase();
+    if (!t || /^404/i.test(String(r.path))) continue;
+    if (!byTitle.has(t)) byTitle.set(t, []);
+    byTitle.get(t).push(String(r.path));
+  }
+  const allHtml2 = rows.map((r) => String(r.content || '')).join('\n');
+  const inbound2 = {};
+  for (const m of allHtml2.matchAll(/href=["']([^"'#?]+\.html)["']/gi)) {
+    const f = m[1].split('/').pop(); inbound2[f] = (inbound2[f] || 0) + 1;
+  }
+  for (const paths of byTitle.values()) {
+    if (paths.length < 2) continue;
+    const winner = paths.slice().sort((a, b) => (inbound2[b] || 0) - (inbound2[a] || 0) || a.localeCompare(b))[0];
+    const target = `https://${domain}/${winner === 'index.html' ? '' : winner}`;
+    for (const p of paths) {
+      if (p === winner) continue;
+      const row = await db.prepare('SELECT content FROM site_files WHERE slug = ? AND path = ?').bind(slug, p).first();
+      if (!row) continue;
+      const html2 = String(row.content);
+      const link = `<link rel="canonical" href="${target}">`;
+      const has = /<link[^>]+rel=["']canonical["'][^>]*>/i;
+      const out = has.test(html2) ? html2.replace(has, link) : html2.replace(/<\/head>/i, `${link}</head>`);
+      if (out === html2) continue;
+      await db.prepare(`UPDATE site_files SET content = ?, updated_at = datetime('now') WHERE slug = ? AND path = ?`).bind(out, slug, p).run();
+      canonicals++;
+    }
+  }
   const sameAsCount = Object.values(profiles).filter((v) => /^https?:\/\//i.test(String(v || ''))).length;
-  await logEvent(db, id, 'aeo_fix', `🤖 Entity graph written to ${done} page(s) — ${sameAsCount} off-site profile(s) linked${hours.length ? ', opening hours published' : ''}`);
-  return c.json({ ok: true, pages: done, skipped, same_as: sameAsCount, hours: hours.length,
+  await logEvent(db, id, 'aeo_fix', `🤖 Entity graph written to ${done} page(s) — ${sameAsCount} off-site profile(s) linked${hours.length ? ', opening hours published' : ''}${canonicals ? `, ${canonicals} duplicate page(s) pointed at the real address` : ''}`);
+  return c.json({ ok: true, pages: done, skipped, same_as: sameAsCount, hours: hours.length, canonicals,
     note: 'Live on the served copy now. Publish the site to put it in the repo permanently.' });
 });
 
@@ -4528,10 +4561,18 @@ app.post('/api/clients/:id/sitemap-rebuild', async (c) => {
 
   const rows = (await db.prepare(`SELECT path, content, updated_at FROM site_files WHERE slug = ? AND path LIKE '%.html'`).bind(slug).all()).results || [];
   const SKIP = /^(404|thanks?|thank-you)\b/i;
-  // A page whose <title> already appeared keeps only its first address — listing
-  // both halves of a duplicate pair in the sitemap actively asks for the split.
+  // When a page exists at two addresses, keep the one the SITE ITSELF links to.
+  // Sorting alphabetically picked legal-terms.html over terms.html on Anywhere —
+  // and terms.html was the one in all 42 footers. The sitemap would have pointed
+  // at the address nothing links to, which is the wrong half of the pair.
+  const allHtml = rows.map((r) => String(r.content || '')).join('\n');
+  const inbound = {};
+  for (const m of allHtml.matchAll(/href=["']([^"'#?]+\.html)["']/gi)) {
+    const f = m[1].split('/').pop(); inbound[f] = (inbound[f] || 0) + 1;
+  }
+  const rank = (p) => -(inbound[p] || 0);
   const seenTitle = new Set(), pages = [], dropped = [];
-  for (const r of rows.slice().sort((a, b) => String(a.path).localeCompare(String(b.path)))) {
+  for (const r of rows.slice().sort((a, b) => rank(String(a.path)) - rank(String(b.path)) || String(a.path).localeCompare(String(b.path)))) {
     const p = String(r.path);
     if (SKIP.test(p)) { dropped.push(`${p} (not a content page)`); continue; }
     const t = ((String(r.content).match(/<title>([^<]*)<\/title>/i) || [])[1] || '').trim().toLowerCase();
@@ -4541,6 +4582,8 @@ app.post('/api/clients/:id/sitemap-rebuild', async (c) => {
   }
   const before = rows.length;
   const loc = (p) => `https://${domain}/${p === 'index.html' ? '' : p}`;
+  // selection order was by inbound links; the file itself reads better in page order
+  pages.sort((a, b) => (a.path === 'index.html' ? -1 : b.path === 'index.html' ? 1 : a.path.localeCompare(b.path)));
   const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n`
     + pages.map((p) => `  <url><loc>${loc(p.path)}</loc>${p.at ? `<lastmod>${p.at}</lastmod>` : ''}</url>`).join('\n')
     + `\n</urlset>\n`;
