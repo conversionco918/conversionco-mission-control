@@ -4316,15 +4316,27 @@ app.post('/api/clients/:id/llms-txt', async (c) => {
   const rows = (await db.prepare(`SELECT path, content FROM site_files WHERE slug = ? AND path LIKE '%.html'`).bind(slug).all()).results || [];
   const titleOf = (h) => ((h.match(/<title>([^<]*)<\/title>/i) || [])[1] || '').replace(/\s*[|·—-]\s*[^|·—-]*$/, '').trim();
   const descOf = (h) => ((h.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)/i) || [])[1] || '').trim();
-  const pages = rows.map((r) => ({ path: r.path, title: titleOf(r.content), desc: descOf(r.content) }))
-    .filter((p) => p.title && !/^404/.test(p.title));
+  // Decode the handful of entities that show up in <title>/description — an
+  // answer engine quoting "IV Menu &amp; Prices" back at a customer looks broken.
+  const dec = (t) => String(t).replace(/&amp;/g, '&').replace(/&#0?39;|&apos;/g, "'")
+    .replace(/&quot;/g, '"').replace(/&nbsp;/g, ' ').replace(/&mdash;/g, '—').replace(/&ndash;/g, '–')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+  // Exclude by PATH, not by title — the 404 page is titled "Page Not Found" and
+  // was being advertised to answer engines as a service.
+  const SKIP = /^(404|privacy|legal-terms|review-us|thanks?|thank-you)\b/i;
+  const pages = rows.map((r) => ({ path: r.path, title: dec(titleOf(r.content)), desc: dec(descOf(r.content)) }))
+    .filter((p) => p.title && !SKIP.test(p.path));
   const idx = rows.find((r) => r.path === 'index.html');
   const tagline = idx ? descOf(idx.content) : '';
   const phone = (rows.map((r) => (r.content.match(/tel:\+?1?(\d{10})/i) || [])[1]).find(Boolean) || '');
   const fmtPhone = phone ? `(${phone.slice(0, 3)}) ${phone.slice(3, 6)}-${phone.slice(6)}` : '';
 
-  const svc = pages.filter((p) => !/^(index|about|faq|blog|privacy|legal|review|safety|locations|membership)/i.test(p.path) && !/^blog-/i.test(p.path));
+  // Sections must be mutually exclusive — city pages were appearing under both
+  // "Services" and "Areas served", which reads as a site padding its own list.
   const loc = pages.filter((p) => /^(iv-therapy-|city-)/i.test(p.path));
+  const locSet = new Set(loc.map((p) => p.path));
+  const svc = pages.filter((p) => !locSet.has(p.path)
+    && !/^(index|about|faq|blog|safety|locations|membership)/i.test(p.path) && !/^blog-/i.test(p.path));
   const L = [];
   L.push(`# ${biz}`, '');
   if (tagline) L.push(`> ${tagline}`, '');
