@@ -5200,16 +5200,22 @@ app.get('/api/aeo-overview', async (c) => {
   const clients = (await db.prepare(`SELECT * FROM clients WHERE stage != 'archived' AND (live_url != '' OR preview_url != '')`).all()).results || [];
   const out = [];
   for (const cl of clients) {
-    const slug = await slugForClient(db, cl.id);
-    if (!slug) continue;
-    const rows = (await db.prepare(
+    // Do NOT skip a client just because we did not build their site. The audit
+    // can fetch a live domain now, and skipping meant a paying client whose site
+    // we inherited simply vanished from the roll-up.
+    const slug = await slugForClient(db, cl.id, cl);
+    if (!slug && !cl.live_url) continue;
+    const rows = slug ? ((await db.prepare(
       `SELECT kind, SUM(n) AS n FROM ai_visits WHERE slug = ? AND day > date('now', ?) GROUP BY kind`
-    ).bind(slug, `-${days} days`).all()).results || [];
+    ).bind(slug, `-${days} days`).all()).results || []) : [];
     const t = { answer: 0, referral: 0, train: 0 };
     for (const r of rows) if (t[r.kind] !== undefined) t[r.kind] = Number(r.n);
-    const a = aeoAudit((await aeoPages(c.env, settingsO, cl, slug)).rows, cl.business_name || '');
+    const pgO = await aeoPages(c.env, settingsO, cl, slug);
+    if (!pgO.rows.length) continue;   // nothing readable yet — a build in progress
+    const a = aeoAudit(pgO.rows, cl.business_name || '');
     let domain = ''; try { domain = new URL(cl.live_url).hostname.replace(/^www\./, ''); } catch {}
-    out.push({ id: cl.id, name: cl.business_name || cl.name || cl.email, domain, slug, traffic: t, content_score: a.score, content_max: a.max, top_fix: a.fixes[0] || null });
+    out.push({ id: cl.id, name: cl.business_name || cl.name || cl.email, domain, slug, source: pgO.source,
+      traffic: t, content_score: a.score, content_max: a.max, top_fix: a.fixes[0] || null });
   }
   out.sort((x, y) => (y.traffic.referral - x.traffic.referral) || (x.content_score - y.content_score));
   return c.json({ ok: true, days, clients: out });
