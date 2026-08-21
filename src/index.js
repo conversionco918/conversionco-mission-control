@@ -4233,7 +4233,7 @@ function aeoAudit(rows, biz, opts = {}) {
     { what: sameAs.length ? `Only ${sameAs.length} off-site profile linked — add Google Business Profile, Facebook, Yelp and the rest` : 'Link the off-site profiles (Google Business Profile, Facebook, Instagram, Yelp) via sameAs',
       why: 'sameAs is how an engine proves the Yelp listing, the Google listing and this website are the same company. It is also what makes every new listing you create count.' });
 
-  add(8, types.has('FAQPage'),
+  add(4, types.has('FAQPage'),
     'FAQ schema present — engines can lift Q&A directly',
     { what: 'Add FAQPage schema to the FAQ and service pages', why: 'FAQ schema is the most-quoted format in AI answers.' });
 
@@ -4255,26 +4255,27 @@ function aeoAudit(rows, biz, opts = {}) {
     if (t) { faqTotal++; const w = String(t).split(/\s+/).filter(Boolean).length; if (w >= 50 && w <= 150) faqLong++; }
   }
   const quotableTotal = quotable + faqLong;
-  add(12, quotableTotal >= Math.max(10, htmls.length * 0.3),
+  add(11, quotableTotal >= Math.max(10, htmls.length * 0.3),
     `${quotableTotal} self-contained 50–150 word passages an engine can quote`,
     { what: quotableTotal ? `Only ${quotableTotal} passages are in the 50–150 word range engines quote (of ${paras + faqTotal} checked)` : `Not one passage on the site is in the 50–150 word range engines quote (${paras + faqTotal} checked)`,
       why: 'Short punchy marketing copy converts humans and gives an engine nothing to lift. This does not mean changing the voice — it means adding one self-contained answer under each question.' });
 
   const qHeads = (all.match(/<h[23][^>]*>[^<]*\?/gi) || []).length + faqTotal;
-  add(8, qHeads >= 20,
+  add(7, qHeads >= 20,
     `${qHeads} questions answered on the site`,
     { what: qHeads >= 8 ? `Only ${qHeads} questions answered — aim for 20+ real customer questions` : 'Write content as real customer questions with a direct answer underneath',
       why: 'Engines match a user question to a question on the page, then quote what sits under it.' });
 
   // ══ MACHINE-READABLE FACTS — 10 ════════════════════════════════════════
-  const svcPages = htmls.filter(([p]) => !/^(index|about|faq|blog|privacy|legal|review|safety|locations|membership|404|sitemap)/i.test(p) && !/^(blog-|iv-therapy-|city-)/i.test(p));
+  const NON_SERVICE = /^(index|about|faq|blog|privacy|privacy-policy|legal|legal-terms|terms|review|review-us|safety|safety-standards|locations|membership|contact|thanks|thank-you|404|sitemap)\b/i;
+  const svcPages = htmls.filter(([p]) => !NON_SERVICE.test(p) && !/^(blog-|iv-therapy-|city-)/i.test(p));
   const noPrice = svcPages.filter(([, c]) => !/"offers"|"priceSpecification"/i.test(c)).map(([p]) => p);
-  add(5, svcPages.length > 0 && noPrice.length === 0,
+  add(4, svcPages.length > 0 && noPrice.length === 0,
     `All ${svcPages.length} service pages carry a machine-readable price`,
     { what: `${noPrice.length} service page(s) have no machine-readable price: ${noPrice.slice(0, 4).join(', ')}${noPrice.length > 4 ? ` (+${noPrice.length - 4})` : ''}`,
       why: 'A price an engine cannot read is a price it will not quote — and cost is the most common question asked about a service.' });
 
-  add(3, !!(bizNode && bizNode.openingHoursSpecification),
+  add(2, !!(bizNode && bizNode.openingHoursSpecification),
     'Opening hours are machine-readable',
     { what: 'Add opening hours to the business schema', why: '"Are they open now" and "can someone come tonight" are among the most asked questions about a local service, and the answer is currently not readable anywhere.' });
 
@@ -4283,14 +4284,46 @@ function aeoAudit(rows, biz, opts = {}) {
     'Pages declare when they were last updated',
     { what: `Only ${dm} of ${htmls.length} pages declare a last-updated date`, why: 'Freshness is a real input, and right now most of the site declares none.' });
 
+  // ══ DISCOVERABILITY — 10 ══════════════════════════════════════════════
+  // A page nothing links to and no sitemap lists is invisible, however good it
+  // is. On Anywhere this was hiding a whole published blog post and six service
+  // landing pages — pages that had been paid for and written and could not be
+  // found by anything.
+  const sitemap = have.get('sitemap.xml') || '';
+  const listed = new Set([...sitemap.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/gi)]
+    .map((m) => (m[1].replace(/\/$/, '').split('/').pop() || 'index.html')));
+  const IGNORE = /^(404|sitemap)/i;
+  const linkTargets = new Set([...all.matchAll(/href=["']([^"'#?]+\.html)["']/gi)].map((m) => m[1].split('/').pop()));
+  const orphans = htmls.map(([p]) => p).filter((p) => !IGNORE.test(p)
+    && !listed.has(p) && !listed.has(p.replace(/index\.html$/, '')) && !linkTargets.has(p));
+  add(6, sitemap && orphans.length === 0,
+    sitemap ? 'Every page is reachable — listed in the sitemap or linked from the site' : 'sitemap present',
+    { what: sitemap ? `${orphans.length} page(s) are invisible — not in the sitemap and not linked from anywhere: ${orphans.slice(0, 5).join(', ')}${orphans.length > 5 ? ` (+${orphans.length - 5})` : ''}` : 'No sitemap.xml — nothing can discover the pages systematically',
+      why: 'Crawlers find pages through links and the sitemap. A page in neither has been written and paid for and cannot be found by anything.' });
+
+  // Two URLs serving the same page split the credit and leave an engine unsure
+  // which one is the real address.
+  const sig = new Map();
+  for (const [p, c] of htmls) {
+    const t = ((c.match(/<title>([^<]*)<\/title>/i) || [])[1] || '').trim().toLowerCase();
+    if (!t || IGNORE.test(p)) continue;
+    if (!sig.has(t)) sig.set(t, []);
+    sig.get(t).push(p);
+  }
+  const dupes = [...sig.values()].filter((v) => v.length > 1);
+  add(4, dupes.length === 0,
+    'No duplicate pages — every page lives at exactly one address',
+    { what: `${dupes.length} page(s) exist at two addresses: ${dupes.slice(0, 3).map((v) => v.join(' = ')).join('; ')}`,
+      why: 'The same page at two URLs splits its credit and leaves an engine unsure which is the real address. Pick one and redirect the other.' });
+
   // ══ HYGIENE — 10 ═══════════════════════════════════════════════════════
-  add(4, have.has('llms.txt') && (have.get('llms.txt') || '').length > 200,
+  add(3, have.has('llms.txt') && (have.get('llms.txt') || '').length > 200,
     'llms.txt present — the site explains itself to models in plain language',
     { what: 'Publish an llms.txt', why: 'A plain-text brief of the business, services and area that models read directly. One click to generate.' });
 
   const idx = have.get('index.html') || '';
   const text = idx.replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-  add(3, text.length > 1200,
+  add(2, text.length > 1200,
     'Home page content lives in the HTML, not in JavaScript',
     { what: 'Home page has little readable text in the raw HTML', why: 'AI crawlers do not run JavaScript. Whatever is not in the HTML does not exist to them.' });
 
@@ -4353,7 +4386,7 @@ app.get('/api/clients/:id/aeo', async (c) => {
 
   // ── 3. readiness — content side here, crawler access from the browser
   const fileRows = slug ? ((await db.prepare(
-    `SELECT path, content FROM site_files WHERE slug = ? AND (path LIKE '%.html' OR path = 'llms.txt')`
+    `SELECT path, content FROM site_files WHERE slug = ? AND (path LIKE '%.html' OR path IN ('llms.txt','sitemap.xml'))`
   ).bind(slug).all()).results || []) : [];
   // business_name only — falling back to the contact's first name would check
   // every page for "Tiffany" and report a nonsense finding.
@@ -4479,6 +4512,48 @@ app.post('/api/clients/:id/aeo-fix', async (c) => {
     note: 'Live on the served copy now. Publish the site to put it in the repo permanently.' });
 });
 
+// Rebuild sitemap.xml from the pages that actually exist. The old one was
+// hand-maintained, so it drifted: the blog engine published a post nobody
+// listed, six service landing pages were never added, and two legal pages
+// existed at two URLs each. Generated from the served files, it cannot drift.
+app.post('/api/clients/:id/sitemap-rebuild', async (c) => {
+  const id = Number(c.req.param('id'));
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  const slug = await slugForClient(db, id);
+  if (!slug) return c.json({ error: 'no built site for this client yet' }, 400);
+  let domain = ''; try { domain = new URL(client.live_url).hostname.replace(/^www\./, ''); } catch {}
+  if (!domain) return c.json({ error: 'no live domain yet — a sitemap has to point at the real address' }, 400);
+
+  const rows = (await db.prepare(`SELECT path, content, updated_at FROM site_files WHERE slug = ? AND path LIKE '%.html'`).bind(slug).all()).results || [];
+  const SKIP = /^(404|thanks?|thank-you)\b/i;
+  // A page whose <title> already appeared keeps only its first address — listing
+  // both halves of a duplicate pair in the sitemap actively asks for the split.
+  const seenTitle = new Set(), pages = [], dropped = [];
+  for (const r of rows.slice().sort((a, b) => String(a.path).localeCompare(String(b.path)))) {
+    const p = String(r.path);
+    if (SKIP.test(p)) { dropped.push(`${p} (not a content page)`); continue; }
+    const t = ((String(r.content).match(/<title>([^<]*)<\/title>/i) || [])[1] || '').trim().toLowerCase();
+    if (t && seenTitle.has(t)) { dropped.push(`${p} (duplicate of an existing page)`); continue; }
+    if (t) seenTitle.add(t);
+    pages.push({ path: p, at: String(r.updated_at || '').slice(0, 10) });
+  }
+  const before = rows.length;
+  const loc = (p) => `https://${domain}/${p === 'index.html' ? '' : p}`;
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n`
+    + pages.map((p) => `  <url><loc>${loc(p.path)}</loc>${p.at ? `<lastmod>${p.at}</lastmod>` : ''}</url>`).join('\n')
+    + `\n</urlset>\n`;
+  await db.prepare(
+    `INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
+     VALUES (?, 'sitemap.xml', ?, 'application/xml; charset=utf-8', 0, datetime('now'))
+     ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, content_type=excluded.content_type, updated_at=datetime('now')`
+  ).bind(slug, xml).run();
+  await logEvent(db, id, 'sitemap_rebuilt', `🗺 Sitemap rebuilt for ${domain} — ${pages.length} pages listed${dropped.length ? `, ${dropped.length} excluded` : ''}`);
+  return c.json({ ok: true, listed: pages.length, scanned: before, dropped, url: `https://${domain}/sitemap.xml`,
+    note: 'Live on the served copy now. Publish the site to put it in the repo permanently.' });
+});
+
 // Profiles + hours — the inputs the entity graph is built from.
 app.post('/api/clients/:id/aeo-profile', async (c) => {
   const id = Number(c.req.param('id'));
@@ -4594,7 +4669,7 @@ app.get('/api/aeo-overview', async (c) => {
     const t = { answer: 0, referral: 0, train: 0 };
     for (const r of rows) if (t[r.kind] !== undefined) t[r.kind] = Number(r.n);
     const fileRows = (await db.prepare(
-      `SELECT path, content FROM site_files WHERE slug = ? AND (path LIKE '%.html' OR path = 'llms.txt')`
+      `SELECT path, content FROM site_files WHERE slug = ? AND (path LIKE '%.html' OR path IN ('llms.txt','sitemap.xml'))`
     ).bind(slug).all()).results || [];
     const a = aeoAudit(fileRows, cl.business_name || '');
     let domain = ''; try { domain = new URL(cl.live_url).hostname.replace(/^www\./, ''); } catch {}

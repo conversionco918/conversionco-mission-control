@@ -711,6 +711,7 @@ function aeoProfileForm(r) {
     <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;">
       <button class="btn btn-green" onclick="aeoSaveFix(${r.client_id}, this)" title="Saves these details, then writes the entity graph into every page of the site.">🔗 Save &amp; fix schema</button>
       <button class="btn btn-ghost" onclick="aeoLlms(${r.client_id}, this)">📄 Generate llms.txt</button>
+      <button class="btn btn-ghost" onclick="aeoSitemap(${r.client_id}, this)" title="Rebuilds sitemap.xml from the pages that actually exist, dropping duplicates.">🗺 Rebuild sitemap</button>
     </div>
     <div id="aeoFixOut" style="margin-top:8px;font-size:11.5px;"></div>
     <div id="aeoLlmsOut" style="margin-top:8px;font-size:11.5px;color:#475569;"></div>
@@ -735,6 +736,17 @@ async function aeoSaveFix(id, btn) {
   if (fix.error) { if (out) out.innerHTML = `<span style="color:#b91c1c;">${esc(fix.error)}</span>`; return; }
   if (out) out.innerHTML = `<span style="color:#065f46;font-weight:600;">✅ Entity graph written to ${fix.pages} page(s) — ${fix.same_as} profile(s) linked${fix.hours?', hours published':''}.</span> <span style="color:#94a3b8;">Live on the served copy now.</span>`;
   toast(`✅ Schema fixed on ${fix.pages} pages`);
+  setTimeout(() => aeoView(id, null), 900);
+}
+async function aeoSitemap(id, btn) {
+  btn.disabled = true; btn.textContent = 'Rebuilding…';
+  const r = await api(`/api/clients/${id}/sitemap-rebuild`, { method:'POST', body:'{}' });
+  btn.disabled = false; btn.textContent = '🗺 Rebuild sitemap';
+  const out = document.getElementById('aeoFixOut');
+  if (r.error) { if (out) out.innerHTML = `<span style="color:#b91c1c;">${esc(r.error)}</span>`; return; }
+  if (out) out.innerHTML = `<span style="color:#065f46;font-weight:600;">🗺 Sitemap rebuilt — ${r.listed} pages listed.</span>`
+    + (r.dropped && r.dropped.length ? `<br><span style="color:#94a3b8;">Left out: ${esc(r.dropped.join(' · '))}</span>` : '');
+  toast(`🗺 Sitemap rebuilt — ${r.listed} pages`);
   setTimeout(() => aeoView(id, null), 900);
 }
 async function aeoLlms(id, btn) {
