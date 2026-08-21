@@ -4815,6 +4815,22 @@ async function aeoQuestions(env, client) {
   return { questions: qs.slice(0, 14), engines: AEO_ENGINES, cities, what, biz };
 }
 
+// Undo for the spot-check grid. A mis-clicked cell would otherwise be permanent,
+// and a wrong observation sitting in a client's history is worse than a blank.
+app.post('/api/clients/:id/aeo-check-clear', async (c) => {
+  const id = Number(c.req.param('id'));
+  let f = {}; try { f = await c.req.json(); } catch {}
+  if (f.all) {
+    const r = await c.env.DB.prepare('DELETE FROM ai_checks WHERE client_id = ?').bind(id).run();
+    return c.json({ ok: true, cleared: (r.meta && r.meta.changes) || 0 });
+  }
+  const engine = String(f.engine || ''), question = String(f.question || '');
+  if (!engine || !question) return c.json({ error: 'engine + question required, or all:true' }, 400);
+  const r = await c.env.DB.prepare('DELETE FROM ai_checks WHERE client_id = ? AND engine = ? AND question = ?')
+    .bind(id, engine, question).run();
+  return c.json({ ok: true, cleared: (r.meta && r.meta.changes) || 0 });
+});
+
 // ══ CLIENT-FACING: "Why AI matters" ═══════════════════════════════════════
 // Everything on this page is measured. There is no citation-ranking section,
 // because truthfully reporting that needs paid API access to each engine and we
