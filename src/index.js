@@ -4762,10 +4762,26 @@ async function aeoQuestions(env, client) {
   // Rank by how often the site itself mentions each city, which is the site's own
   // statement of where its business is.
   const allText = rows.map((r) => String(r.content || '')).join(' ');
-  // Not every site names location pages the way ours do. Fall back to the city
-  // the site's own schema declares — without this, any client whose site we did
-  // not build got one useless question and nothing else.
-  const fromSchema = [...allText.matchAll(/"addressLocality"\s*:\s*"([^"]{2,40})"/gi)].map((m) => m[1].trim());
+  // Not every site names location pages the way ours do. Fall back to what the
+  // site's OWN schema says about where it operates — parsed properly, because a
+  // regex for addressLocality missed a site whose cities were all in areaServed
+  // and left that client with one useless question.
+  const fromSchema = [];
+  for (const m of allText.matchAll(/<script[^>]+application\/ld\+json[^>]*>([\s\S]*?)<\/script>/gi)) {
+    let j; try { j = JSON.parse(m[1]); } catch { continue; }
+    const walk = (n) => {
+      if (!n || typeof n !== 'object') return;
+      if (Array.isArray(n)) return n.forEach(walk);
+      const loc = n.address && n.address.addressLocality;
+      if (typeof loc === 'string') fromSchema.push(loc.trim());
+      for (const a of [].concat(n.areaServed || [])) {
+        if (typeof a === 'string') fromSchema.push(a.split(',')[0].trim());
+        else if (a && a.name) fromSchema.push(String(a.name).split(',')[0].trim());
+      }
+      for (const v of Object.values(n)) if (v && typeof v === 'object') walk(v);
+    };
+    walk(j);
+  }
   const cities = rows.map((r) => String(r.path)).filter((p) => /^(iv-therapy-|city-|location|serving)/i.test(p))
     .map((p) => p.replace(/^(iv-therapy-|city-)/i, '').replace(/\.html$/i, '').split('-').map((w) => w[0].toUpperCase() + w.slice(1)).join(' '))
     .map((name) => ({ name, n: (allText.match(new RegExp('\\b' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'gi')) || []).length }))
@@ -4835,6 +4851,9 @@ app.get('/portal-ai/:id/:token', async (c) => {
   const pgP = await aeoPages(c.env, settingsP, client, slug);
   const audit = aeoAudit(pgP.rows, client.business_name || '');
   const pct = Math.round(100 * audit.score / audit.max);
+  // No website to read yet. Showing a score here would be a made-up number about
+  // a site that does not exist — say so instead.
+  const noSite = pgP.rows.length === 0;
 
   const esc2 = (x) => String(x == null ? '' : x).replace(/[<>&"]/g, (m) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[m]));
   const engineRows = Object.entries(perEngine).sort((a, b) => b[1] - a[1]);
@@ -4904,6 +4923,7 @@ footer{margin-top:52px;border-top:1px solid var(--line);padding-top:20px;font-si
 
 <section>
   <h2>How ready your site is</h2>
+  ${noSite ? `<p class="empty">Your website is still being built, so there is nothing to measure yet. This section fills in the day it goes live.</p>` : `
   <div class="score">
     <div class="dial"><b>${pct}</b></div>
     <div><p style="margin:0;font-weight:600;color:${grade[0]};font-family:Archivo,sans-serif">${grade[1]}</p>
@@ -4913,7 +4933,7 @@ footer{margin-top:52px;border-top:1px solid var(--line);padding-top:20px;font-si
     <ul style="margin:0 0 0 20px;padding:0;font-size:15px;color:var(--good)">${audit.wins.map((w) => `<li style="margin-bottom:5px">${esc2(w)}</li>`).join('')}</ul>` : ''}
   ${audit.fixes.length ? `<p style="font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);font-family:Archivo,sans-serif;font-weight:600;margin:22px 0 6px">What we are working on next</p>
     <ol>${audit.fixes.map((f) => `<li><b>${esc2(f.what)}</b><br><span style="font-size:14.5px;color:var(--muted)">${esc2(f.why)}</span></li>`).join('')}</ol>`
-    : `<p style="color:var(--good);font-weight:600">Everything measurable on your website is done. The remaining work is off your site — being listed and mentioned in the places assistants read.</p>`}
+    : `<p style="color:var(--good);font-weight:600">Everything measurable on your website is done. The remaining work is off your site — being listed and mentioned in the places assistants read.</p>`}`}
 </section>
 
 <footer>
