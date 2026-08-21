@@ -721,8 +721,8 @@ function openDrawer(id) {
       ${(c.preview_url || c.live_url) && c.stage !== 'prospect' ? `<div style="background:${c.stage==='live'?'#f0fdf4':'#eff6ff'};border:1px solid ${c.stage==='live'?'#86efac':'#bfdbfe'};border-radius:10px;padding:14px;">
         <p style="font-size:12.5px;font-weight:700;color:${c.stage==='live'?'#065f46':'#1e40af'};margin-bottom:4px;">${c.stage === 'live' ? '🌐 This site is live' : '🚀 Ready to go live'}</p>
         <p style="font-size:11.5px;color:#475569;margin-bottom:10px;">${c.stage === 'live'
-          ? 'Re-check any time — it fetches the real domain and proves every page loads, no preview-only links survived, images load, and www redirects.'
-          : 'One button: points the domain at the finished site, turns on SSL, maps serving, enrolls Google Search Console — then audits the live domain and tells you if anything broke.'}</p>
+          ? 'Re-check any time. It proves the domain is mapped and attached in Cloudflare, that nothing the site serves still points at a preview-only link, that every image reference resolves — then loads real images off the live domain from this browser.'
+          : 'One button: points the domain at the finished site, turns on SSL, maps serving, enrolls Google Search Console — then audits the launch and tells you plainly if anything broke.'}</p>
         ${c.stage === 'live'
           ? `<button class="btn btn-ghost" onclick="launchCheck(${c.id}, '', this, '🔎 Re-check the live site')">🔎 Re-check the live site</button>
              <button class="btn btn-ghost" onclick="goLive(${c.id}, this)" title="Point a different domain at this site.">🌐 Change domain</button>`

@@ -4041,6 +4041,15 @@ app.get('/api/clients/:id/launch-check', async (c) => {
   };
 
   const pass = problems.length === 0;
+  // A passing gate is proof of health, so it clears any stale DOWN alarm — the
+  // self-fetch bug left client cards flagged red on sites that were perfectly up.
+  if (pass) {
+    try {
+      let st = {}; try { st = JSON.parse(settings[`uptime_${id}`] || '{}'); } catch {}
+      if (st.last === 'down') { st.last = 'up'; st.how = 'launch check passed'; st.at = new Date().toISOString(); await setSetting(db, `uptime_${id}`, JSON.stringify(st)); }
+      if (settings[`downwatch_${id}`] && settings[`downwatch_${id}`] !== '{}') await setSetting(db, `downwatch_${id}`, '{}');
+    } catch { /* clearing an alarm must never fail the check */ }
+  }
   await logEvent(db, id, pass ? 'launch_check_pass' : 'launch_check_fail',
     pass ? `✅ Launch check passed on ${domain}: ${htmlRows.length} served files clean, ${imgRefs} image refs all resolve, hostnames mapped + attached.`
          : `⚠️ Launch check found ${problems.length} problem(s) on ${domain}: ${problems.slice(0, 3).join(' · ')}`);
@@ -5879,14 +5888,41 @@ async function queueWatch(env, settings) {
   }
 }
 
+// ⚠️ A worker CANNOT fetch a domain it is itself serving — Cloudflare answers 522.
+// Every hostname in livehost_* is served by THIS worker, so fetching it to prove
+// it is up produces a permanent false "SITE DOWN" alarm on a perfectly healthy
+// site. (That is exactly what happened to anywhereinfusions.com on 8/21.)
+// For those, health is proved the only way that is actually meaningful from in
+// here: the files the domain serves are present and intact in storage.
+function selfServed(settings, url) {
+  let host = '';
+  try { host = new URL(url).hostname.toLowerCase(); } catch { return null; }
+  return settings[`livehost_${host}`] || settings[`livehost_www.${host}`] || null;
+}
+async function siteHealth(db, settings, client) {
+  const slug = client.live_url ? selfServed(settings, client.live_url) : null;
+  if (slug) {
+    const idx = await db.prepare(`SELECT length(content) AS n FROM site_files WHERE slug=? AND path='index.html'`).bind(slug).first();
+    const ok = !!(idx && idx.n > 500);
+    return { up: ok, how: ok ? 'served by us — site files intact' : 'site files missing/corrupt' };
+  }
+  if (client.live_url) {
+    try {
+      const r = await fetch(client.live_url, { method: 'GET', redirect: 'follow', cf: { cacheTtl: 0 } });
+      return { up: r.ok, how: `live domain HTTP ${r.status}` };
+    } catch (e) { return { up: false, how: `live domain unreachable (${String(e.message).slice(0, 60)})` }; }
+  }
+  return null;
+}
+
 // ⛑ DOWN WATCH: every 5 minutes, quick check of every LIVE client domain.
 // 2 consecutive fails (~10 min down) → one immediate alert. Recovery → one all-clear.
 async function downWatch(env, settings) {
   const db = env.DB;
   const clients = (await db.prepare(`SELECT * FROM clients WHERE stage = 'live' AND live_url != ''`).all()).results || [];
   for (const client of clients) {
-    let up = true;
-    try { const r = await fetch(client.live_url, { method: 'GET', redirect: 'follow', cf: { cacheTtl: 0 } }); up = r.ok; } catch { up = false; }
+    const h = await siteHealth(db, settings, client);
+    const up = h ? h.up : true;
     const key = `downwatch_${client.id}`;
     let st = {}; try { st = JSON.parse(settings[key] || '{}'); } catch {}
     const biz = client.business_name || client.name || client.email;
@@ -5918,12 +5954,9 @@ async function dailyUptime(env) {
   const results = [];
   for (const client of clients) {
     let up = false, how = '';
-    if (client.live_url) {
-      try {
-        const r = await fetch(client.live_url, { method: 'GET', redirect: 'follow', cf: { cacheTtl: 0 } });
-        up = r.ok; how = `live domain HTTP ${r.status}`;
-      } catch (e) { up = false; how = `live domain unreachable (${String(e.message).slice(0, 60)})`; }
-    } else {
+    const h = await siteHealth(db, settings, client);
+    if (h) { up = h.up; how = h.how; }
+    else {
       // preview-hosted: the worker itself serves it — verify the site files are intact in D1
       const metas = (await db.prepare(`SELECT slug, content FROM site_files WHERE path='site-meta.json'`).all()).results || [];
       let slug = null;
