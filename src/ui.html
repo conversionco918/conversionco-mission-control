@@ -672,10 +672,70 @@ async function aeoView(id, btn) {
       <ol style="margin:0 0 4px 18px;font-size:11.5px;color:#475569;">${fixes.map(f=>`<li style="margin-bottom:5px;"><b>+${f.pts}</b> ${esc(f.what)}<br><span style="color:#94a3b8;">${esc(f.why)}</span></li>`).join('')}</ol>` : ''}
     ${r.audit.wins.length ? `<p style="font-size:11.5px;font-weight:700;color:#334155;margin:10px 0 4px;">Already working</p>
       <ul style="margin:0 0 4px 18px;font-size:11.5px;color:#059669;">${r.audit.wins.map(w=>`<li>${esc(w)}</li>`).join('')}</ul>` : ''}
-    <div style="margin-top:10px;"><button class="btn btn-ghost" onclick="aeoLlms(${id}, this)" title="Writes a plain-language brief of the business that AI models read directly.">📄 Generate llms.txt</button></div>
-    <div id="aeoLlmsOut" style="margin-top:8px;font-size:11.5px;color:#475569;"></div>`;
+    ${aeoProfileForm(r)}`;
   if (btn) { btn.disabled = false; btn.textContent = '🤖 AEO report'; }
   return { total, access, r };
+}
+// The off-site profiles that make every listing count. sameAs is how an engine
+// proves the Yelp page, the Google listing and the website are one business —
+// so this panel is where the off-site work gets connected to the site.
+const AEO_PROFILE_FIELDS = [
+  ['gbp',       'Google Business Profile'],
+  ['facebook',  'Facebook'],
+  ['instagram', 'Instagram'],
+  ['yelp',      'Yelp'],
+  ['nextdoor',  'Nextdoor'],
+  ['other',     'Anywhere else'],
+];
+const AEO_DAYS = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
+function aeoProfileForm(r) {
+  const p = r.profiles || {};
+  const h = (r.hours || [])[0] || {};
+  const open = h.opens || '', close = h.closes || '';
+  return `<div style="border-top:1px solid #e2e8f0;margin-top:12px;padding-top:12px;">
+    <p style="font-size:11.5px;font-weight:700;color:#334155;margin-bottom:2px;">Off-site profiles</p>
+    <p style="font-size:11px;color:#94a3b8;margin-bottom:8px;">Paste the web address of every place this business is listed. This is what tells an answer engine they are all the same company — and it is what makes each new listing you create actually count.</p>
+    ${AEO_PROFILE_FIELDS.map(([k,label])=>`<div style="display:flex;align-items:center;gap:8px;margin-bottom:5px;">
+      <label style="font-size:11px;color:#64748b;width:150px;flex:none;">${label}</label>
+      <input id="aeoP_${k}" type="url" placeholder="https://…" value="${esc(p[k]||'')}"
+        style="flex:1;font-size:11.5px;padding:5px 8px;border:1px solid #cbd5e1;border-radius:6px;min-width:0;">
+    </div>`).join('')}
+    <p style="font-size:11.5px;font-weight:700;color:#334155;margin:12px 0 2px;">Hours</p>
+    <p style="font-size:11px;color:#94a3b8;margin-bottom:8px;">“Can someone come tonight?” is one of the most asked questions about a mobile service. Leave blank if hours vary.</p>
+    <div style="display:flex;align-items:center;gap:8px;">
+      <label style="font-size:11px;color:#64748b;width:150px;flex:none;">Open, every day</label>
+      <input id="aeoH_open" type="time" value="${esc(open)}" style="font-size:11.5px;padding:5px 8px;border:1px solid #cbd5e1;border-radius:6px;">
+      <span style="font-size:11px;color:#94a3b8;">to</span>
+      <input id="aeoH_close" type="time" value="${esc(close)}" style="font-size:11.5px;padding:5px 8px;border:1px solid #cbd5e1;border-radius:6px;">
+    </div>
+    <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;">
+      <button class="btn btn-green" onclick="aeoSaveFix(${r.client_id}, this)" title="Saves these details, then writes the entity graph into every page of the site.">🔗 Save &amp; fix schema</button>
+      <button class="btn btn-ghost" onclick="aeoLlms(${r.client_id}, this)">📄 Generate llms.txt</button>
+    </div>
+    <div id="aeoFixOut" style="margin-top:8px;font-size:11.5px;"></div>
+    <div id="aeoLlmsOut" style="margin-top:8px;font-size:11.5px;color:#475569;"></div>
+  </div>`;
+}
+async function aeoSaveFix(id, btn) {
+  const profiles = {};
+  for (const [k] of AEO_PROFILE_FIELDS) {
+    const el = document.getElementById('aeoP_' + k);
+    if (el && el.value.trim()) profiles[k] = el.value.trim();
+  }
+  const o = (document.getElementById('aeoH_open')||{}).value || '';
+  const cl = (document.getElementById('aeoH_close')||{}).value || '';
+  const hours = (o && cl) ? [{ '@type':'OpeningHoursSpecification', dayOfWeek: AEO_DAYS, opens: o, closes: cl }] : [];
+  const out = document.getElementById('aeoFixOut');
+  btn.disabled = true; btn.textContent = 'Saving…';
+  const save = await api(`/api/clients/${id}/aeo-profile`, { method:'POST', body: JSON.stringify({ profiles, hours }) });
+  if (save.error) { btn.disabled = false; btn.textContent = '🔗 Save & fix schema'; if (out) out.innerHTML = `<span style="color:#b91c1c;">${esc(save.error)}</span>`; return; }
+  btn.textContent = 'Writing schema…';
+  const fix = await api(`/api/clients/${id}/aeo-fix`, { method:'POST', body:'{}' });
+  btn.disabled = false; btn.textContent = '🔗 Save & fix schema';
+  if (fix.error) { if (out) out.innerHTML = `<span style="color:#b91c1c;">${esc(fix.error)}</span>`; return; }
+  if (out) out.innerHTML = `<span style="color:#065f46;font-weight:600;">✅ Entity graph written to ${fix.pages} page(s) — ${fix.same_as} profile(s) linked${fix.hours?', hours published':''}.</span> <span style="color:#94a3b8;">Live on the served copy now.</span>`;
+  toast(`✅ Schema fixed on ${fix.pages} pages`);
+  setTimeout(() => aeoView(id, null), 900);
 }
 async function aeoLlms(id, btn) {
   btn.disabled = true; btn.textContent = 'Writing…';

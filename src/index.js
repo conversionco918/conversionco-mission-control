@@ -81,6 +81,11 @@ async function ensureSchema(db) {
   try { await db.prepare(`CREATE INDEX IF NOT EXISTS idx_leads_gclid ON leads(gclid)`).run(); } catch {}
   try { await db.prepare(`CREATE INDEX IF NOT EXISTS idx_leads_client_created ON leads(client_id, created_at)`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN competitors TEXT DEFAULT ''`).run(); } catch {}
+  // 🤖 AEO entity resolution: the off-site profiles that prove the website, the
+  // Google listing, the Facebook page and the Yelp page are ONE business. Without
+  // these an answer engine sees four similar businesses and trusts none of them.
+  try { await db.prepare(`ALTER TABLE clients ADD COLUMN profiles TEXT DEFAULT ''`).run(); } catch {}
+  try { await db.prepare(`ALTER TABLE clients ADD COLUMN hours TEXT DEFAULT ''`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN vertical TEXT DEFAULT ''`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE site_files ADD COLUMN gh_sha TEXT DEFAULT ''`).run(); } catch {}
   // 🤖 AEO (answer-engine optimisation): one row per site/day/engine/kind.
@@ -203,7 +208,15 @@ app.use('*', async (c, next) => {
     }
   } catch { /* counting must never break serving */ }
   const body = row.is_base64 ? Uint8Array.from(atob(row.content), (ch) => ch.charCodeAt(0)) : row.content;
-  return new Response(body, { headers: { 'Content-Type': row.content_type, 'Cache-Control': 'public, max-age=300' } });
+  // A preview is a COMPLETE SECOND COPY of the client's website on a domain we
+  // own. A canonical tag is only a hint, and AI crawlers honour it inconsistently
+  // — so the copy has to refuse indexing outright, or a client can end up cited
+  // at a workers.dev URL that looks like nothing to a customer.
+  return new Response(body, { headers: {
+    'Content-Type': row.content_type,
+    'Cache-Control': 'public, max-age=300',
+    'X-Robots-Tag': 'noindex, nofollow, noarchive',
+  } });
 });
 
 // ══ AEO DETECTION ══════════════════════════════════════════════════════════
@@ -4175,68 +4188,126 @@ app.get('/api/clients/:id/launch-check', async (c) => {
 // exception — Cloudflare injects a managed block at the edge that never appears
 // in the stored file — so that one is checked from the browser instead.
 
-// What actually gets a business cited by an answer engine, weighted by how much
-// each one matters. Access is 30 because nothing else can help while it is shut.
-function aeoAudit(rows, biz) {
+// What actually gets a business cited by an answer engine.
+//
+// The first version of this scored Anywhere Infusions at 93/100 while the site
+// had one sameAs link, no entity graph, no opening hours, no dateModified, and
+// not a single paragraph long enough for an engine to quote. A score that reads
+// "nearly perfect" over gaps that size is worse than no score — it tells you to
+// stop working. So the dimensions below are the ones a real audit turned up.
+//
+// 100 points: 30 access (scored in the browser, see the endpoint) + 70 here.
+function aeoAudit(rows, biz, opts = {}) {
   const have = new Map(rows.map((r) => [String(r.path), String(r.content || '')]));
   const htmls = [...have.entries()].filter(([p]) => /\.html$/i.test(p));
   const all = htmls.map(([, c]) => c).join('\n');
   const wins = [], fixes = [];
   let score = 0;
+  const add = (pts, ok, win, fix) => { if (ok) { score += pts; wins.push(win); } else fixes.push({ pts, ...fix }); };
 
-  // ── structured data (25) — how an engine knows WHAT and WHERE the business is
-  const ld = [...all.matchAll(/<script[^>]+application\/ld\+json[^>]*>([\s\S]*?)<\/script>/gi)].map((m) => m[1]);
-  const types = new Set();
-  for (const raw of ld) {
+  // ── parse every JSON-LD node once ───────────────────────────────────────
+  const nodes = [];
+  for (const raw of all.matchAll(/<script[^>]+application\/ld\+json[^>]*>([\s\S]*?)<\/script>/gi)) {
     try {
-      const j = JSON.parse(raw);
-      for (const node of (Array.isArray(j) ? j : [j, ...(j['@graph'] || [])])) {
-        if (node && node['@type']) [].concat(node['@type']).forEach((t) => types.add(String(t)));
-      }
-    } catch { /* a malformed block is a finding, not a crash */ }
+      const j = JSON.parse(raw[1]);
+      for (const n of (Array.isArray(j) ? j : [j, ...(j['@graph'] || [])])) if (n && typeof n === 'object') nodes.push(n);
+    } catch { /* malformed blocks are counted as absent, which is the finding */ }
   }
-  const localTypes = ['LocalBusiness', 'MedicalBusiness', 'HealthAndBeautyBusiness', 'MedicalClinic', 'Physician', 'Organization'];
-  const hasLocal = localTypes.some((t) => types.has(t));
-  if (hasLocal) { score += 15; wins.push('Business identity is machine-readable (LocalBusiness schema)'); }
-  else fixes.push({ pts: 15, what: 'Add LocalBusiness schema with name, address, phone and hours', why: 'Without it an answer engine cannot confirm this is a real local business, and will name a competitor that has it.' });
-  if (types.has('FAQPage')) { score += 10; wins.push('FAQ schema present — answer engines can lift Q&A directly'); }
-  else fixes.push({ pts: 10, what: 'Add FAQPage schema to the FAQ and service pages', why: 'FAQ schema is the single most-quoted format in AI answers.' });
+  const types = new Set();
+  for (const n of nodes) if (n['@type']) [].concat(n['@type']).forEach((t) => types.add(String(t)));
+  const LOCAL = ['LocalBusiness', 'MedicalBusiness', 'HealthAndBeautyBusiness', 'MedicalClinic', 'Physician', 'Organization', 'DaySpa'];
+  const bizNode = nodes.find((n) => [].concat(n['@type'] || []).some((t) => LOCAL.includes(String(t)))) || null;
 
-  // ── question-shaped content (15) — engines quote answers, not brochures
-  const qHeads = (all.match(/<h[23][^>]*>[^<]*\?/gi) || []).length;
-  if (qHeads >= 12) { score += 15; wins.push(`${qHeads} question-style headings across the site`); }
-  else if (qHeads >= 4) { score += 8; fixes.push({ pts: 7, what: `Only ${qHeads} question-style headings — add more real customer questions as H2s`, why: 'Engines match a user question to a heading, then quote the sentence under it.' }); }
-  else fixes.push({ pts: 15, what: 'Write content as questions with a direct answer underneath', why: 'A page with no questions on it is very hard for an answer engine to quote.' });
+  // ══ ENTITY & STRUCTURED DATA — 30 ══════════════════════════════════════
+  add(8, !!bizNode,
+    'Business identity is machine-readable (LocalBusiness schema)',
+    { what: 'Add LocalBusiness schema with name, address, phone and hours', why: 'Without it an engine cannot confirm this is a real local business, and names a competitor that has it.' });
 
-  // ── llms.txt (10) — the plain-language map written for machines
-  if (have.has('llms.txt') && (have.get('llms.txt') || '').length > 200) { score += 10; wins.push('llms.txt present — the site tells AI models what it is in plain language'); }
-  else fixes.push({ pts: 10, what: 'Publish an llms.txt', why: 'A short plain-text summary of the business, services and service area that models read directly. One click to generate.' });
+  add(6, !!(bizNode && bizNode['@id']),
+    'One canonical business entity — every page points at the same business',
+    { what: 'Give the business a single @id and have every page reference it', why: 'Otherwise each page declares its own separate business, so 50 pages read as 50 unlinked mentions instead of one company with 50 pages.' });
 
-  // ── machine-readable HTML (10) — AI crawlers do not run JavaScript
+  const sameAs = [].concat((bizNode && bizNode.sameAs) || []).filter(Boolean);
+  add(8, sameAs.length >= 3,
+    `Linked to ${sameAs.length} off-site profiles — the website, listings and socials resolve to one business`,
+    { what: sameAs.length ? `Only ${sameAs.length} off-site profile linked — add Google Business Profile, Facebook, Yelp and the rest` : 'Link the off-site profiles (Google Business Profile, Facebook, Instagram, Yelp) via sameAs',
+      why: 'sameAs is how an engine proves the Yelp listing, the Google listing and this website are the same company. It is also what makes every new listing you create count.' });
+
+  add(8, types.has('FAQPage'),
+    'FAQ schema present — engines can lift Q&A directly',
+    { what: 'Add FAQPage schema to the FAQ and service pages', why: 'FAQ schema is the most-quoted format in AI answers.' });
+
+  // ══ QUOTABLE CONTENT — 20 ══════════════════════════════════════════════
+  // The measured sweet spot for a passage an engine will lift is ~50-150 words
+  // that stand alone. Marketing copy is almost never in that range.
+  let quotable = 0, paras = 0;
+  for (const [, c] of htmls) {
+    const body = c.replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '');
+    for (const m of body.matchAll(/<(p|li|dd)\b[^>]*>([\s\S]*?)<\/\1>/gi)) {
+      const w = m[2].replace(/<[^>]+>/g, ' ').replace(/&[a-z#0-9]+;/gi, ' ').trim().split(/\s+/).filter(Boolean).length;
+      if (w > 3) { paras++; if (w >= 50 && w <= 150) quotable++; }
+    }
+  }
+  // also count schema FAQ answers — those are quoted straight out of the markup
+  let faqLong = 0, faqTotal = 0;
+  for (const n of nodes) for (const e of [].concat(n.mainEntity || [])) {
+    const t = e && e.acceptedAnswer && e.acceptedAnswer.text;
+    if (t) { faqTotal++; const w = String(t).split(/\s+/).filter(Boolean).length; if (w >= 50 && w <= 150) faqLong++; }
+  }
+  const quotableTotal = quotable + faqLong;
+  add(12, quotableTotal >= Math.max(10, htmls.length * 0.3),
+    `${quotableTotal} self-contained 50–150 word passages an engine can quote`,
+    { what: quotableTotal ? `Only ${quotableTotal} passages are in the 50–150 word range engines quote (of ${paras + faqTotal} checked)` : `Not one passage on the site is in the 50–150 word range engines quote (${paras + faqTotal} checked)`,
+      why: 'Short punchy marketing copy converts humans and gives an engine nothing to lift. This does not mean changing the voice — it means adding one self-contained answer under each question.' });
+
+  const qHeads = (all.match(/<h[23][^>]*>[^<]*\?/gi) || []).length + faqTotal;
+  add(8, qHeads >= 20,
+    `${qHeads} questions answered on the site`,
+    { what: qHeads >= 8 ? `Only ${qHeads} questions answered — aim for 20+ real customer questions` : 'Write content as real customer questions with a direct answer underneath',
+      why: 'Engines match a user question to a question on the page, then quote what sits under it.' });
+
+  // ══ MACHINE-READABLE FACTS — 10 ════════════════════════════════════════
+  const svcPages = htmls.filter(([p]) => !/^(index|about|faq|blog|privacy|legal|review|safety|locations|membership|404|sitemap)/i.test(p) && !/^(blog-|iv-therapy-|city-)/i.test(p));
+  const noPrice = svcPages.filter(([, c]) => !/"offers"|"priceSpecification"/i.test(c)).map(([p]) => p);
+  add(5, svcPages.length > 0 && noPrice.length === 0,
+    `All ${svcPages.length} service pages carry a machine-readable price`,
+    { what: `${noPrice.length} service page(s) have no machine-readable price: ${noPrice.slice(0, 4).join(', ')}${noPrice.length > 4 ? ` (+${noPrice.length - 4})` : ''}`,
+      why: 'A price an engine cannot read is a price it will not quote — and cost is the most common question asked about a service.' });
+
+  add(3, !!(bizNode && bizNode.openingHoursSpecification),
+    'Opening hours are machine-readable',
+    { what: 'Add opening hours to the business schema', why: '"Are they open now" and "can someone come tonight" are among the most asked questions about a local service, and the answer is currently not readable anywhere.' });
+
+  const dm = htmls.filter(([, c]) => /"dateModified"/.test(c)).length;
+  add(2, dm >= htmls.length * 0.6,
+    'Pages declare when they were last updated',
+    { what: `Only ${dm} of ${htmls.length} pages declare a last-updated date`, why: 'Freshness is a real input, and right now most of the site declares none.' });
+
+  // ══ HYGIENE — 10 ═══════════════════════════════════════════════════════
+  add(4, have.has('llms.txt') && (have.get('llms.txt') || '').length > 200,
+    'llms.txt present — the site explains itself to models in plain language',
+    { what: 'Publish an llms.txt', why: 'A plain-text brief of the business, services and area that models read directly. One click to generate.' });
+
   const idx = have.get('index.html') || '';
   const text = idx.replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-  if (text.length > 1200) { score += 10; wins.push('Home page content is in the HTML itself, not built by JavaScript'); }
-  else fixes.push({ pts: 10, what: 'Home page has little readable text in the raw HTML', why: 'AI crawlers do not run JavaScript. Whatever is not in the HTML does not exist to them.' });
+  add(3, text.length > 1200,
+    'Home page content lives in the HTML, not in JavaScript',
+    { what: 'Home page has little readable text in the raw HTML', why: 'AI crawlers do not run JavaScript. Whatever is not in the HTML does not exist to them.' });
 
-  // ── entity consistency (10) — one name, one number, everywhere
-  // Only trust the two places a phone number is unambiguous: a tel: link and the
-  // schema telephone field. A loose digit regex over the whole page also matches
-  // Google Maps CIDs, licence numbers and prices — it reported a phantom "second
-  // phone number" on a site that only ever had one.
   const phones = new Set();
   for (const m of all.matchAll(/href=["']tel:\+?1?([0-9][0-9\-.() ]{8,})["']/gi)) phones.add(m[1].replace(/\D/g, '').replace(/^1/, ''));
   for (const m of all.matchAll(/"telephone"\s*:\s*"\+?1?([^"]+)"/gi)) phones.add(m[1].replace(/\D/g, '').replace(/^1/, ''));
   phones.delete('');
   const nameHits = biz ? htmls.filter(([, c]) => c.toLowerCase().includes(String(biz).toLowerCase())).length : 0;
-  if (phones.size === 1 && (!biz || nameHits >= htmls.length * 0.8)) { score += 10; wins.push('Business name and phone number are identical on every page'); }
-  else {
-    const bits = [];
-    if (phones.size > 1) bits.push(`${phones.size} different phone numbers appear across the site`);
-    if (biz && nameHits < htmls.length * 0.8) bits.push(`the business name is missing from ${htmls.length - nameHits} page(s)`);
-    fixes.push({ pts: 10, what: `Make the business details identical everywhere — ${bits.join(' and ')}`, why: 'Conflicting details make an engine unsure it is one business, so it stays quiet rather than risk being wrong.' });
-  }
+  add(3, phones.size === 1 && (!biz || nameHits >= htmls.length * 0.8),
+    'Business name and phone number are identical on every page',
+    { what: `Make the business details identical everywhere — ${[phones.size > 1 ? `${phones.size} different phone numbers appear` : '', biz && nameHits < htmls.length * 0.8 ? `the name is missing from ${htmls.length - nameHits} page(s)` : ''].filter(Boolean).join(' and ')}`,
+      why: 'Conflicting details make an engine unsure it is one business, so it stays quiet rather than risk being wrong.' });
 
-  return { score, max: 70, wins, fixes, pages: htmls.length, question_headings: qHeads, schema_types: [...types] };
+  fixes.sort((a, b) => b.pts - a.pts);
+  return { score, max: 70, wins, fixes, pages: htmls.length,
+    questions: qHeads, quotable: quotableTotal, same_as: sameAs.length,
+    has_entity_id: !!(bizNode && bizNode['@id']), schema_types: [...types] };
 }
 
 app.get('/api/clients/:id/aeo', async (c) => {
@@ -4293,12 +4364,136 @@ app.get('/api/clients/:id/aeo', async (c) => {
   let domain = '';
   try { domain = new URL(client.live_url).hostname.replace(/^www\./, ''); } catch {}
 
+  let profiles = {}; try { profiles = JSON.parse(client.profiles || '{}'); } catch {}
+  let hours = []; try { hours = JSON.parse(client.hours || '[]'); } catch {}
   return c.json({
     ok: true, client_id: id, slug, domain, days,
-    traffic, money, audit,
+    traffic, money, audit, profiles, hours,
     robots_url: domain ? `https://${domain}/robots.txt` : '',
     note: 'access score (30 pts) is added by the browser after it reads robots.txt',
   });
+});
+
+// ══ ONE-CLICK ENTITY FIX ═══════════════════════════════════════════════════
+// Welds a whole site into a single business entity an answer engine can trust.
+//
+// It does NOT rewrite the JSON-LD already on the page — editing 50 files of
+// someone else's markup programmatically is how you break a live site. Instead
+// it injects ONE additional block carrying a canonical @graph. Schema.org merges
+// nodes by @id, so the existing per-page schema and this block combine rather
+// than fight. Running it twice replaces its own block and changes nothing else.
+const CC_ENTITY_TAG = 'cc-entity';
+
+function buildEntityGraph(client, domain, profiles, hours, pagePath, pageHtml, updatedAt) {
+  const base = `https://${domain}`;
+  const biz = client.business_name || client.name || domain;
+  const bizId = `${base}/#business`;
+  const siteId = `${base}/#website`;
+  const pageUrl = pagePath === 'index.html' ? `${base}/` : `${base}/${pagePath}`;
+
+  const sameAs = Object.values(profiles || {}).map((v) => String(v || '').trim()).filter((v) => /^https?:\/\//i.test(v));
+
+  // Read the facts already proven on the page rather than inventing them.
+  const tel = (pageHtml.match(/href=["']tel:\+?1?([0-9][0-9\-.() ]{8,})["']/i) || [])[1] || '';
+  const phone = tel ? '+1' + tel.replace(/\D/g, '').replace(/^1/, '') : '';
+  const title = ((pageHtml.match(/<title>([^<]*)<\/title>/i) || [])[1] || '').trim();
+  const desc = ((pageHtml.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)/i) || [])[1] || '').trim();
+  const img = ((pageHtml.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)/i) || [])[1] || '').trim();
+
+  // Reuse whatever the site already declares — never contradict it.
+  let prior = {};
+  for (const raw of pageHtml.matchAll(/<script[^>]+application\/ld\+json[^>]*>([\s\S]*?)<\/script>/gi)) {
+    try {
+      const j = JSON.parse(raw[1]);
+      for (const n of (Array.isArray(j) ? j : [j, ...(j['@graph'] || [])])) {
+        if (n && /Business|Organization|Clinic|Physician/i.test(String(n['@type'] || ''))) prior = { ...n, ...prior };
+      }
+    } catch {}
+  }
+
+  const areaServed = [].concat(prior.areaServed || []).map((a) => {
+    if (typeof a !== 'string') return a;
+    const [city, region] = a.split(',').map((x) => x.trim());
+    return { '@type': 'City', name: city, ...(region ? { addressRegion: region } : {}), addressCountry: 'US' };
+  });
+
+  const bizNode = {
+    '@type': prior['@type'] || 'MedicalBusiness',
+    '@id': bizId,
+    name: biz,
+    url: base,
+    ...(desc ? { description: desc } : {}),
+    ...(phone ? { telephone: phone } : {}),
+    ...(prior.address ? { address: prior.address } : {}),
+    ...(areaServed.length ? { areaServed } : {}),
+    ...(prior.priceRange ? { priceRange: prior.priceRange } : {}),
+    ...(prior.hasMap ? { hasMap: prior.hasMap } : {}),
+    ...(prior.image ? { image: prior.image } : img ? { image: img } : {}),
+    ...(sameAs.length ? { sameAs } : {}),
+    ...(Array.isArray(hours) && hours.length ? { openingHoursSpecification: hours } : {}),
+  };
+
+  return {
+    '@context': 'https://schema.org',
+    '@graph': [
+      bizNode,
+      { '@type': 'WebSite', '@id': siteId, url: base, name: biz, publisher: { '@id': bizId } },
+      { '@type': 'WebPage', '@id': `${pageUrl}#webpage`, url: pageUrl,
+        ...(title ? { name: title } : {}), ...(desc ? { description: desc } : {}),
+        isPartOf: { '@id': siteId }, about: { '@id': bizId },
+        ...(updatedAt ? { dateModified: new Date(updatedAt.replace(' ', 'T') + 'Z').toISOString() } : {}) },
+    ],
+  };
+}
+
+app.post('/api/clients/:id/aeo-fix', async (c) => {
+  const id = Number(c.req.param('id'));
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  const slug = await slugForClient(db, id);
+  if (!slug) return c.json({ error: 'no built site for this client yet' }, 400);
+  let domain = ''; try { domain = new URL(client.live_url).hostname.replace(/^www\./, ''); } catch {}
+  if (!domain) return c.json({ error: 'this client has no live domain yet — the entity has to point at a real address' }, 400);
+
+  let profiles = {}; try { profiles = JSON.parse(client.profiles || '{}'); } catch {}
+  let hours = []; try { hours = JSON.parse(client.hours || '[]'); } catch {}
+
+  const rows = (await db.prepare(`SELECT path, content, updated_at FROM site_files WHERE slug = ? AND path LIKE '%.html'`).bind(slug).all()).results || [];
+  let done = 0, skipped = 0;
+  for (const r of rows) {
+    const html = String(r.content || '');
+    if (!/<\/head>/i.test(html)) { skipped++; continue; }
+    const graph = buildEntityGraph(client, domain, profiles, hours, String(r.path), html, String(r.updated_at || ''));
+    const tag = `<script type="application/ld+json" id="${CC_ENTITY_TAG}">${JSON.stringify(graph)}</script>`;
+    const existing = new RegExp(`<script[^>]+id=["']${CC_ENTITY_TAG}["'][^>]*>[\\s\\S]*?<\\/script>\\s*`, 'i');
+    const next = existing.test(html) ? html.replace(existing, tag) : html.replace(/<\/head>/i, `${tag}</head>`);
+    if (next === html) { skipped++; continue; }
+    await db.prepare(`UPDATE site_files SET content = ?, updated_at = datetime('now') WHERE slug = ? AND path = ?`)
+      .bind(next, slug, r.path).run();
+    done++;
+  }
+  const sameAsCount = Object.values(profiles).filter((v) => /^https?:\/\//i.test(String(v || ''))).length;
+  await logEvent(db, id, 'aeo_fix', `🤖 Entity graph written to ${done} page(s) — ${sameAsCount} off-site profile(s) linked${hours.length ? ', opening hours published' : ''}`);
+  return c.json({ ok: true, pages: done, skipped, same_as: sameAsCount, hours: hours.length,
+    note: 'Live on the served copy now. Publish the site to put it in the repo permanently.' });
+});
+
+// Profiles + hours — the inputs the entity graph is built from.
+app.post('/api/clients/:id/aeo-profile', async (c) => {
+  const id = Number(c.req.param('id'));
+  let f = {}; try { f = await c.req.json(); } catch {}
+  const clean = {};
+  for (const [k, v] of Object.entries(f.profiles || {})) {
+    const url = String(v || '').trim();
+    if (!url) continue;
+    if (!/^https?:\/\//i.test(url)) return c.json({ error: `${k} must be a full web address starting with https://` }, 400);
+    clean[k.slice(0, 24)] = url.slice(0, 300);
+  }
+  const hours = Array.isArray(f.hours) ? f.hours.slice(0, 7) : [];
+  await c.env.DB.prepare('UPDATE clients SET profiles = ?, hours = ? WHERE id = ?')
+    .bind(JSON.stringify(clean), JSON.stringify(hours), id).run();
+  return c.json({ ok: true, profiles: clean, hours: hours.length });
 });
 
 // One-click llms.txt: a plain-language brief written FOR models. Not marketing
@@ -4318,9 +4513,12 @@ app.post('/api/clients/:id/llms-txt', async (c) => {
   const descOf = (h) => ((h.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)/i) || [])[1] || '').trim();
   // Decode the handful of entities that show up in <title>/description — an
   // answer engine quoting "IV Menu &amp; Prices" back at a customer looks broken.
-  const dec = (t) => String(t).replace(/&amp;/g, '&').replace(/&#0?39;|&apos;/g, "'")
-    .replace(/&quot;/g, '"').replace(/&nbsp;/g, ' ').replace(/&mdash;/g, '—').replace(/&ndash;/g, '–')
-    .replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+  const NAMED = { amp: '&', apos: "'", quot: '"', nbsp: ' ', mdash: '—', ndash: '–', lt: '<', gt: '>', hellip: '…', rsquo: '\u2019', lsquo: '\u2018', ldquo: '\u201c', rdquo: '\u201d' };
+  const dec = (t) => String(t)
+    // numeric entities, decimal AND hex — &#x27; slipped through a named-only list
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(Number(d)))
+    .replace(/&([a-z]+);/gi, (m, n) => (n.toLowerCase() in NAMED ? NAMED[n.toLowerCase()] : m));
   // Exclude by PATH, not by title — the 404 page is titled "Page Not Found" and
   // was being advertised to answer engines as a service.
   const SKIP = /^(404|privacy|legal-terms|review-us|thanks?|thank-you)\b/i;
