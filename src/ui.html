@@ -558,6 +558,135 @@ async function rollbackSite(id, btn) {
   refresh(); setTimeout(() => openDrawer(id), 400);
 }
 
+// ══ AEO — how the business shows up when somebody asks an AI ═══════════════
+// The worker scores the content. The browser scores ACCESS, because Cloudflare
+// injects its managed AI-crawler block into robots.txt at the edge — it is not
+// in the stored file, so the only way to know the real answer is to read the
+// live robots.txt from outside. Access is 30 of the 100 points because while it
+// is shut, nothing else on the list can help.
+// Two different doors, constantly confused with each other:
+//
+//   CITATION  — the agents that fetch a page to answer someone's live question.
+//               If these are blocked, the business cannot be named in that
+//               engine's answers at all. This is what gets scored (30 pts).
+//   TRAINING  — crawlers taking content to train a model. Blocking them costs
+//               no visibility today, so it is reported for information and
+//               deliberately NOT scored. Whether to allow them is a values call
+//               about your content, not an SEO one.
+//
+// Google AI Overviews are the odd one out: they are governed by ordinary
+// Googlebot, not Google-Extended. Blocking Google-Extended does not remove a
+// business from AI Overviews — it opts out of Gemini grounding and training.
+const AEO_CITATION_BOTS = [
+  ['ChatGPT',            ['ChatGPT-User', 'OAI-SearchBot']],
+  ['Claude',             ['Claude-User', 'Claude-SearchBot']],
+  ['Perplexity',         ['PerplexityBot', 'Perplexity-User']],
+  ['Google AI Overviews',['Googlebot']],
+  ['Copilot',            ['bingbot']],
+];
+const AEO_TRAINING_BOTS = [
+  ['ChatGPT', 'GPTBot'], ['Claude', 'ClaudeBot'], ['Gemini grounding', 'Google-Extended'],
+  ['Meta', 'meta-externalagent'], ['Apple', 'Applebot-Extended'], ['Common Crawl', 'CCBot'],
+];
+// Minimal robots.txt evaluation: for each agent, the most specific matching
+// group wins, and we only care whether "/" is reachable.
+function robotsAllows(txt, agent) {
+  const lines = String(txt || '').split(/\r?\n/).map(l => l.replace(/#.*$/, '').trim()).filter(Boolean);
+  let groups = [], cur = null, lastWasUA = false;
+  for (const l of lines) {
+    const m = l.match(/^([A-Za-z-]+)\s*:\s*(.*)$/); if (!m) continue;
+    const k = m[1].toLowerCase(), v = m[2].trim();
+    if (k === 'user-agent') {
+      if (!lastWasUA || !cur) { cur = { agents: [], rules: [] }; groups.push(cur); }
+      cur.agents.push(v.toLowerCase()); lastWasUA = true;
+    } else if (cur && (k === 'allow' || k === 'disallow')) { cur.rules.push([k, v]); lastWasUA = false; }
+    else lastWasUA = false;
+  }
+  const a = agent.toLowerCase();
+  const exact = groups.filter(g => g.agents.includes(a));
+  const star  = groups.filter(g => g.agents.includes('*'));
+  const use = exact.length ? exact : star;
+  if (!use.length) return true;                     // nothing addressed to it = allowed
+  const rules = use.flatMap(g => g.rules);
+  let best = null;
+  for (const [k, v] of rules) {
+    if (v === '' && k === 'disallow') continue;      // "Disallow:" with no path = allow all
+    if (v === '/' || v === '' || '/'.startsWith(v)) {
+      if (!best || v.length > best[1].length || (v.length === best[1].length && k === 'allow')) best = [k, v];
+    }
+  }
+  return best ? best[0] === 'allow' : true;
+}
+async function aeoView(id, btn) {
+  const box = document.getElementById('aeoOut'); if (!box) return;
+  if (btn) { btn.disabled = true; btn.textContent = 'Checking…'; }
+  box.innerHTML = '<p style="color:#475569;">Reading the site and the live robots.txt…</p>';
+  const r = await api(`/api/clients/${id}/aeo`);
+  if (r.error) { if (btn) { btn.disabled = false; btn.textContent = '🤖 AEO report'; } box.innerHTML = `<p style="color:#b91c1c;">${esc(r.error)}</p>`; return; }
+
+  // ── access, read live from outside
+  let access = { pts: 0, allowed: [], blocked: [], trainBlocked: [], unknown: !r.robots_url };
+  if (r.robots_url) {
+    try {
+      const txt = await fetch(r.robots_url + '?cb=' + Date.now(), { cache: 'no-store' }).then(x => x.ok ? x.text() : '');
+      for (const [engine, agents] of AEO_CITATION_BOTS) {
+        (agents.some(a => robotsAllows(txt, a)) ? access.allowed : access.blocked).push(engine);
+      }
+      for (const [label, agent] of AEO_TRAINING_BOTS) if (!robotsAllows(txt, agent)) access.trainBlocked.push(label);
+      access.pts = Math.round(30 * access.allowed.length / AEO_CITATION_BOTS.length);
+    } catch { access.unknown = true; }
+  }
+  const total = r.audit.score + access.pts;
+  const grade = total >= 85 ? ['#065f46','#f0fdf4','#86efac','Strong'] :
+                total >= 60 ? ['#1e40af','#eff6ff','#bfdbfe','Decent'] :
+                total >= 35 ? ['#b45309','#fffbeb','#fde68a','Weak'] :
+                              ['#b91c1c','#fef2f2','#fecaca','Invisible'];
+  const t = r.traffic.totals, m = r.money;
+  const eng = (list) => list.length ? list.map(x => `${esc(x.engine)} ${x.n}`).join(' · ') : '—';
+
+  const fixes = [...r.audit.fixes];
+  if (access.blocked.length && !access.unknown) fixes.unshift({ pts: 30 - access.pts,
+    what: `Let ${access.blocked.join(', ')} read the site (Cloudflare setting)`,
+    why: 'These engines are told to stay out, so this business cannot be named in their answers at all. Nothing else on this list matters until this is open.' });
+
+  box.innerHTML = `
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px;">
+      <div style="background:${grade[1]};border:1px solid ${grade[2]};border-radius:10px;padding:8px 14px;">
+        <div style="font-size:22px;font-weight:800;color:${grade[0]};line-height:1;">${total}<span style="font-size:12px;font-weight:600;">/100</span></div>
+        <div style="font-size:10.5px;color:${grade[0]};font-weight:700;letter-spacing:.04em;">${grade[3]}</div>
+      </div>
+      <div style="font-size:11.5px;color:#475569;">AI answer visibility for <b>${esc(r.domain || r.slug || '')}</b><br>last ${r.days} days</div>
+    </div>
+    <table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:10px;">
+      <tr><td style="padding:4px 0;color:#475569;">AI read the site to answer a question</td><td style="text-align:right;font-weight:700;">${t.answer}</td><td style="color:#94a3b8;padding-left:8px;">${eng(r.traffic.answer)}</td></tr>
+      <tr><td style="padding:4px 0;color:#475569;">People who arrived from an AI answer</td><td style="text-align:right;font-weight:700;color:${t.referral?'#065f46':'#94a3b8'};">${t.referral}</td><td style="color:#94a3b8;padding-left:8px;">${eng(r.traffic.referral)}</td></tr>
+      <tr><td style="padding:4px 0;color:#475569;">Leads from AI</td><td style="text-align:right;font-weight:700;">${m.leads}</td><td style="color:#94a3b8;padding-left:8px;">${m.booked} booked${m.revenue?` · $${m.revenue.toLocaleString()}`:''}</td></tr>
+      <tr><td style="padding:4px 0;color:#94a3b8;">Training crawlers (not visibility)</td><td style="text-align:right;color:#94a3b8;">${t.train}</td><td style="color:#94a3b8;padding-left:8px;">${eng(r.traffic.train)}</td></tr>
+    </table>
+    <p style="font-size:11.5px;font-weight:700;color:#334155;margin:8px 0 4px;">Can these engines name this business?</p>
+    <p style="font-size:11.5px;margin-bottom:6px;">${access.unknown ? '<span style="color:#94a3b8;">not live yet — no domain to check</span>' :
+      (access.allowed.length ? `<span style="color:#059669;">✓ ${access.allowed.join(', ')}</span>` : '') +
+      (access.blocked.length ? `${access.allowed.length?'<br>':''}<span style="color:#b91c1c;">✕ shut out of: ${access.blocked.join(', ')}</span>` : '')}</p>
+    ${access.trainBlocked.length ? `<p style="font-size:11px;color:#94a3b8;margin-bottom:10px;">Training crawlers blocked: ${access.trainBlocked.join(', ')}. This costs no visibility today — it only stops the content being used to train models. Not scored either way; it is your call.</p>` : ''}
+    ${fixes.length ? `<p style="font-size:11.5px;font-weight:700;color:#334155;margin:10px 0 4px;">To fix, biggest first</p>
+      <ol style="margin:0 0 4px 18px;font-size:11.5px;color:#475569;">${fixes.map(f=>`<li style="margin-bottom:5px;"><b>+${f.pts}</b> ${esc(f.what)}<br><span style="color:#94a3b8;">${esc(f.why)}</span></li>`).join('')}</ol>` : ''}
+    ${r.audit.wins.length ? `<p style="font-size:11.5px;font-weight:700;color:#334155;margin:10px 0 4px;">Already working</p>
+      <ul style="margin:0 0 4px 18px;font-size:11.5px;color:#059669;">${r.audit.wins.map(w=>`<li>${esc(w)}</li>`).join('')}</ul>` : ''}
+    <div style="margin-top:10px;"><button class="btn btn-ghost" onclick="aeoLlms(${id}, this)" title="Writes a plain-language brief of the business that AI models read directly.">📄 Generate llms.txt</button></div>
+    <div id="aeoLlmsOut" style="margin-top:8px;font-size:11.5px;color:#475569;"></div>`;
+  if (btn) { btn.disabled = false; btn.textContent = '🤖 AEO report'; }
+  return { total, access, r };
+}
+async function aeoLlms(id, btn) {
+  btn.disabled = true; btn.textContent = 'Writing…';
+  const r = await api(`/api/clients/${id}/llms-txt`, { method:'POST', body:'{}' });
+  btn.disabled = false; btn.textContent = '📄 Generate llms.txt';
+  const out = document.getElementById('aeoLlmsOut');
+  if (r.error) { if (out) out.innerHTML = `<span style="color:#b91c1c;">${esc(r.error)}</span>`; return; }
+  if (out) out.innerHTML = `<p style="color:#065f46;font-weight:600;">✅ llms.txt written — ${r.pages} pages described${r.url?` · <a href="${esc(r.url)}" target="_blank" style="color:#0369a1;">view</a>`:''}</p><pre style="white-space:pre-wrap;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:8px;font-size:10.5px;max-height:180px;overflow:auto;">${esc(r.preview)}</pre><p style="color:#94a3b8;">It is live on the served copy now. Publish the site to put it in the repo permanently.</p>`;
+  toast('✅ llms.txt published');
+}
+
 // 🚀 GO LIVE — one button. Attaches the real domain to direct hosting (DNS + SSL
 // + serving all handled by the worker), then immediately audits the LIVE domain
 // so a broken launch can never look like a successful one.
@@ -728,6 +857,12 @@ function openDrawer(id) {
              <button class="btn btn-ghost" onclick="goLive(${c.id}, this)" title="Point a different domain at this site.">🌐 Change domain</button>`
           : `<button class="btn btn-green" onclick="goLive(${c.id}, this)">🚀 Take this site live</button>`}
         <div id="goliveOut" style="margin-top:10px;font-size:12px;color:#334155;"></div>
+      </div>` : ''}
+      ${(c.preview_url || c.live_url) && c.stage !== 'prospect' ? `<div style="background:#faf5ff;border:1px solid #e9d5ff;border-radius:10px;padding:14px;">
+        <p style="font-size:12.5px;font-weight:700;color:#6b21a8;margin-bottom:4px;">🤖 AI answer visibility (AEO)</p>
+        <p style="font-size:11.5px;color:#475569;margin-bottom:10px;">Where this business stands when somebody asks ChatGPT, Perplexity, Claude or Gemini instead of searching Google — measured, with the reasons it is or is not being named.</p>
+        <button class="btn btn-ghost" onclick="aeoView(${c.id}, this)">🤖 AEO report</button>
+        <div id="aeoOut" style="margin-top:10px;"></div>
       </div>` : ''}
       ${(() => { const ed = editFor(c); if (!ed) return ''; return `<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:10px;padding:14px;">
         <p style="font-size:12.5px;font-weight:600;color:#92400e;margin-bottom:6px;">📝 Edits not yet published — ${ed.n} file${ed.n===1?'':'s'}, first seen ${ago(ed.since)}</p>

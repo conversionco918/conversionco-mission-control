@@ -83,6 +83,13 @@ async function ensureSchema(db) {
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN competitors TEXT DEFAULT ''`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN vertical TEXT DEFAULT ''`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE site_files ADD COLUMN gh_sha TEXT DEFAULT ''`).run(); } catch {}
+  // 🤖 AEO (answer-engine optimisation): one row per site/day/engine/kind.
+  // kind='referral' = a human arrived from an AI answer. kind='answer' = an AI
+  // fetched the page to answer a live question. kind='train' = a training crawler.
+  // These are three completely different things and must never be added together.
+  try { await db.prepare(`CREATE TABLE IF NOT EXISTS ai_visits (
+    slug TEXT NOT NULL, day TEXT NOT NULL, engine TEXT NOT NULL, kind TEXT NOT NULL,
+    n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (slug, day, engine, kind))`).run(); } catch {}
   // first-party visitor counting: one row per site/day/page (HTML views only, bots skipped)
   try { await db.prepare(`CREATE TABLE IF NOT EXISTS hits (
     slug TEXT NOT NULL, day TEXT NOT NULL, path TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0,
@@ -177,6 +184,16 @@ app.use('*', async (c, next) => {
     const isHtml = String(row.content_type || '').includes('text/html');
     const isBot = /bot|crawl|spider|slurp|headless|preview|monitor|lighthouse|pingdom/i.test(ua) || !ua;
     const isFrame = (c.req.header('Sec-Fetch-Dest') || '') === 'iframe';
+    // AEO: an AI agent reading the page counts even though it is a "bot" —
+    // that is the whole point of the signal, so it is measured BEFORE the bot filter.
+    if (isHtml) {
+      const ag = aiAgent(ua);
+      if (ag) c.executionCtx.waitUntil(noteAi(c.env, slug, ag.engine, ag.kind));
+      else {
+        const ref = aiReferral(c.req.header('Referer'), c.req.query('utm_source'));
+        if (ref) c.executionCtx.waitUntil(noteAi(c.env, slug, ref, 'referral'));
+      }
+    }
     if (isHtml && !isBot && !isFrame) {
       const day = new Date().toISOString().slice(0, 10);
       c.executionCtx.waitUntil(c.env.DB.prepare(
@@ -188,6 +205,80 @@ app.use('*', async (c, next) => {
   const body = row.is_base64 ? Uint8Array.from(atob(row.content), (ch) => ch.charCodeAt(0)) : row.content;
   return new Response(body, { headers: { 'Content-Type': row.content_type, 'Cache-Control': 'public, max-age=300' } });
 });
+
+// ══ AEO DETECTION ══════════════════════════════════════════════════════════
+// Being found through an AI assistant is a different channel from Google search,
+// and it splits into three signals that are constantly conflated by the tools
+// that sell "AI visibility". We keep them apart on purpose:
+//
+//   answer   — an AI fetched this page to answer somebody's live question.
+//              Proof the door is open and the content is being consulted.
+//   referral — a human read that answer, clicked the citation, and landed here.
+//              The only one of the three that is a visitor, and the only one
+//              that can become a booking.
+//   train    — a crawler taking content to train a model. Not visibility.
+//              Recorded so the number is honest, never counted as a win.
+//
+// Adding these together would let us show a client a big impressive number that
+// means nothing. Each is reported on its own line.
+const AI_AGENTS = [
+  // live answering (a person is waiting on the other end)
+  [/ChatGPT-User/i,        'ChatGPT',    'answer'],
+  [/OAI-SearchBot/i,       'ChatGPT',    'answer'],
+  [/Perplexity-User/i,     'Perplexity', 'answer'],
+  [/PerplexityBot/i,       'Perplexity', 'answer'],
+  [/Claude-User/i,         'Claude',     'answer'],
+  [/Claude-SearchBot/i,    'Claude',     'answer'],
+  [/Google-Extended/i,     'Gemini',     'answer'],
+  [/DuckAssistBot/i,       'DuckDuckGo', 'answer'],
+  // training / bulk collection
+  [/GPTBot/i,              'ChatGPT',    'train'],
+  [/ClaudeBot/i,           'Claude',     'train'],
+  [/CCBot/i,               'CommonCrawl','train'],
+  [/Bytespider/i,          'TikTok',     'train'],
+  [/Amazonbot/i,           'Amazon',     'train'],
+  [/Applebot-Extended/i,   'Apple',      'train'],
+  [/meta-externalagent/i,  'Meta',       'train'],
+  [/cohere-ai|cohere-training/i, 'Cohere', 'train'],
+];
+function aiAgent(ua) {
+  const s = String(ua || '');
+  for (const [re, engine, kind] of AI_AGENTS) if (re.test(s)) return { engine, kind };
+  return null;
+}
+// Referrers an AI assistant sends a human here with. OpenAI also tags some links
+// with ?utm_source=chatgpt.com, so the query string is checked as a fallback.
+const AI_REFS = [
+  [/(^|\.)chatgpt\.com$|(^|\.)chat\.openai\.com$/i, 'ChatGPT'],
+  [/(^|\.)perplexity\.ai$/i,                        'Perplexity'],
+  [/(^|\.)claude\.ai$/i,                            'Claude'],
+  [/(^|\.)gemini\.google\.com$|(^|\.)bard\.google\.com$/i, 'Gemini'],
+  [/(^|\.)copilot\.microsoft\.com$/i,               'Copilot'],
+  [/(^|\.)you\.com$/i,                              'You.com'],
+  [/(^|\.)poe\.com$/i,                              'Poe'],
+  [/(^|\.)phind\.com$/i,                            'Phind'],
+  [/(^|\.)grok\.com$|(^|\.)x\.ai$/i,                'Grok'],
+  [/(^|\.)mistral\.ai$|(^|\.)chat\.mistral\.ai$/i,  'Mistral'],
+];
+function aiReferral(referrer, utmSource) {
+  let host = '';
+  try { host = new URL(String(referrer || '')).hostname.toLowerCase(); } catch {}
+  if (host) for (const [re, engine] of AI_REFS) if (re.test(host)) return engine;
+  const u = String(utmSource || '').toLowerCase();
+  if (u) for (const [re, engine] of AI_REFS) if (re.test(u.replace(/^https?:\/\//, ''))) return engine;
+  return null;
+}
+// Records one AEO signal. Never throws — measurement must never break serving.
+async function noteAi(env, slug, engine, kind) {
+  if (!slug || !engine || !kind) return;
+  const day = new Date().toISOString().slice(0, 10);
+  try {
+    await env.DB.prepare(
+      `INSERT INTO ai_visits (slug, day, engine, kind, n) VALUES (?, ?, ?, ?, 1)
+       ON CONFLICT(slug, day, engine, kind) DO UPDATE SET n = n + 1`
+    ).bind(slug, day, engine, kind).run();
+  } catch { /* never break a page render over a counter */ }
+}
 
 // ---------------- helpers ----------------
 async function hmac(secret, msg) {
@@ -482,6 +573,16 @@ app.get('/preview/:slug/*', async (c) => {
     // ?nocount=1 lets QA/tests view without polluting the numbers.
     const isAdmin = await checkSession(c.env, c.req.header('Cookie'));
     const noCount = !!c.req.query('nocount');
+    // AEO signals are measured before the bot/admin filters — an AI agent fetching
+    // the page IS the signal, and it would otherwise be discarded as a crawler.
+    if (isHtml && !noCount) {
+      const ag = aiAgent(ua);
+      if (ag) c.executionCtx.waitUntil(noteAi(c.env, slug, ag.engine, ag.kind));
+      else if (!isAdmin) {
+        const ref = aiReferral(c.req.header('Referer'), c.req.query('utm_source'));
+        if (ref) c.executionCtx.waitUntil(noteAi(c.env, slug, ref, 'referral'));
+      }
+    }
     if (isHtml && !isBot && !isFrame && !isAdmin && !noCount) {
       const day = new Date().toISOString().slice(0, 10);
       c.executionCtx.waitUntil(c.env.DB.prepare(
@@ -4059,6 +4160,230 @@ app.get('/api/clients/:id/launch-check', async (c) => {
     image_refs: imgRefs, images_missing: missingImgs.length,
     hostnames_attached: certsOk, notes, problems, probe,
   });
+});
+
+// ══ AEO ENGINE ═════════════════════════════════════════════════════════════
+// "Is my business showing up when people ask an AI?" — answered with measured
+// data, not vibes. Three things are reported and never blended:
+//   1. AI traffic     — answer-fetches, referral visits, training crawls
+//   2. AI revenue     — leads whose first touch was an AI answer, and what they booked
+//   3. Readiness /100 — what is actually stopping the site being cited, with fixes
+//
+// The audit reads the site's OWN served rows (the literal bytes the domain
+// returns) rather than fetching the domain, for the same reason the launch gate
+// does: a worker cannot fetch a hostname it is serving. robots.txt is the one
+// exception — Cloudflare injects a managed block at the edge that never appears
+// in the stored file — so that one is checked from the browser instead.
+
+// What actually gets a business cited by an answer engine, weighted by how much
+// each one matters. Access is 30 because nothing else can help while it is shut.
+function aeoAudit(rows, biz) {
+  const have = new Map(rows.map((r) => [String(r.path), String(r.content || '')]));
+  const htmls = [...have.entries()].filter(([p]) => /\.html$/i.test(p));
+  const all = htmls.map(([, c]) => c).join('\n');
+  const wins = [], fixes = [];
+  let score = 0;
+
+  // ── structured data (25) — how an engine knows WHAT and WHERE the business is
+  const ld = [...all.matchAll(/<script[^>]+application\/ld\+json[^>]*>([\s\S]*?)<\/script>/gi)].map((m) => m[1]);
+  const types = new Set();
+  for (const raw of ld) {
+    try {
+      const j = JSON.parse(raw);
+      for (const node of (Array.isArray(j) ? j : [j, ...(j['@graph'] || [])])) {
+        if (node && node['@type']) [].concat(node['@type']).forEach((t) => types.add(String(t)));
+      }
+    } catch { /* a malformed block is a finding, not a crash */ }
+  }
+  const localTypes = ['LocalBusiness', 'MedicalBusiness', 'HealthAndBeautyBusiness', 'MedicalClinic', 'Physician', 'Organization'];
+  const hasLocal = localTypes.some((t) => types.has(t));
+  if (hasLocal) { score += 15; wins.push('Business identity is machine-readable (LocalBusiness schema)'); }
+  else fixes.push({ pts: 15, what: 'Add LocalBusiness schema with name, address, phone and hours', why: 'Without it an answer engine cannot confirm this is a real local business, and will name a competitor that has it.' });
+  if (types.has('FAQPage')) { score += 10; wins.push('FAQ schema present — answer engines can lift Q&A directly'); }
+  else fixes.push({ pts: 10, what: 'Add FAQPage schema to the FAQ and service pages', why: 'FAQ schema is the single most-quoted format in AI answers.' });
+
+  // ── question-shaped content (15) — engines quote answers, not brochures
+  const qHeads = (all.match(/<h[23][^>]*>[^<]*\?/gi) || []).length;
+  if (qHeads >= 12) { score += 15; wins.push(`${qHeads} question-style headings across the site`); }
+  else if (qHeads >= 4) { score += 8; fixes.push({ pts: 7, what: `Only ${qHeads} question-style headings — add more real customer questions as H2s`, why: 'Engines match a user question to a heading, then quote the sentence under it.' }); }
+  else fixes.push({ pts: 15, what: 'Write content as questions with a direct answer underneath', why: 'A page with no questions on it is very hard for an answer engine to quote.' });
+
+  // ── llms.txt (10) — the plain-language map written for machines
+  if (have.has('llms.txt') && (have.get('llms.txt') || '').length > 200) { score += 10; wins.push('llms.txt present — the site tells AI models what it is in plain language'); }
+  else fixes.push({ pts: 10, what: 'Publish an llms.txt', why: 'A short plain-text summary of the business, services and service area that models read directly. One click to generate.' });
+
+  // ── machine-readable HTML (10) — AI crawlers do not run JavaScript
+  const idx = have.get('index.html') || '';
+  const text = idx.replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  if (text.length > 1200) { score += 10; wins.push('Home page content is in the HTML itself, not built by JavaScript'); }
+  else fixes.push({ pts: 10, what: 'Home page has little readable text in the raw HTML', why: 'AI crawlers do not run JavaScript. Whatever is not in the HTML does not exist to them.' });
+
+  // ── entity consistency (10) — one name, one number, everywhere
+  const phones = new Set((all.match(/(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g) || [])
+    .map((p) => p.replace(/\D/g, '').replace(/^1/, '')));
+  const nameHits = biz ? htmls.filter(([, c]) => c.toLowerCase().includes(String(biz).toLowerCase())).length : 0;
+  if (phones.size === 1 && (!biz || nameHits >= htmls.length * 0.8)) { score += 10; wins.push('Business name and phone number are identical on every page'); }
+  else {
+    const bits = [];
+    if (phones.size > 1) bits.push(`${phones.size} different phone numbers appear across the site`);
+    if (biz && nameHits < htmls.length * 0.8) bits.push(`the business name is missing from ${htmls.length - nameHits} page(s)`);
+    fixes.push({ pts: 10, what: `Make the business details identical everywhere — ${bits.join(' and ')}`, why: 'Conflicting details make an engine unsure it is one business, so it stays quiet rather than risk being wrong.' });
+  }
+
+  return { score, max: 70, wins, fixes, pages: htmls.length, question_headings: qHeads, schema_types: [...types] };
+}
+
+app.get('/api/clients/:id/aeo', async (c) => {
+  const id = Number(c.req.param('id'));
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  const slug = await slugForClient(db, id);
+  const days = Math.min(365, Math.max(7, Number(c.req.query('days') || 28)));
+
+  // ── 1. traffic, split three ways and never summed
+  let traffic = { answer: [], referral: [], train: [], totals: { answer: 0, referral: 0, train: 0 } };
+  if (slug) {
+    const rows = (await db.prepare(
+      `SELECT engine, kind, SUM(n) AS n FROM ai_visits
+       WHERE slug = ? AND day > date('now', ?) GROUP BY engine, kind ORDER BY n DESC`
+    ).bind(slug, `-${days} days`).all()).results || [];
+    for (const r of rows) {
+      const k = String(r.kind);
+      if (!traffic[k]) continue;
+      traffic[k].push({ engine: r.engine, n: Number(r.n) });
+      traffic.totals[k] += Number(r.n);
+    }
+  }
+
+  // ── 2. money: leads whose first touch was an AI answer
+  const leadRows = (await db.prepare(
+    `SELECT id, name, email, referrer, utm_source, status, value, created_at
+     FROM leads WHERE client_id = ? AND created_at > datetime('now', ?)`
+  ).bind(id, `-${days} days`).all()).results || [];
+  const aiLeads = [];
+  for (const l of leadRows) {
+    const engine = aiReferral(l.referrer, l.utm_source);
+    if (engine) aiLeads.push({ id: l.id, name: l.name || l.email || 'lead', engine, status: l.status || '', value: Number(l.value || 0), at: l.created_at });
+  }
+  const booked = aiLeads.filter((l) => l.status === 'booked');
+  const money = {
+    leads: aiLeads.length,
+    booked: booked.length,
+    revenue: booked.reduce((a, l) => a + l.value, 0),
+    all_leads: leadRows.length,
+  };
+
+  // ── 3. readiness — content side here, crawler access from the browser
+  const fileRows = slug ? ((await db.prepare(
+    `SELECT path, content FROM site_files WHERE slug = ? AND (path LIKE '%.html' OR path = 'llms.txt')`
+  ).bind(slug).all()).results || []) : [];
+  const audit = aeoAudit(fileRows, client.business_name || client.name || '');
+
+  // the browser fetches robots.txt for us — Cloudflare's managed block is injected
+  // at the edge and is not in the stored file, and we cannot fetch our own domain
+  let domain = '';
+  try { domain = new URL(client.live_url).hostname.replace(/^www\./, ''); } catch {}
+
+  return c.json({
+    ok: true, client_id: id, slug, domain, days,
+    traffic, money, audit,
+    robots_url: domain ? `https://${domain}/robots.txt` : '',
+    note: 'access score (30 pts) is added by the browser after it reads robots.txt',
+  });
+});
+
+// One-click llms.txt: a plain-language brief written FOR models. Not marketing
+// copy — models discard adjectives. Facts, services, area, hours, how to book.
+app.post('/api/clients/:id/llms-txt', async (c) => {
+  const id = Number(c.req.param('id'));
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  const slug = await slugForClient(db, id);
+  if (!slug) return c.json({ error: 'no built site for this client yet' }, 400);
+  let domain = ''; try { domain = new URL(client.live_url).hostname.replace(/^www\./, ''); } catch {}
+  const biz = client.business_name || client.name || '';
+
+  const rows = (await db.prepare(`SELECT path, content FROM site_files WHERE slug = ? AND path LIKE '%.html'`).bind(slug).all()).results || [];
+  const titleOf = (h) => ((h.match(/<title>([^<]*)<\/title>/i) || [])[1] || '').replace(/\s*[|·—-]\s*[^|·—-]*$/, '').trim();
+  const descOf = (h) => ((h.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)/i) || [])[1] || '').trim();
+  const pages = rows.map((r) => ({ path: r.path, title: titleOf(r.content), desc: descOf(r.content) }))
+    .filter((p) => p.title && !/^404/.test(p.title));
+  const idx = rows.find((r) => r.path === 'index.html');
+  const tagline = idx ? descOf(idx.content) : '';
+  const phone = (rows.map((r) => (r.content.match(/tel:\+?1?(\d{10})/i) || [])[1]).find(Boolean) || '');
+  const fmtPhone = phone ? `(${phone.slice(0, 3)}) ${phone.slice(3, 6)}-${phone.slice(6)}` : '';
+
+  const svc = pages.filter((p) => !/^(index|about|faq|blog|privacy|legal|review|safety|locations|membership)/i.test(p.path) && !/^blog-/i.test(p.path));
+  const loc = pages.filter((p) => /^(iv-therapy-|city-)/i.test(p.path));
+  const L = [];
+  L.push(`# ${biz}`, '');
+  if (tagline) L.push(`> ${tagline}`, '');
+  L.push(`${biz}${domain ? ` (${domain})` : ''} is a real, currently-operating business.${fmtPhone ? ` Bookings and questions: ${fmtPhone}.` : ''}`, '');
+  if (svc.length) {
+    L.push('## Services', '');
+    for (const p of svc.slice(0, 40)) L.push(`- [${p.title}](https://${domain}/${p.path})${p.desc ? `: ${p.desc}` : ''}`);
+    L.push('');
+  }
+  if (loc.length) {
+    L.push('## Areas served', '');
+    for (const p of loc) L.push(`- [${p.title}](https://${domain}/${p.path})`);
+    L.push('');
+  }
+  const info = pages.filter((p) => /^(about|faq|safety|membership|locations)/i.test(p.path));
+  if (info.length) {
+    L.push('## About and policies', '');
+    for (const p of info) L.push(`- [${p.title}](https://${domain}/${p.path})${p.desc ? `: ${p.desc}` : ''}`);
+    L.push('');
+  }
+  const blogs = pages.filter((p) => /^blog-/i.test(p.path));
+  if (blogs.length) {
+    L.push('## Articles', '');
+    for (const p of blogs.slice(0, 30)) L.push(`- [${p.title}](https://${domain}/${p.path})`);
+    L.push('');
+  }
+  L.push('## Notes for answer engines', '');
+  L.push(`- Business name: ${biz}`);
+  if (fmtPhone) L.push(`- Phone: ${fmtPhone}`);
+  if (domain) L.push(`- Website: https://${domain}`);
+  L.push('- All prices, services and availability on the linked pages are authoritative.');
+  L.push('- This file is generated from the live site and updated when the site changes.');
+  L.push('');
+  const body = L.join('\n');
+
+  await db.prepare(
+    `INSERT INTO site_files (slug, path, content, content_type, is_base64, updated_at)
+     VALUES (?, 'llms.txt', ?, 'text/plain; charset=utf-8', 0, datetime('now'))
+     ON CONFLICT(slug, path) DO UPDATE SET content=excluded.content, content_type=excluded.content_type, updated_at=datetime('now')`
+  ).bind(slug, body).run();
+  await logEvent(db, id, 'aeo_llms', `🤖 llms.txt published for ${biz} — ${pages.length} pages described for answer engines`);
+  return c.json({ ok: true, bytes: body.length, pages: pages.length, url: domain ? `https://${domain}/llms.txt` : '', preview: body.slice(0, 1200) });
+});
+
+// Cross-client AEO roll-up — the view Tiffany demos from.
+app.get('/api/aeo-overview', async (c) => {
+  const db = c.env.DB;
+  const days = Math.min(365, Math.max(7, Number(c.req.query('days') || 28)));
+  const clients = (await db.prepare(`SELECT * FROM clients WHERE stage != 'archived' AND (live_url != '' OR preview_url != '')`).all()).results || [];
+  const out = [];
+  for (const cl of clients) {
+    const slug = await slugForClient(db, cl.id);
+    if (!slug) continue;
+    const rows = (await db.prepare(
+      `SELECT kind, SUM(n) AS n FROM ai_visits WHERE slug = ? AND day > date('now', ?) GROUP BY kind`
+    ).bind(slug, `-${days} days`).all()).results || [];
+    const t = { answer: 0, referral: 0, train: 0 };
+    for (const r of rows) if (t[r.kind] !== undefined) t[r.kind] = Number(r.n);
+    const fileRows = (await db.prepare(
+      `SELECT path, content FROM site_files WHERE slug = ? AND (path LIKE '%.html' OR path = 'llms.txt')`
+    ).bind(slug).all()).results || [];
+    const a = aeoAudit(fileRows, cl.business_name || cl.name || '');
+    let domain = ''; try { domain = new URL(cl.live_url).hostname.replace(/^www\./, ''); } catch {}
+    out.push({ id: cl.id, name: cl.business_name || cl.name || cl.email, domain, slug, traffic: t, content_score: a.score, content_max: a.max, top_fix: a.fixes[0] || null });
+  }
+  out.sort((x, y) => (y.traffic.referral - x.traffic.referral) || (x.content_score - y.content_score));
+  return c.json({ ok: true, days, clients: out });
 });
 
 app.post('/api/clients/:id/golive-domain', async (c) => {
