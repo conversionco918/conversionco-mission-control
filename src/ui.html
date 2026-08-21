@@ -588,24 +588,53 @@ async function goLive(id, btn) {
   refresh();
 }
 
-// 🔎 LAUNCH CHECK — fetches the REAL domain (never the preview) and proves every
-// page returns 200, no preview-only paths survived, images actually load, and www
-// redirects to the apex. This is the gate that would have caught the 8/20 launch.
+// 🔎 LAUNCH CHECK — two independent halves, because neither alone is trustworthy.
+// The worker audits what the domain SERVES (serving map, Cloudflare attachment,
+// and the literal file rows — no /preview/ paths, every image reference resolves).
+// The worker CANNOT fetch the domain, because it is the thing serving it; asking
+// it to would return 522 on a perfectly healthy site. So the browser does the
+// outside-in half: it loads real images and pages from the live domain over the
+// public internet, which is exactly the view a customer gets.
 async function launchCheck(id, domain, btn, was, priorSteps) {
   const out = document.getElementById('goliveOut');
   if (out && !priorSteps) out.innerHTML = '<p style="color:#475569;">Checking the live site…</p>';
   const q = domain ? ('?domain=' + encodeURIComponent(domain)) : '';
   const r = await api(`/api/clients/${id}/launch-check${q}`);
+  if (r.error && r.probe === undefined) {
+    if (btn) { btn.disabled = false; btn.textContent = was || '🔎 Re-check the live site'; }
+    if (out) out.innerHTML = `<p style="color:#b91c1c;font-weight:700;">${esc(r.error)}</p>`;
+    return r;
+  }
+  // outside-in probes
+  const loadImg = (u) => new Promise((res) => {
+    const im = new Image(); let done = false;
+    const fin = (ok) => { if (!done) { done = true; res(ok); } };
+    im.onload = () => fin(true); im.onerror = () => fin(false);
+    setTimeout(() => fin(false), 9000);
+    im.src = u + (u.includes('?') ? '&' : '?') + 'lc=' + Date.now();
+  });
+  const reach = async (u) => { try { await fetch(u, { mode:'no-cors', cache:'no-store' }); return true; } catch { return false; } };
+  const p = r.probe || { images: [], pages: [], www: '' };
+  const live = [...r.problems];
+  const imgRes = await Promise.all((p.images || []).map(loadImg));
+  const imgOk = imgRes.filter(Boolean).length;
+  (p.images || []).forEach((u, i) => { if (!imgRes[i]) live.push(`image does not load on the live domain: ${u.replace(/\?lc=.*$/, '')}`); });
+  const pageRes = await Promise.all([...(p.pages || []), p.www].filter(Boolean).map(reach));
+  const pageOk = pageRes.filter(Boolean).length;
+  if (pageRes.length && pageOk === 0) live.push('the live domain could not be reached from this browser at all — DNS or SSL is not ready yet');
+
   if (btn) { btn.disabled = false; btn.textContent = was || '🔎 Re-check the live site'; }
-  if (!out) return r;
-  if (r.error && r.pages_checked === undefined) { out.innerHTML = `<p style="color:#b91c1c;font-weight:700;">${esc(r.error)}</p>`; return r; }
-  const head = r.ok
-    ? `<p style="font-weight:700;color:#065f46;">✅ Live and clean — ${r.pages_checked} pages all loading, ${r.images_ok}/${r.images_checked} images loading, www redirects to the main address.</p>`
-    : `<p style="font-weight:700;color:#b45309;">⚠️ Live, but ${r.problems.length} thing${r.problems.length===1?'':'s'} need${r.problems.length===1?'s':''} fixing:</p><ul style="margin:6px 0 0 18px;font-size:12px;color:#7c2d12;">${r.problems.map(p=>`<li>${esc(p)}</li>`).join('')}</ul>`;
-  out.innerHTML = head + (priorSteps ? `<pre style="white-space:pre-wrap;font-size:11px;color:#475569;margin-top:8px;">• ${esc(priorSteps)}</pre>` : '')
+  if (!out) return { ...r, live_problems: live };
+  const ok = live.length === 0;
+  const head = ok
+    ? `<p style="font-weight:700;color:#065f46;">✅ Live and clean.</p>
+       <p style="font-size:11.5px;color:#475569;margin-top:4px;">${r.files_checked} served files carry no preview-only links · all ${r.image_refs} image references resolve to real files · ${imgOk}/${(p.images||[]).length} images loaded straight off the live domain in this browser · ${pageOk}/${pageRes.length} live addresses reachable${r.hostnames_attached ? ' · both addresses attached in Cloudflare' : ''}</p>`
+    : `<p style="font-weight:700;color:#b45309;">⚠️ ${live.length} thing${live.length===1?'':'s'} need${live.length===1?'s':''} fixing:</p><ul style="margin:6px 0 0 18px;font-size:12px;color:#7c2d12;">${live.map(x=>`<li>${esc(x)}</li>`).join('')}</ul>`;
+  out.innerHTML = head
+    + (priorSteps ? `<pre style="white-space:pre-wrap;font-size:11px;color:#475569;margin-top:8px;">• ${esc(priorSteps)}</pre>` : '')
     + `<p style="margin-top:8px;font-size:11.5px;"><a href="https://${esc(r.domain||domain||'')}" target="_blank" style="color:#0369a1;">open ${esc(r.domain||domain||'')} →</a></p>`;
-  toast(r.ok ? '✅ Launch check passed' : `⚠️ Launch check found ${r.problems.length} problem(s)`);
-  return r;
+  toast(ok ? '✅ Launch check passed' : `⚠️ Launch check found ${live.length} problem(s)`);
+  return { ...r, live_problems: live };
 }
 
 async function addProspect() {

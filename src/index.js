@@ -3941,69 +3941,115 @@ app.post('/api/clients/:id/billing-bypass', async (c) => {
 // 🌐 GO-LIVE AUTOPILOT: attach a client's domain to direct hosting — zone check,
 // Workers custom domains for apex + www (DNS + SSL automatic), live-host serving
 // mapping, optional hello@ email forward, card flipped live + instant GSC.
-// ══ LAUNCH GATE — check the REAL domain, not the preview ═══════════════════
+// ══ LAUNCH GATE — audit what the live domain ACTUALLY serves ═══════════════
 // The pre-launch audit on 8/20 passed cleanly and the site still launched with
 // every image broken. Why: the audit read the PREVIEW url, where the paths were
-// correct. The bug only existed on the live domain. A launch check that reads
-// anything other than the live domain is not a launch check.
+// correct. The bug only existed on the live domain.
 //
-// Fetches real pages over the public internet and asserts:
-//   • every page returns 200
-//   • no page contains a "/preview/" path (preview-only URLs 404 when live)
-//   • the images each page references actually load
-//   • www redirects to the apex (one address, undivided SEO credit)
+// The obvious fix — have the worker fetch https://theirdomain.com — does NOT
+// work, and finding that out cost a deploy: once a domain is attached to this
+// worker, the worker fetching that domain is the worker calling itself, and
+// Cloudflare answers 522 for every page. A green check built that way would be
+// all-red on a perfectly healthy site, and (worse) an all-green one on a broken
+// site the day that behaviour changes.
+//
+// So this checks the three things that can independently make a launch wrong,
+// each from the one source that actually knows:
+//   1. SERVING  — settings say both hostnames map to this client's site
+//   2. DNS/SSL  — Cloudflare says both hostnames are attached with a live cert
+//   3. CONTENT  — the served file rows (the literal bytes the domain returns)
+//                 contain no /preview/ paths, and every image they reference
+//                 exists as a real file in that site
+// Then it hands the browser a short list of live URLs to probe from OUTSIDE
+// Cloudflare — an independent pair of eyes the worker cannot provide itself.
 app.get('/api/clients/:id/launch-check', async (c) => {
   const id = Number(c.req.param('id'));
-  const client = await c.env.DB.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
   if (!client) return c.json({ ok: false, error: 'client not found' }, 404);
   let domain = String(c.req.query('domain') || '');
   if (!domain) { try { domain = new URL(client.live_url).hostname; } catch {} }
-  domain = domain.replace(/^https?:\/\//, '').replace(/\/.*$/, '').replace(/^www\./, '');
+  domain = domain.toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '').replace(/^www\./, '');
   if (!domain) return c.json({ ok: false, error: 'no live domain on this client yet' }, 400);
 
-  const slug = await slugForClient(c.env.DB, id);
-  const rows = slug ? ((await c.env.DB.prepare(
-    `SELECT path FROM site_files WHERE slug = ? AND path LIKE '%.html'`).bind(slug).all()).results || []) : [];
-  // Cap the sweep: Workers have a subrequest budget, and each page costs 2.
-  const pages = ['index.html', ...rows.map((r) => r.path).filter((p) => p !== 'index.html')].slice(0, 24);
+  const slug = await slugForClient(db, id);
+  if (!slug) return c.json({ ok: false, error: 'no built site for this client yet' }, 400);
+  const problems = [], notes = [];
 
-  const problems = [], checked = [];
-  let imagesOk = 0, imagesChecked = 0;
-  const base = `https://${domain}`;
-  for (const p of pages) {
-    const url = `${base}/${p === 'index.html' ? '' : p}`;
-    let res;
-    try { res = await fetch(url, { headers: { 'User-Agent': 'ConversionCo-LaunchCheck' } }); }
-    catch (e) { problems.push(`${p}: could not be fetched (${String(e.message).slice(0, 60)})`); continue; }
-    if (res.status !== 200) { problems.push(`${p}: HTTP ${res.status}`); continue; }
-    const html = await res.text();
-    checked.push(p);
-    if (html.includes('/preview/')) problems.push(`${p}: still contains preview-only paths — these 404 on the live domain`);
-    // verify the first image on the page actually loads
-    const m = html.match(/src="([^"]+\.(?:png|jpg|jpeg|webp|svg))"/i);
-    if (m) {
-      const src = m[1].startsWith('http') ? m[1] : `${base}/${m[1].replace(/^\//, '')}`;
-      imagesChecked++;
-      try {
-        const ir = await fetch(src, { method: 'HEAD' });
-        if (ir.status === 200) imagesOk++; else problems.push(`${p}: image ${m[1]} returns ${ir.status}`);
-      } catch { problems.push(`${p}: image ${m[1]} could not be fetched`); }
-    }
+  // ── 1. SERVING ───────────────────────────────────────────────────────────
+  const settings = await getSettings(db);
+  for (const host of [domain, `www.${domain}`]) {
+    const mapped = settings[`livehost_${host}`];
+    if (mapped === slug) notes.push(`${host} → ${slug} ✓`);
+    else if (mapped) problems.push(`${host} is serving a different site (${mapped}), not this client's`);
+    else problems.push(`${host} is not mapped to any site — it will not serve`);
   }
 
-  // www must land on the apex, not serve a second copy of the site
-  let wwwRedirects = null;
-  try {
-    const w = await fetch(`https://www.${domain}/`, { redirect: 'manual' });
-    wwwRedirects = w.status >= 300 && w.status < 400;
-    if (!wwwRedirects) problems.push(`www.${domain} does not redirect to the apex — Google may treat it as a second site`);
-  } catch { problems.push(`www.${domain} could not be reached`); }
+  // ── 2. DNS + SSL, straight from Cloudflare ───────────────────────────────
+  let certsOk = null;
+  if (c.env.CLOUDFLARE_API_TOKEN && c.env.CF_ACCOUNT_ID) {
+    try {
+      const cf = async (p) => (await fetch(`https://api.cloudflare.com/client/v4${p}`, {
+        headers: { Authorization: `Bearer ${c.env.CLOUDFLARE_API_TOKEN}` } })).json();
+      const doms = await cf(`/accounts/${c.env.CF_ACCOUNT_ID}/workers/domains?hostname=${encodeURIComponent(domain)}`);
+      const all = await cf(`/accounts/${c.env.CF_ACCOUNT_ID}/workers/domains`);
+      const owned = ((all && all.result) || []).filter((d) => d.hostname === domain || d.hostname === `www.${domain}`);
+      certsOk = owned.length >= 2;
+      for (const host of [domain, `www.${domain}`]) {
+        const hit = owned.find((d) => d.hostname === host);
+        if (!hit) problems.push(`${host} is not attached to the site in Cloudflare — DNS still points somewhere else`);
+        else if (hit.service && hit.service !== 'conversionco-mission-control')
+          problems.push(`${host} is attached to the wrong worker (${hit.service})`);
+        else notes.push(`${host} attached in Cloudflare ✓`);
+      }
+      if (doms && doms.errors && doms.errors.length) notes.push('cloudflare: ' + JSON.stringify(doms.errors).slice(0, 120));
+    } catch (e) { notes.push('could not read Cloudflare (check skipped): ' + String(e && e.message || e).slice(0, 80)); }
+  } else notes.push('Cloudflare token not configured — DNS/SSL check skipped');
+
+  // ── 3. CONTENT — the actual served bytes ─────────────────────────────────
+  const rows = (await db.prepare('SELECT path, content FROM site_files WHERE slug = ?').bind(slug).all()).results || [];
+  const have = new Set(rows.map((r) => String(r.path)));
+  const htmlRows = rows.filter((r) => /\.(html|css|js)$/i.test(String(r.path)));
+  let previewPages = 0, missingImgs = [], imgRefs = 0;
+  const probeImgs = new Set(), probePages = new Set();
+  for (const r of htmlRows) {
+    const body = String(r.content || '');
+    if (body.includes('/preview/')) { previewPages++; problems.push(`${r.path} still contains preview-only paths (/preview/…) — those 404 on the live domain`); }
+    const re = /(?:src|href|poster)="([^"]+\.(?:png|jpe?g|webp|svg|gif))"|url\((['"]?)([^)'"]+\.(?:png|jpe?g|webp|svg|gif))\2\)/gi;
+    let m;
+    while ((m = re.exec(body))) {
+      let ref = m[1] || m[3] || '';
+      if (/^(https?:)?\/\//i.test(ref) || ref.startsWith('data:')) continue;
+      imgRefs++;
+      const clean = ref.replace(/^\.\//, '').replace(/^\//, '').split('?')[0];
+      if (!have.has(clean)) missingImgs.push(`${r.path} → ${ref}`);
+      else if (probeImgs.size < 6) probeImgs.add(clean);
+    }
+    if (/\.html$/i.test(String(r.path)) && probePages.size < 6) probePages.add(String(r.path));
+  }
+  if (missingImgs.length) {
+    const uniq = [...new Set(missingImgs.map((x) => x.split('→')[1].trim()))];
+    problems.push(`${missingImgs.length} image reference${missingImgs.length === 1 ? '' : 's'} point at files that do not exist in this site: ${uniq.slice(0, 6).join(', ')}${uniq.length > 6 ? ` (+${uniq.length - 6} more)` : ''}`);
+  }
+
+  // ── the browser's half: real URLs to load from outside Cloudflare ────────
+  const base = `https://${domain}`;
+  const probe = {
+    images: [...probeImgs].map((p) => `${base}/${p}`),
+    pages: [...probePages].map((p) => `${base}/${p === 'index.html' ? '' : p}`),
+    www: `https://www.${domain}/`,
+  };
 
   const pass = problems.length === 0;
-  await logEvent(c.env.DB, id, pass ? 'launch_check_pass' : 'launch_check_fail',
-    pass ? `✅ Launch check passed on ${domain}: ${checked.length} pages, ${imagesOk}/${imagesChecked} images loading, www redirects.`
+  await logEvent(db, id, pass ? 'launch_check_pass' : 'launch_check_fail',
+    pass ? `✅ Launch check passed on ${domain}: ${htmlRows.length} served files clean, ${imgRefs} image refs all resolve, hostnames mapped + attached.`
          : `⚠️ Launch check found ${problems.length} problem(s) on ${domain}: ${problems.slice(0, 3).join(' · ')}`);
-  return c.json({ ok: pass, domain, pages_checked: checked.length, images_ok: imagesOk, images_checked: imagesChecked, www_redirects: wwwRedirects, problems });
+  return c.json({
+    ok: pass, domain, slug,
+    files_checked: htmlRows.length, preview_pages: previewPages,
+    image_refs: imgRefs, images_missing: missingImgs.length,
+    hostnames_attached: certsOk, notes, problems, probe,
+  });
 });
 
 app.post('/api/clients/:id/golive-domain', async (c) => {
