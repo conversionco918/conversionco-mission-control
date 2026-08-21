@@ -4685,8 +4685,17 @@ async function aeoQuestions(db, client) {
   const rows = slug ? ((await db.prepare(`SELECT path, content FROM site_files WHERE slug = ? AND path LIKE '%.html'`).bind(slug).all()).results || []) : [];
   const titleOf = (h) => ((String(h).match(/<title>([^<]*)<\/title>/i) || [])[1] || '');
   // cities come from the location pages the site already has
+  // Order cities by how central they actually are, NOT alphabetically. The first
+  // pass sorted by filename and produced "Who does mobile IV therapy in Bixby?"
+  // as the headline question for a Tulsa business — the wrong market entirely.
+  // Rank by how often the site itself mentions each city, which is the site's own
+  // statement of where its business is.
+  const allText = rows.map((r) => String(r.content || '')).join(' ');
   const cities = rows.map((r) => String(r.path)).filter((p) => /^(iv-therapy-|city-)/i.test(p))
-    .map((p) => p.replace(/^(iv-therapy-|city-)/i, '').replace(/\.html$/i, '').split('-').map((w) => w[0].toUpperCase() + w.slice(1)).join(' '));
+    .map((p) => p.replace(/^(iv-therapy-|city-)/i, '').replace(/\.html$/i, '').split('-').map((w) => w[0].toUpperCase() + w.slice(1)).join(' '))
+    .map((name) => ({ name, n: (allText.match(new RegExp('\\b' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'gi')) || []).length }))
+    .sort((a, b) => b.n - a.n)
+    .map((x) => x.name);
   const home = rows.find((r) => r.path === 'index.html');
   const what = /iv|infusion|drip|hydrat/i.test(titleOf(home && home.content) + (client.vertical || '')) ? 'mobile IV therapy' : (client.vertical || 'this service');
   const main = cities[0] || '';
@@ -4700,9 +4709,9 @@ async function aeoQuestions(db, client) {
     qs.push(`How much does ${what} cost in ${main}?`);
     qs.push(`Is ${what} in ${main} done by a nurse?`);
   }
-  for (const city of cities.slice(1, 5)) qs.push(`${what} in ${city}`);
+  for (const city of cities.slice(1, 7)) qs.push(`${what} in ${city}`);
   if (biz) qs.push(`Tell me about ${biz}`);
-  return { questions: qs.slice(0, 12), engines: AEO_ENGINES, cities, what, biz };
+  return { questions: qs.slice(0, 14), engines: AEO_ENGINES, cities, what, biz };
 }
 
 // ══ CLIENT-FACING: "Why AI matters" ═══════════════════════════════════════
