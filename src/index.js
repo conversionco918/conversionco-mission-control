@@ -4300,7 +4300,11 @@ function aeoAudit(rows, biz, opts = {}) {
   const listed = new Set([...sitemap.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/gi)]
     .map((m) => (m[1].replace(/\/$/, '').split('/').pop() || 'index.html')));
   const IGNORE = /^(404|sitemap)/i;
-  const linkTargets = new Set([...all.matchAll(/href=["']([^"'#?]+\.html)["']/gi)].map((m) => m[1].split('/').pop()));
+  const linkCount = {};
+  for (const m of all.matchAll(/href=["']([^"'#?]+\.html)["']/gi)) {
+    const f = m[1].split('/').pop(); linkCount[f] = (linkCount[f] || 0) + 1;
+  }
+  const linkTargets = new Set(Object.keys(linkCount));
   const orphans = htmls.map(([p]) => p).filter((p) => !IGNORE.test(p)
     && !listed.has(p) && !listed.has(p.replace(/index\.html$/, '')) && !linkTargets.has(p));
   add(6, sitemap && orphans.length === 0,
@@ -4317,11 +4321,25 @@ function aeoAudit(rows, biz, opts = {}) {
     if (!sig.has(t)) sig.set(t, []);
     sig.get(t).push(p);
   }
-  const dupes = [...sig.values()].filter((v) => v.length > 1);
-  add(4, dupes.length === 0,
-    'No duplicate pages — every page lives at exactly one address',
-    { what: `${dupes.length} page(s) exist at two addresses: ${dupes.slice(0, 3).map((v) => v.join(' = ')).join('; ')}`,
-      why: 'The same page at two URLs splits its credit and leaves an engine unsure which is the real address. Pick one and redirect the other.' });
+  // A duplicate pair is RESOLVED once the twin nothing links to carries a
+  // canonical pointing at the one that does. Scoring it as a fault forever means
+  // the fixer can repair the site and the number never moves — which trains you
+  // to ignore the number.
+  const canonOf = (p) => {
+    const c = have.get(p) || '';
+    const m = c.match(/<link[^>]+rel=["']canonical["'][^>]*href=["']([^"']+)["']/i)
+      || c.match(/<link[^>]+href=["']([^"']+)["'][^>]*rel=["']canonical["']/i);
+    return m ? (m[1].replace(/\/$/, '').split('/').pop() || 'index.html') : '';
+  };
+  const unresolved = [...sig.values()].filter((v) => v.length > 1).filter((paths) => {
+    const winner = paths.slice().sort((a, b) => (linkCount[b] || 0) - (linkCount[a] || 0) || a.localeCompare(b))[0];
+    // resolved when every other copy points at the same single address
+    return !paths.every((p) => p === winner || canonOf(p) === winner);
+  });
+  add(4, unresolved.length === 0,
+    'No duplicate pages competing — each page has one real address',
+    { what: `${unresolved.length} page(s) exist at two addresses with nothing saying which is real: ${unresolved.slice(0, 3).map((v) => v.join(' = ')).join('; ')}`,
+      why: 'The same page at two URLs splits its credit and leaves an engine unsure which is the real address.' });
 
   // ══ HYGIENE — 10 ═══════════════════════════════════════════════════════
   add(3, have.has('llms.txt') && (have.get('llms.txt') || '').length > 200,
