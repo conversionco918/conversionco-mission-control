@@ -719,8 +719,11 @@ function aeoProfileForm(r) {
       <button class="btn btn-green" onclick="aeoSaveFix(${r.client_id}, this)" title="Saves these details, then writes the entity graph into every page of the site.">🔗 Save &amp; fix schema</button>
       <button class="btn btn-ghost" onclick="aeoLlms(${r.client_id}, this)">📄 Generate llms.txt</button>
       <button class="btn btn-ghost" onclick="aeoSitemap(${r.client_id}, this)" title="Rebuilds sitemap.xml from the pages that actually exist, dropping duplicates.">🗺 Rebuild sitemap</button>
+      <button class="btn btn-ghost" onclick="aeoChecks(${r.client_id}, this)" title="Record whether each assistant named this business.">🔎 AI spot-checks</button>
+      <button class="btn btn-ghost" onclick="aeoClientPage(${r.client_id}, this)" title="The client-facing page — real numbers only.">📊 Client page</button>
     </div>
     <div id="aeoFixOut" style="margin-top:8px;font-size:11.5px;"></div>
+    <div id="aeoChecksOut" style="margin-top:10px;"></div>
     <div id="aeoLlmsOut" style="margin-top:8px;font-size:11.5px;color:#475569;"></div>
   </div>`;
 }
@@ -744,6 +747,46 @@ async function aeoSaveFix(id, btn) {
   if (out) out.innerHTML = `<span style="color:#065f46;font-weight:600;">✅ Entity graph written to ${fix.pages} page(s) — ${fix.same_as} profile(s) linked${fix.hours?', hours published':''}.</span> <span style="color:#94a3b8;">Live on the served copy now.</span>`;
   toast(`✅ Schema fixed on ${fix.pages} pages`);
   setTimeout(() => aeoView(id, null), 900);
+}
+// Manual citation spot-checks. Deliberately by hand: asking the engines properly
+// needs paid API access, and a made-up ranking in something a client pays for
+// would be worse than showing nothing. Every row is something a human saw.
+async function aeoChecks(id, btn) {
+  const box = document.getElementById('aeoChecksOut'); if (!box) return;
+  if (btn) { btn.disabled = true; btn.textContent = 'Loading…'; }
+  const q = await api(`/api/clients/${id}/aeo-questions`);
+  if (btn) { btn.disabled = false; btn.textContent = '🔎 AI spot-checks'; }
+  if (q.error) { box.innerHTML = `<span style="color:#b91c1c;">${esc(q.error)}</span>`; return; }
+  const eng = q.engines;
+  const cell = (question, engine) => {
+    const r = q.latest[`${engine}|${question}`];
+    const st = !r ? ['–', '#cbd5e1', 'not checked'] : r.named ? ['✓', '#059669', 'named ' + ago(r.checked_at)] : ['✕', '#dc2626', 'not named ' + ago(r.checked_at)];
+    return `<td style="text-align:center;padding:2px;">
+      <button title="${esc(engine)} — ${st[2]}. Click to record what you just saw."
+        onclick="aeoLog(${id}, ${JSON.stringify(engine).replace(/"/g,'&quot;')}, ${JSON.stringify(question).replace(/"/g,'&quot;')})"
+        style="width:26px;height:24px;border:1px solid #e2e8f0;background:#fff;border-radius:5px;cursor:pointer;color:${st[1]};font-weight:700;font-size:12px;">${st[0]}</button></td>`;
+  };
+  box.innerHTML = `
+    <p style="font-size:11.5px;color:#475569;margin-bottom:8px;">Open each assistant, paste the question, and record whether <b>${esc(q.biz || 'the client')}</b> was named. Click a box to log it. Doing this monthly is enough to show a trend.</p>
+    <div style="overflow-x:auto;">
+    <table style="width:100%;border-collapse:collapse;font-size:11px;">
+      <tr><th style="text-align:left;padding:4px 6px 4px 0;color:#64748b;font-weight:600;">Question</th>
+      ${eng.map(e=>`<th style="padding:4px 2px;color:#64748b;font-weight:600;font-size:9.5px;writing-mode:vertical-rl;transform:rotate(180deg);height:74px;">${esc(e)}</th>`).join('')}</tr>
+      ${q.questions.map(qq=>`<tr><td style="padding:3px 6px 3px 0;border-top:1px solid #f1f5f9;color:#334155;">${esc(qq)}</td>${eng.map(e=>cell(qq,e)).join('')}</tr>`).join('')}
+    </table></div>
+    <p style="font-size:10.5px;color:#94a3b8;margin-top:8px;">${q.total_checks} check(s) recorded. Gemini and Google AI Overviews publish no ranking and have no way to query one — check those by hand too, and treat any tool that claims a number for them with suspicion.</p>`;
+}
+async function aeoLog(id, engine, question) {
+  const yes = confirm(`${engine}\n\n"${question}"\n\nWas the business NAMED in the answer?\n\nOK = yes, named.   Cancel = no, not named.`);
+  const r = await api(`/api/clients/${id}/aeo-check`, { method:'POST', body: JSON.stringify({ engine, question, named: yes }) });
+  if (r.error) return toast('⚠ ' + r.error);
+  toast(yes ? `✅ Recorded: named by ${engine}` : `Recorded: not named by ${engine}`);
+  aeoChecks(id, null);
+}
+async function aeoClientPage(id, btn) {
+  const r = await api(`/api/clients/${id}/ai-report-link`);
+  if (r.error) return toast('⚠ ' + r.error);
+  window.open(r.url, '_blank');
 }
 async function aeoSitemap(id, btn) {
   btn.disabled = true; btn.textContent = 'Rebuilding…';

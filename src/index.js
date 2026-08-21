@@ -86,6 +86,14 @@ async function ensureSchema(db) {
   // these an answer engine sees four similar businesses and trusts none of them.
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN profiles TEXT DEFAULT ''`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN hours TEXT DEFAULT ''`).run(); } catch {}
+  // Manual AI citation spot-checks. Deliberately hand-entered: asking the engines
+  // properly needs paid API keys, and a made-up number in a client report is far
+  // worse than an empty one. Every row here is something a human actually saw.
+  try { await db.prepare(`CREATE TABLE IF NOT EXISTS ai_checks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, client_id INTEGER NOT NULL,
+    engine TEXT NOT NULL, question TEXT NOT NULL, named INTEGER NOT NULL DEFAULT 0,
+    note TEXT DEFAULT '', checked_at TEXT NOT NULL DEFAULT (datetime('now')))`).run(); } catch {}
+  try { await db.prepare(`CREATE INDEX IF NOT EXISTS idx_aichecks_client ON ai_checks(client_id, checked_at)`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE clients ADD COLUMN vertical TEXT DEFAULT ''`).run(); } catch {}
   try { await db.prepare(`ALTER TABLE site_files ADD COLUMN gh_sha TEXT DEFAULT ''`).run(); } catch {}
   // 🤖 AEO (answer-engine optimisation): one row per site/day/engine/kind.
@@ -4664,6 +4672,204 @@ app.post('/api/clients/:id/sitemap-rebuild', async (c) => {
   await logEvent(db, id, 'sitemap_rebuilt', `🗺 Sitemap rebuilt for ${domain} — ${pages.length} pages listed${dropped.length ? `, ${dropped.length} excluded` : ''}`);
   return c.json({ ok: true, listed: pages.length, scanned: before, dropped, url: `https://${domain}/sitemap.xml`,
     note: 'Live on the served copy now. Publish the site to put it in the repo permanently.' });
+});
+
+// The exact questions to put to an assistant, built from what this business
+// actually sells and where. Generic questions ("best IV therapy") are useless —
+// an answer engine is asked local, specific things, so these are local and
+// specific. Same list every time so results are comparable week to week.
+const AEO_ENGINES = ['ChatGPT', 'Claude', 'Perplexity', 'Gemini', 'Google AI Overviews', 'Copilot'];
+
+async function aeoQuestions(db, client) {
+  const slug = await slugForClient(db, client.id);
+  const rows = slug ? ((await db.prepare(`SELECT path, content FROM site_files WHERE slug = ? AND path LIKE '%.html'`).bind(slug).all()).results || []) : [];
+  const titleOf = (h) => ((String(h).match(/<title>([^<]*)<\/title>/i) || [])[1] || '');
+  // cities come from the location pages the site already has
+  const cities = rows.map((r) => String(r.path)).filter((p) => /^(iv-therapy-|city-)/i.test(p))
+    .map((p) => p.replace(/^(iv-therapy-|city-)/i, '').replace(/\.html$/i, '').split('-').map((w) => w[0].toUpperCase() + w.slice(1)).join(' '));
+  const home = rows.find((r) => r.path === 'index.html');
+  const what = /iv|infusion|drip|hydrat/i.test(titleOf(home && home.content) + (client.vertical || '')) ? 'mobile IV therapy' : (client.vertical || 'this service');
+  const main = cities[0] || '';
+  const biz = client.business_name || client.name || '';
+
+  const qs = [];
+  if (main) {
+    qs.push(`Who does ${what} in ${main}?`);
+    qs.push(`Best ${what} in ${main}`);
+    qs.push(`Can someone bring an IV to my house in ${main}?`);
+    qs.push(`How much does ${what} cost in ${main}?`);
+    qs.push(`Is ${what} in ${main} done by a nurse?`);
+  }
+  for (const city of cities.slice(1, 5)) qs.push(`${what} in ${city}`);
+  if (biz) qs.push(`Tell me about ${biz}`);
+  return { questions: qs.slice(0, 12), engines: AEO_ENGINES, cities, what, biz };
+}
+
+// ══ CLIENT-FACING: "Why AI matters" ═══════════════════════════════════════
+// Everything on this page is measured. There is no citation-ranking section,
+// because truthfully reporting that needs paid API access to each engine and we
+// do not have it — and an invented ranking in a document a client pays for is
+// the one thing that would actually destroy trust here. What IS shown: real
+// visits from AI answers, real leads, real revenue, and the real readiness score.
+app.get('/portal-ai/:id/:token', async (c) => {
+  const id = Number(c.req.param('id'));
+  if (c.req.param('token') !== await portalToken(c.env, 'ai', id)) return c.text('not found', 404);
+  const db = c.env.DB;
+  const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.text('not found', 404);
+  const biz = client.business_name || client.name || '';
+  const slug = await slugForClient(db, id);
+  let domain = ''; try { domain = new URL(client.live_url).hostname.replace(/^www\./, ''); } catch {}
+
+  const days = 90;
+  const t = { answer: 0, referral: 0, train: 0 };
+  const perEngine = {};
+  if (slug) {
+    const rows = (await db.prepare(
+      `SELECT engine, kind, SUM(n) AS n FROM ai_visits WHERE slug = ? AND day > date('now', ?) GROUP BY engine, kind`
+    ).bind(slug, `-${days} days`).all()).results || [];
+    for (const r of rows) {
+      if (t[r.kind] === undefined) continue;
+      t[r.kind] += Number(r.n);
+      if (r.kind !== 'train') perEngine[r.engine] = (perEngine[r.engine] || 0) + Number(r.n);
+    }
+  }
+  const leadRows = (await db.prepare(
+    `SELECT referrer, utm_source, status, value FROM leads WHERE client_id = ? AND created_at > datetime('now', ?)`
+  ).bind(id, `-${days} days`).all()).results || [];
+  const aiLeads = leadRows.filter((l) => aiReferral(l.referrer, l.utm_source));
+  const bookedL = aiLeads.filter((l) => l.status === 'booked');
+  const revenue = bookedL.reduce((a, l) => a + Number(l.value || 0), 0);
+
+  const fileRows = slug ? ((await db.prepare(
+    `SELECT path, content FROM site_files WHERE slug = ? AND (path LIKE '%.html' OR path IN ('llms.txt','sitemap.xml'))`
+  ).bind(slug).all()).results || []) : [];
+  const audit = aeoAudit(fileRows, client.business_name || '');
+  const pct = Math.round(100 * audit.score / audit.max);
+
+  const esc2 = (x) => String(x == null ? '' : x).replace(/[<>&"]/g, (m) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[m]));
+  const engineRows = Object.entries(perEngine).sort((a, b) => b[1] - a[1]);
+  const grade = pct >= 85 ? ['#0F6E5C', 'Strong'] : pct >= 60 ? ['#1D4ED8', 'Solid'] : pct >= 35 ? ['#A55A00', 'Needs work'] : ['#B3261E', 'Not ready'];
+
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>${esc2(biz)} — Being found by AI</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=IBM+Plex+Mono:wght@500&display=swap">
+<style>
+:root{--ink:#0E1A1D;--paper:#F6F8F8;--surface:#fff;--muted:#5B6B6E;--faint:#8A9A9C;--line:#DCE4E4;--accent:#C2185B;--good:#0F6E5C;--band:#EDF2F2}
+@media(prefers-color-scheme:dark){:root{--ink:#E4EDED;--paper:#0B1416;--surface:#111E21;--muted:#9BADAF;--faint:#6C7E80;--line:#203438;--accent:#F0619A;--good:#4BC0A8;--band:#0F1B1E}}
+*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font-family:"Source Serif 4",Georgia,serif;font-size:17px;line-height:1.62;-webkit-font-smoothing:antialiased}
+.w{max-width:720px;margin:0 auto;padding:56px 24px 80px}
+h1,h2,h3,.mono,.eyebrow{font-family:Archivo,Helvetica,Arial,sans-serif}
+.mono,.n{font-family:"IBM Plex Mono",monospace;font-variant-numeric:tabular-nums}
+.eyebrow{font-size:11px;font-weight:600;letter-spacing:.16em;text-transform:uppercase;color:var(--accent);margin:0 0 12px}
+h1{font-size:clamp(30px,5.5vw,44px);line-height:1.08;letter-spacing:-.025em;margin:0 0 16px;text-wrap:balance}
+h2{font-size:22px;letter-spacing:-.015em;margin:0 0 10px;text-wrap:balance}
+p{margin:0 0 16px}.lede{font-size:19px;color:var(--muted);margin-bottom:30px}
+section{margin-top:44px;border-top:1px solid var(--line);padding-top:28px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:20px 0}
+.card{background:var(--surface);border:1px solid var(--line);padding:16px}
+.card .lab{font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--faint);font-family:Archivo,sans-serif;font-weight:600}
+.big{font-size:34px;font-weight:600;line-height:1.1;letter-spacing:-.03em;margin-top:6px;font-family:"IBM Plex Mono",monospace}
+.card p{font-size:13px;color:var(--muted);margin:8px 0 0;line-height:1.45}
+table{width:100%;border-collapse:collapse;font-size:15px;margin-top:14px}
+td,th{text-align:left;padding:9px 10px 9px 0;border-bottom:1px solid var(--line)}
+th{font-family:Archivo,sans-serif;font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--faint);font-weight:600}
+.score{display:flex;align-items:center;gap:16px;margin:18px 0}
+.dial{width:88px;height:88px;flex:none;border-radius:50%;display:grid;place-items:center;
+ background:conic-gradient(${grade[0]} ${pct * 3.6}deg, var(--band) 0)}
+.dial b{width:66px;height:66px;border-radius:50%;background:var(--surface);display:grid;place-items:center;
+ font-family:"IBM Plex Mono",monospace;font-size:20px;color:${grade[0]}}
+ol{margin:12px 0 0 20px;padding:0}li{margin-bottom:12px}
+li b{font-family:Archivo,sans-serif}
+.why{background:var(--surface);border:1px solid var(--line);border-left:3px solid var(--accent);padding:18px 20px;margin:18px 0}
+.empty{color:var(--faint);font-size:15px;font-style:italic}
+footer{margin-top:52px;border-top:1px solid var(--line);padding-top:20px;font-size:13px;color:var(--faint)}
+</style></head><body><div class="w">
+
+<p class="eyebrow">${esc2(biz)}${domain ? ' · ' + esc2(domain) : ''}</p>
+<h1>Being found when people ask an AI</h1>
+<p class="lede">More people every month look for a local service by asking an assistant instead of searching. This page shows exactly where you stand — every number here is measured on your own website, not estimated.</p>
+
+<div class="why">
+  <p style="margin:0"><b>Why this matters.</b> A search engine hands back ten links and the customer picks. An assistant names two or three businesses and the customer usually stops there. Being one of the names is worth far more than being the fourth link — and there is no paid placement to buy your way in.</p>
+</div>
+
+<section>
+  <h2>What has actually happened</h2>
+  <p style="font-size:14.5px;color:var(--muted);margin-bottom:4px">Last 90 days, measured on your site.</p>
+  <div class="cards">
+    <div class="card"><div class="lab">AI read your site</div><div class="big">${t.answer}</div>
+      <p>Times an assistant opened your pages to answer someone's live question.</p></div>
+    <div class="card"><div class="lab">People who came</div><div class="big" style="color:${t.referral ? 'var(--good)' : 'inherit'}">${t.referral}</div>
+      <p>Visitors who arrived here from an AI answer.</p></div>
+    <div class="card"><div class="lab">Leads from AI</div><div class="big">${aiLeads.length}</div>
+      <p>${bookedL.length} booked${revenue ? ` · $${revenue.toLocaleString()}` : ''}</p></div>
+  </div>
+  ${engineRows.length ? `<table><tr><th>Assistant</th><th style="text-align:right">Visits &amp; reads</th></tr>
+    ${engineRows.map(([e, n]) => `<tr><td>${esc2(e)}</td><td class="n" style="text-align:right">${n}</td></tr>`).join('')}</table>`
+    : `<p class="empty">No AI activity recorded yet. This started being measured recently, and these numbers build over weeks — an empty table here is normal early on, not a problem.</p>`}
+</section>
+
+<section>
+  <h2>How ready your site is</h2>
+  <div class="score">
+    <div class="dial"><b>${pct}</b></div>
+    <div><p style="margin:0;font-weight:600;color:${grade[0]};font-family:Archivo,sans-serif">${grade[1]}</p>
+    <p style="margin:4px 0 0;font-size:14.5px;color:var(--muted)">${audit.score} of ${audit.max} points on the things that decide whether an assistant can confidently name you: whether it can read your site, whether it can tell who and where you are, and whether your pages say anything it can quote.</p></div>
+  </div>
+  ${audit.wins.length ? `<p style="font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);font-family:Archivo,sans-serif;font-weight:600;margin:22px 0 6px">Already in place</p>
+    <ul style="margin:0 0 0 20px;padding:0;font-size:15px;color:var(--good)">${audit.wins.map((w) => `<li style="margin-bottom:5px">${esc2(w)}</li>`).join('')}</ul>` : ''}
+  ${audit.fixes.length ? `<p style="font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);font-family:Archivo,sans-serif;font-weight:600;margin:22px 0 6px">What we are working on next</p>
+    <ol>${audit.fixes.map((f) => `<li><b>${esc2(f.what)}</b><br><span style="font-size:14.5px;color:var(--muted)">${esc2(f.why)}</span></li>`).join('')}</ol>`
+    : `<p style="color:var(--good);font-weight:600">Everything measurable on your website is done. The remaining work is off your site — being listed and mentioned in the places assistants read.</p>`}
+</section>
+
+<footer>
+  <p>Prepared by ConversionCo${domain ? ` for ${esc2(domain)}` : ''}. Figures cover the last 90 days and are measured directly on your website.</p>
+  <p>We do not report a "ranking" on ChatGPT or Gemini. Those engines publish no ranking and give no way to query one honestly, so any tool showing you a position for them is guessing. We would rather show you fewer numbers that are all true.</p>
+</footer>
+</div></body></html>`;
+  return c.html(html);
+});
+
+app.get('/api/clients/:id/ai-report-link', async (c) => {
+  const id = Number(c.req.param('id'));
+  return c.json({ ok: true, url: `${BASE_URL}/portal-ai/${id}/${await portalToken(c.env, 'ai', id)}` });
+});
+
+app.get('/api/clients/:id/aeo-questions', async (c) => {
+  const id = Number(c.req.param('id'));
+  const client = await c.env.DB.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
+  if (!client) return c.json({ error: 'client not found' }, 404);
+  const q = await aeoQuestions(c.env.DB, client);
+  const rows = (await c.env.DB.prepare(
+    `SELECT engine, question, named, note, checked_at FROM ai_checks WHERE client_id = ? ORDER BY id DESC LIMIT 300`
+  ).bind(id).all()).results || [];
+  // latest result per engine+question
+  const latest = {};
+  for (const r of rows) { const k = `${r.engine}|${r.question}`; if (!latest[k]) latest[k] = r; }
+  const byEngine = {};
+  for (const e of q.engines) {
+    const mine = Object.values(latest).filter((r) => r.engine === e);
+    byEngine[e] = { checked: mine.length, named: mine.filter((r) => r.named).length,
+      last: mine.map((r) => r.checked_at).sort().pop() || '' };
+  }
+  return c.json({ ok: true, ...q, latest, by_engine: byEngine, total_checks: rows.length });
+});
+
+app.post('/api/clients/:id/aeo-check', async (c) => {
+  const id = Number(c.req.param('id'));
+  let f = {}; try { f = await c.req.json(); } catch {}
+  const engine = String(f.engine || '').slice(0, 40);
+  const question = String(f.question || '').slice(0, 300);
+  if (!engine || !question) return c.json({ error: 'engine and question required' }, 400);
+  await c.env.DB.prepare(`INSERT INTO ai_checks (client_id, engine, question, named, note) VALUES (?, ?, ?, ?, ?)`)
+    .bind(id, engine, question, f.named ? 1 : 0, String(f.note || '').slice(0, 400)).run();
+  await logEvent(c.env.DB, id, 'aeo_check', `${f.named ? '✅ Named' : '⭕ Not named'} by ${engine} — “${question.slice(0, 70)}”`);
+  return c.json({ ok: true });
 });
 
 // Profiles + hours — the inputs the entity graph is built from.
