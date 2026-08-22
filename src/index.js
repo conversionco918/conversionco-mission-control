@@ -2166,7 +2166,15 @@ app.get('/portal/:id/:token', async (c) => {
     ${ranks && Array.isArray(ranks.keywords) && ranks.keywords.length ? `
       ${hasGsc ? '<p class="note" style="margin:12px 0 0">And in the searches we run ourselves in your market:</p>' : `<p class="note" style="margin:0 0 6px">We run these exact searches every week${ranks.checked_at ? ` · last checked ${String(ranks.checked_at).slice(0, 10)}` : ''}.</p>`}
       ${ranks.keywords.map((k) => `<div class="grow"><div class="kw">when someone searches <b>"${escq(k.kw)}"</b></div>${ladder(k.you || 0, null)}
-        <div class="pos">${k.you ? `you're <b>Page 1, #${k.you}</b>` : (k.pending ? 'your spot is waiting — tracking starts at launch' : `not on Page 1 yet — that's the target`)}</div>
+        <div class="pos">${k.you ? `you're <b>Page 1, #${k.you}</b>` : (k.pending
+          // "tracking starts at launch" is only true BEFORE launch. On a live
+          // client's portal it reads as "we aren't watching yet", which is both
+          // wrong and alarming — Tonya's portal said it on eight searches while
+          // her site had been live for weeks.
+          ? (client.stage === 'live' || client.live_url
+              ? 'no position recorded here yet — we keep checking weekly'
+              : 'your spot is waiting — tracking starts at launch')
+          : `not on Page 1 yet — that's the target`)}</div>
         ${k.competitors ? `<div class="note" style="margin-top:4px">${Object.entries(k.competitors).map(([n, p]) => `${escq(n)}: ${p ? `Page 1, #${p}` : 'not on Page 1'}`).join(' · ')}</div>` : ''}</div>`).join('')}` : ''}
     ${!hasGsc && !(ranks && ranks.keywords && ranks.keywords.length) ? (client.live_url
       ? `<p style="color:var(--muted);font-size:14px">Your website is registered with Google and the measuring has begun — your first exact positions appear here within days, and we re-check them every Sunday.</p><div class="ladder"><div class="goal"></div></div><div class="lscale"><span>#100</span><span>Page 1 🏁</span></div>`
