@@ -4940,11 +4940,14 @@ app.get('/portal-ai/:id/:token', async (c) => {
   let domain = ''; try { domain = new URL(client.live_url).hostname.replace(/^www\./, ''); } catch {}
   // Settings first — everything below reads them.
   const settingsP = await getSettings(db);
+  // Declared HERE, not inside the if-block below: the page body reads it, and a
+  // const scoped to that block threw a ReferenceError that 500'd the whole
+  // report. Textual order is not scope.
+  const sinceP = await aeoSince(db, id, settingsP);
   const days = 90;
   const t = { answer: 0, referral: 0, train: 0 };
   const perEngine = {};
   if (slug) {
-    const sinceP = await aeoSince(db, id, settingsP);
     const rows = (await db.prepare(
       `SELECT engine, kind, SUM(n) AS n FROM ai_visits WHERE slug = ? AND day > date('now', ?) AND (? = '' OR day >= ?) GROUP BY engine, kind`
     ).bind(slug, `-${days} days`, sinceP, sinceP).all()).results || [];
