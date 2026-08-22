@@ -674,7 +674,7 @@ async function aeoView(id, btn) {
         <div style="font-size:22px;font-weight:800;color:${grade[0]};line-height:1;">${total}<span style="font-size:12px;font-weight:600;">/${measured}</span></div>
         <div style="font-size:10.5px;color:${grade[0]};font-weight:700;letter-spacing:.04em;">${grade[3]}</div>
       </div>
-      <div style="font-size:11.5px;color:#475569;">AI answer visibility for <b>${esc(r.domain || r.slug || '')}</b><br>last ${r.days} days${access.unknown ? `<br><span style="color:#b45309;">crawler access could not be read — scored out of ${measured}, not counted against you</span>` : ''}</div>
+      <div style="font-size:11.5px;color:#475569;">AI answer visibility for <b>${esc(r.domain || r.slug || '')}</b><br>${r.since ? `counting since ${esc(r.since)}` : `last ${r.days} days`}${access.unknown ? `<br><span style="color:#b45309;">crawler access could not be read — scored out of ${measured}, not counted against you</span>` : ''}</div>
     </div>
     <table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:10px;">
       <tr><td style="padding:4px 0;color:#475569;">AI read the site to answer a question</td><td style="text-align:right;font-weight:700;">${t.answer}</td><td style="color:#94a3b8;padding-left:8px;">${eng(r.traffic.answer)}</td></tr>
@@ -732,6 +732,7 @@ function aeoProfileForm(r) {
       <button class="btn btn-ghost" onclick="aeoLlms(${r.client_id}, this)">📄 Generate llms.txt</button>
       <button class="btn btn-ghost" onclick="aeoSitemap(${r.client_id}, this)" title="Rebuilds sitemap.xml from the pages that actually exist, dropping duplicates.">🗺 Rebuild sitemap</button>
       <button class="btn btn-ghost" onclick="aeoChecks(${r.client_id}, this)" title="Record whether each assistant named this business.">🔎 AI spot-checks</button>
+      <button class="btn btn-ghost" onclick="aeoReset(${r.client_id}, this)" title="Start this client's AI counters from today. Deletes nothing — it just stops counting anything before now.">🧹 Start counting today</button>
       <button class="btn btn-ghost" onclick="aeoClientPage(${r.client_id}, this)" title="The client-facing page — real numbers only.">📊 Client page</button>
     </div>
     <div id="aeoFixOut" style="margin-top:8px;font-size:11.5px;"></div>
@@ -802,6 +803,18 @@ async function aeoChecks(id, btn) {
 // 🔍 Scan any website — a prospect's, a competitor's, anyone's. Read-only.
 // Walking into a pitch already knowing what their site scores, and why an
 // assistant names their competitor instead of them, is the whole sales pitch.
+// Start a client's AI counters from today. Use it after testing against their
+// site, or any time a number cannot be defended. Nothing is deleted — the older
+// rows stay, they simply stop counting toward what the client is shown.
+async function aeoReset(id, btn) {
+  if (!confirm('Start this client\'s AI numbers from today?\n\nUse this when the current figures include test traffic rather than real visitors.\n\nNothing is deleted — everything before today simply stops being counted, and their report will say the date counting began.')) return;
+  btn.disabled = true; btn.textContent = 'Resetting…';
+  const r = await api(`/api/clients/${id}/aeo-reset`, { method:'POST', body:'{}' });
+  btn.disabled = false; btn.textContent = '🧹 Start counting today';
+  if (r.error) return toast('⚠ ' + r.error);
+  toast(`✅ Counting from ${r.since}`);
+  aeoView(id, null);
+}
 async function aeoScan(btn) {
   const input = document.getElementById('aeoScanDomain');
   const out = document.getElementById('aeoScanOut');

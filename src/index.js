@@ -614,6 +614,9 @@ app.get('/preview/:slug/*', async (c) => {
     const noCount = !!c.req.query('nocount');
     // AEO signals are measured before the bot/admin filters — an AI agent fetching
     // the page IS the signal, and it would otherwise be discarded as a crawler.
+    // ?nocount=1 skips EVERY counter, AI included. It used to skip only page
+    // hits, so testing this feature wrote 19 fake "an AI read your site" events
+    // onto a live client's report. Any test request must carry it.
     if (isHtml && !noCount) {
       const ag = aiAgent(ua);
       if (ag) c.executionCtx.waitUntil(noteAi(c.env, slug, ag.engine, ag.kind));
@@ -1920,9 +1923,10 @@ app.get('/portal/:id/:token', async (c) => {
   let aiRef = 0, aiLeadsN = 0, aiRead = 0;
   try {
     if (slug) {
+      const sinceQ = await aeoSince(db, id, settings);
       const av = (await db.prepare(
-        `SELECT kind, SUM(n) AS n FROM ai_visits WHERE slug = ? AND day > date('now','-90 days') GROUP BY kind`
-      ).bind(slug).all()).results || [];
+        `SELECT kind, SUM(n) AS n FROM ai_visits WHERE slug = ? AND day > date('now','-90 days') AND (? = '' OR day >= ?) GROUP BY kind`
+      ).bind(slug, sinceQ, sinceQ).all()).results || [];
       for (const r of av) { if (r.kind === 'referral') aiRef = Number(r.n); if (r.kind === 'answer') aiRead = Number(r.n); }
     }
     const lr = (await db.prepare(
@@ -4500,6 +4504,29 @@ async function aeoPages(env, settings, client, slug) {
   return { rows, source: 'fetched', scanned: urls.length, capped: locs.length > 20 };
 }
 
+// Counting has to start from a date you can defend.
+//
+// The AI counters for Anywhere Infusions read 19 reads and 5 visits, and every
+// one was a test request I made while building the feature. Deleting rows would
+// hide that; instead each client has a date from which their numbers count, and
+// the client page states it. Nothing is destroyed, the client sees only real
+// traffic, and the number has a start you can point at.
+async function aeoSince(db, id, settings) {
+  const s0 = settings || await getSettings(db);
+  return String(s0[`aeo_since_${id}`] || '').slice(0, 10);
+}
+
+// Start a client's AI counters from today. Used after testing, or whenever a
+// number cannot be defended. Writes a date; deletes nothing.
+app.post('/api/clients/:id/aeo-reset', async (c) => {
+  const id = Number(c.req.param('id'));
+  let b = {}; try { b = await c.req.json(); } catch {}
+  const day = /^\d{4}-\d{2}-\d{2}$/.test(String(b.from || '')) ? b.from : new Date().toISOString().slice(0, 10);
+  await setSetting(c.env.DB, `aeo_since_${id}`, day);
+  await logEvent(c.env.DB, id, 'aeo_reset', `🧹 AI counters now count from ${day} — earlier figures were from testing, not real visitors`);
+  return c.json({ ok: true, since: day, note: 'Nothing was deleted. Only traffic from this date forward is counted.' });
+});
+
 app.get('/api/clients/:id/aeo', async (c) => {
   const id = Number(c.req.param('id'));
   const db = c.env.DB;
@@ -4511,10 +4538,11 @@ app.get('/api/clients/:id/aeo', async (c) => {
   // ── 1. traffic, split three ways and never summed
   let traffic = { answer: [], referral: [], train: [], totals: { answer: 0, referral: 0, train: 0 } };
   if (slug) {
+    const since = await aeoSince(db, id, settingsA);
     const rows = (await db.prepare(
       `SELECT engine, kind, SUM(n) AS n FROM ai_visits
-       WHERE slug = ? AND day > date('now', ?) GROUP BY engine, kind ORDER BY n DESC`
-    ).bind(slug, `-${days} days`).all()).results || [];
+       WHERE slug = ? AND day > date('now', ?) AND (? = '' OR day >= ?) GROUP BY engine, kind ORDER BY n DESC`
+    ).bind(slug, `-${days} days`, since, since).all()).results || [];
     for (const r of rows) {
       const k = String(r.kind);
       if (!traffic[k]) continue;
@@ -4558,6 +4586,7 @@ app.get('/api/clients/:id/aeo', async (c) => {
   let hours = []; try { hours = JSON.parse(client.hours || '[]'); } catch {}
   return c.json({
     ok: true, client_id: id, slug, domain, days,
+    since: await aeoSince(db, id, settingsA),
     traffic, money, audit, profiles, hours,
     robots_url: domain ? `https://${domain}/robots.txt` : '',
     note: 'access score (30 pts) is added by the browser after it reads robots.txt',
@@ -4912,9 +4941,10 @@ app.get('/portal-ai/:id/:token', async (c) => {
   const t = { answer: 0, referral: 0, train: 0 };
   const perEngine = {};
   if (slug) {
+    const sinceP = await aeoSince(db, id, settingsP);
     const rows = (await db.prepare(
-      `SELECT engine, kind, SUM(n) AS n FROM ai_visits WHERE slug = ? AND day > date('now', ?) GROUP BY engine, kind`
-    ).bind(slug, `-${days} days`).all()).results || [];
+      `SELECT engine, kind, SUM(n) AS n FROM ai_visits WHERE slug = ? AND day > date('now', ?) AND (? = '' OR day >= ?) GROUP BY engine, kind`
+    ).bind(slug, `-${days} days`, sinceP, sinceP).all()).results || [];
     for (const r of rows) {
       if (t[r.kind] === undefined) continue;
       t[r.kind] += Number(r.n);
@@ -4990,7 +5020,7 @@ footer{margin-top:52px;border-top:1px solid var(--line);padding-top:20px;font-si
 
 <section>
   <h2>What has actually happened</h2>
-  <p style="font-size:14.5px;color:var(--muted);margin-bottom:4px">Last 90 days, measured on your site.</p>
+  <p style="font-size:14.5px;color:var(--muted);margin-bottom:4px">${sinceP ? `Measured on your own website since ${sinceP}.` : 'Last 90 days, measured on your site.'}</p>
   <div class="cards">
     <div class="card"><div class="lab">AI read your site</div><div class="big">${t.answer}</div>
       <p>Times an assistant opened your pages to answer someone's live question.</p></div>
@@ -5226,9 +5256,10 @@ app.get('/api/aeo-overview', async (c) => {
     // we inherited simply vanished from the roll-up.
     const slug = await slugForClient(db, cl.id, cl);
     if (!slug && !cl.live_url) continue;
+    const sinceO = await aeoSince(db, cl.id, settingsO);
     const rows = slug ? ((await db.prepare(
-      `SELECT kind, SUM(n) AS n FROM ai_visits WHERE slug = ? AND day > date('now', ?) GROUP BY kind`
-    ).bind(slug, `-${days} days`).all()).results || []) : [];
+      `SELECT kind, SUM(n) AS n FROM ai_visits WHERE slug = ? AND day > date('now', ?) AND (? = '' OR day >= ?) GROUP BY kind`
+    ).bind(slug, `-${days} days`, sinceO, sinceO).all()).results || []) : [];
     const t = { answer: 0, referral: 0, train: 0 };
     for (const r of rows) if (t[r.kind] !== undefined) t[r.kind] = Number(r.n);
     const pgO = await aeoPages(c.env, settingsO, cl, slug);
