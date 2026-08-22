@@ -5534,10 +5534,27 @@ app.post('/api/clients/:id/portal-invite', async (c) => {
     await ghl.sendEmail({
       contactId: contact.id || contact.contactId,
       subject: `Your private client portal — ${biz}`,
+      // Written to be read on a phone in thirty seconds. The app instructions are
+      // here because most owners check this from a phone and a home-screen icon
+      // is the difference between looking once and looking every week.
       html: `<p>Hi ${first},</p>
-<p>Your project now has a live client portal — your window into everything we're doing for ${biz}: where your project stands, your website's SEO score, uptime monitoring, and everything we publish for you.</p>
+<p>Here is your private portal for ${biz} — one page with everything we're doing for you:</p>
 <p><a href="${url}">${url}</a></p>
-<p>That link is your personal key — no password needed. Bookmark it and check in any time; it updates in real time as we work. Or just reply to this email with any question.</p>
+<ul>
+<li>Where you sit on Google, straight from Google's own records</li>
+<li>Visitors, people who reached out, and how your website is performing</li>
+<li><b>How you're doing in AI search</b> — when someone asks ChatGPT or a similar assistant about your service, this shows whether they're finding you</li>
+<li>Everything we've published and changed, as we do it</li>
+<li>A message box — a real person reads every one, usually the same day</li>
+</ul>
+<p>That link is your key, so there's no password to remember. It updates on its own as we work.</p>
+<p><b>Want it as an app on your phone?</b> It takes about ten seconds:</p>
+<ul>
+<li><b>iPhone:</b> open the link in Safari, tap the Share button (the square with the arrow), scroll down and tap <b>Add to Home Screen</b>.</li>
+<li><b>Android:</b> open the link in Chrome, tap the three dots in the corner, tap <b>Add to Home screen</b> or <b>Install app</b>.</li>
+</ul>
+<p>You'll get an icon with your own business name on it, and it opens straight to your portal like any other app.</p>
+<p>Any questions at all, just reply to this email.</p>
 <p>Talk soon,<br>The ConversionCo Team</p>`,
       emailFrom: settings.email_from || undefined,
     });
