@@ -4532,7 +4532,10 @@ app.get('/api/clients/:id/aeo', async (c) => {
   const db = c.env.DB;
   const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
   if (!client) return c.json({ error: 'client not found' }, 404);
-  const slug = await slugForClient(db, id);
+  const slug = await slugForClient(db, id, client);
+  // Read settings ONCE, at the top, before anything uses them. Declaring this
+  // below its first use threw a 500 on the whole AEO endpoint.
+  const settingsA = await getSettings(db);
   const days = Math.min(365, Math.max(7, Number(c.req.query('days') || 28)));
 
   // ── 1. traffic, split three ways and never summed
@@ -4570,7 +4573,6 @@ app.get('/api/clients/:id/aeo', async (c) => {
   };
 
   // ── 3. readiness — content side here, crawler access from the browser
-  const settingsA = await getSettings(db);
   const pgA = await aeoPages(c.env, settingsA, client, slug);
   // business_name only — falling back to the contact's first name would check
   // every page for "Tiffany" and report a nonsense finding.
@@ -4934,9 +4936,10 @@ app.get('/portal-ai/:id/:token', async (c) => {
   const client = await db.prepare('SELECT * FROM clients WHERE id = ?').bind(id).first();
   if (!client) return c.text('not found', 404);
   const biz = client.business_name || client.name || '';
-  const slug = await slugForClient(db, id);
+  const slug = await slugForClient(db, id, client);
   let domain = ''; try { domain = new URL(client.live_url).hostname.replace(/^www\./, ''); } catch {}
-
+  // Settings first — everything below reads them.
+  const settingsP = await getSettings(db);
   const days = 90;
   const t = { answer: 0, referral: 0, train: 0 };
   const perEngine = {};
@@ -4958,12 +4961,10 @@ app.get('/portal-ai/:id/:token', async (c) => {
   const bookedL = aiLeads.filter((l) => l.status === 'booked');
   const revenue = bookedL.reduce((a, l) => a + Number(l.value || 0), 0);
 
-  const settingsP = await getSettings(db);
   const pgP = await aeoPages(c.env, settingsP, client, slug);
   const audit = aeoAudit(pgP.rows, client.business_name || '');
   const pct = Math.round(100 * audit.score / audit.max);
-  const settingsH = await getSettings(db);
-  let hist = []; try { hist = JSON.parse(settingsH[`aeohist_${id}`] || '[]'); } catch {}
+  let hist = []; try { hist = JSON.parse(settingsP[`aeohist_${id}`] || '[]'); } catch {}
   // No website to read yet. Showing a score here would be a made-up number about
   // a site that does not exist — say so instead.
   const noSite = pgP.rows.length === 0;
