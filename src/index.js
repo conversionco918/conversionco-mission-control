@@ -233,6 +233,18 @@ app.use('*', async (c, next) => {
   } });
 });
 
+// A client must never be shown our own test traffic as if it were a customer.
+// Anywhere Infusions' portal was reporting 9 leads, 8 of which were addresses I
+// created while testing today. Their own numbers, wrong, in front of them.
+//
+// Anything at our internal domain is ours, not theirs: real test addresses, and
+// the prospect+…@conversionco918.com placeholders the intake flow generates.
+// They stay visible in Mission Control — they are just never counted as a lead
+// on anything the client sees.
+const NOT_A_REAL_LEAD = `AND (l.email IS NULL OR l.email NOT LIKE '%@conversionco918.com')`;
+const NOT_A_REAL_LEAD_BARE = `AND (email IS NULL OR email NOT LIKE '%@conversionco918.com')`;
+function isInternalLead(email) { return /@conversionco918\.com$/i.test(String(email || '')); }
+
 // ══ AEO DETECTION ══════════════════════════════════════════════════════════
 // Being found through an AI assistant is a different channel from Google search,
 // and it splits into three signals that are constantly conflated by the tools
@@ -1854,7 +1866,7 @@ app.get('/portal/:id/:token', async (c) => {
   const HELD_TYPES = ['preview_ready', 'auto_published', 'revision_done', 'theme_changed'];
   const slug = await slugForClient(db, id);
   const blogs = slug ? ((await db.prepare(`SELECT path FROM site_files WHERE slug=? AND path LIKE 'blog-%' ORDER BY updated_at DESC LIMIT 5`).bind(slug).all()).results || []) : [];
-  const leadsN = (await db.prepare(`SELECT COUNT(*) AS n FROM leads WHERE client_id = ? AND slug != 'portal-message'`).bind(id).first())?.n || 0;
+  const leadsN = (await db.prepare(`SELECT COUNT(*) AS n FROM leads WHERE client_id = ? AND slug != 'portal-message' ${NOT_A_REAL_LEAD_BARE}`).bind(id).first())?.n || 0;
   const revsN = (await db.prepare(`SELECT COUNT(*) AS n FROM revisions WHERE client_id = ? AND status = 'done'`).bind(id).first())?.n || 0;
   const FRIENDLY = { auto_published: '🚀 Website updated & republished', revision_done: '✅ A requested change was completed',
     theme_changed: '🎨 Fresh look applied to your site', logo_uploaded: '🖼 Your logo was added', photo_uploaded: '📷 New photo added to your site',
@@ -1914,7 +1926,7 @@ app.get('/portal/:id/:token', async (c) => {
       for (const r of av) { if (r.kind === 'referral') aiRef = Number(r.n); if (r.kind === 'answer') aiRead = Number(r.n); }
     }
     const lr = (await db.prepare(
-      `SELECT referrer, utm_source FROM leads WHERE client_id = ? AND created_at > datetime('now','-90 days')`
+      `SELECT referrer, utm_source FROM leads WHERE client_id = ? AND created_at > datetime('now','-90 days') ${NOT_A_REAL_LEAD_BARE}`
     ).bind(id).all()).results || [];
     aiLeadsN = lr.filter((l) => aiReferral(l.referrer, l.utm_source)).length;
   } catch { /* the portal must render even if this table is empty */ }
@@ -1970,7 +1982,7 @@ app.get('/portal/:id/:token', async (c) => {
     if (v28 && Number(v28.n) > 0) visits = { w: Number(v7?.n || 0), m: Number(v28.n), top: topP ? String(topP.path).replace('.html', '').replace(/-/g, ' ') : null };
   }
   // lead inbox + client-confirmed bookings (real revenue)
-  const leadRows = (await db.prepare(`SELECT id AS lid, name, email, phone, message, source, status, created_at FROM leads WHERE client_id = ? AND slug != 'portal-message' ORDER BY id DESC LIMIT 12`).bind(id).all()).results || [];
+  const leadRows = (await db.prepare(`SELECT id AS lid, name, email, phone, message, source, status, created_at FROM leads WHERE client_id = ? AND slug != 'portal-message' ${NOT_A_REAL_LEAD_BARE} ORDER BY id DESC LIMIT 12`).bind(id).all()).results || [];
   const bookedN = Number((await db.prepare(`SELECT COUNT(*) AS n FROM leads WHERE client_id = ? AND status = 'booked'`).bind(id).first())?.n || 0);
   let avgPrice = 0;
   if (slug) {
@@ -4514,7 +4526,7 @@ app.get('/api/clients/:id/aeo', async (c) => {
   // ── 2. money: leads whose first touch was an AI answer
   const leadRows = (await db.prepare(
     `SELECT id, name, email, referrer, utm_source, status, value, created_at
-     FROM leads WHERE client_id = ? AND created_at > datetime('now', ?)`
+     FROM leads WHERE client_id = ? AND created_at > datetime('now', ?) ${NOT_A_REAL_LEAD_BARE}`
   ).bind(id, `-${days} days`).all()).results || [];
   const aiLeads = [];
   for (const l of leadRows) {
@@ -4910,7 +4922,7 @@ app.get('/portal-ai/:id/:token', async (c) => {
     }
   }
   const leadRows = (await db.prepare(
-    `SELECT referrer, utm_source, status, value FROM leads WHERE client_id = ? AND created_at > datetime('now', ?)`
+    `SELECT referrer, utm_source, status, value FROM leads WHERE client_id = ? AND created_at > datetime('now', ?) ${NOT_A_REAL_LEAD_BARE}`
   ).bind(id, `-${days} days`).all()).results || [];
   const aiLeads = leadRows.filter((l) => aiReferral(l.referrer, l.utm_source));
   const bookedL = aiLeads.filter((l) => l.status === 'booked');
@@ -5007,9 +5019,10 @@ footer{margin-top:52px;border-top:1px solid var(--line);padding-top:20px;font-si
   </div>
   ${audit.wins.length ? `<p style="font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);font-family:Archivo,sans-serif;font-weight:600;margin:22px 0 6px">Already in place</p>
     <ul style="margin:0 0 0 20px;padding:0;font-size:15px;color:var(--good)">${audit.wins.map((w) => `<li style="margin-bottom:5px">${esc2(w)}</li>`).join('')}</ul>` : ''}
-  ${audit.fixes.length ? `<p style="font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);font-family:Archivo,sans-serif;font-weight:600;margin:22px 0 6px">What we are working on next</p>
-    <ol>${audit.fixes.map((f) => `<li><b>${esc2(f.what)}</b><br><span style="font-size:14.5px;color:var(--muted)">${esc2(f.why)}</span></li>`).join('')}</ol>`
-    : `<p style="color:var(--good);font-weight:600">Everything measurable on your website is done. The remaining work is off your site — being listed and mentioned in the places assistants read.</p>`}`}
+  ${''/* The fix list is deliberately NOT here. It is a work queue for the people
+       doing the work, not something a client needs to read — a list of faults on
+       a page they are paying for reads as a list of things wrong with them.
+       It lives in Mission Control, where it belongs. */}`}
 </section>
 
 <footer>
